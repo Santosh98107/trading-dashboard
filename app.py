@@ -67,9 +67,9 @@ if st.button("Fetch Data"):
 
 
 
-data["EMA20"] = data["Close"].ewm(span=20).mean()
 
-ema20 = data["EMA20"].iloc[-1]
+
+
 col1, col2 = st.columns(2)
  
 with col1:
