@@ -35,9 +35,7 @@ st.write("Selected:", selected)
 import yfinance as yf
 
 if st.button("Fetch Data"):
-    ticker = "^NSEI"
-
-    if selected == "BANKNIFTY":
+    
         ticker = stocks[selected]
  
 data = yf.download(ticker, period="5d")
