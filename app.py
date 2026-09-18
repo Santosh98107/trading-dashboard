@@ -130,11 +130,7 @@ else:
  
 st.write("Signal:", signal)
  
-elif put_signal:
-    signal = "✅ PUT BUY"
- 
-else:
-    signal = "⏸️ NO TRADE"
+
  
 if ema20 > ema50:
     confidence += 25
