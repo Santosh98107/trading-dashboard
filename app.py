@@ -46,37 +46,21 @@ if st.button("Fetch Data"):
  
     volume = data["Volume"]
  
-    vwap = (
-        (data["Close"] * volume).cumsum()
-        / volume.cumsum()
-    )
+vwap = (
+    (data["Close"] * volume).cumsum()
+    / volume.cumsum()
+)
  
-    last_vwap = vwap.iloc[-1].item()
+last_vwap = vwap.iloc[-1].item()
  
-    close_price = data["Close"].iloc[-1].item()
+close_price = data["Close"].iloc[-1].item()
  
-    data["EMA20"] = data["Close"].ewm(span=20).mean()
+data["EMA20"] = data["Close"].ewm(span=20).mean()
+ema20 = data["EMA20"].iloc[-1].item()
  
-    ema20 = data["EMA20"].iloc[-1].item()
+data["EMA50"] = data["Close"].ewm(span=50).mean()
+ema50 = data["EMA50"].iloc[-1].item()
  
-    data["EMA50"] = data["Close"].ewm(span=50).mean()
- 
-    ema50 = data["EMA50"].iloc[-1].item()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 col1, col2 = st.columns(2)
  
 with col1:
@@ -101,33 +85,50 @@ with col2:
         round(ema50, 2)
     )
  
-    st.write("PCR:", "Coming Soon")
+st.write("PCR:", "Coming Soon")
+st.write("PCR Trend:", "Coming Soon")
  
-    st.write("PCR Trend:", "Coming Soon")
-
 st.write(
     "Last Updated:",
     datetime.now().strftime("%d-%m-%Y %H:%M:%S")
 )
-
+ 
 if ema20 > ema50:
     trend = "🟢 BULLISH 📈"
 else:
     trend = "🔴 BEARISH 📉"
-
+ 
 if "BULLISH" in trend:
     st.success(trend)
 else:
     st.error(trend)
-
-call_signal = (ema20 > ema50) and (float(close_price) > float(ema20))
-
-put_signal = (ema20 < ema50) and (float(close_price) < float(ema20))
-
+ 
+call_signal = (ema20 > ema50) and (close_price > ema20)
+put_signal = (ema20 < ema50) and (close_price < ema20)
+ 
 confidence = 50
+ 
+if ema20 > ema50:
+    confidence += 25
+ 
+if close_price > ema20:
+    confidence += 25
+ 
+st.write(
+    "Confidence Score:",
+    f"{confidence}%"
+)
  
 if call_signal:
     signal = "✅ CALL BUY"
+ 
+elif put_signal:
+    signal = "✅ PUT BUY"
+ 
+else:
+    signal = "⏸️ NO TRADE"
+ 
+st.write("Signal:", signal)
  
 elif put_signal:
     signal = "✅ PUT BUY"
