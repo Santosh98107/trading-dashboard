@@ -40,9 +40,9 @@ if st.button("Fetch Data"):
  
     data = yf.download(ticker, period="5d")
  
-if data.empty:
-    st.error("No data found for selected symbol")
-    st.stop()
+    if data.empty:
+        st.error("No data found for selected symbol")
+        st.stop()
  
 volume = data["Volume"]
  
