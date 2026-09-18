@@ -38,9 +38,13 @@ if st.button("Fetch Data"):
     ticker = "^NSEI"
 
     if selected == "BANKNIFTY":
-        ticker = "^NSEBANK"
-
-    data = yf.download(ticker, period="5d")
+        ticker = stocks[selected]
+ 
+data = yf.download(ticker, period="5d")
+ 
+if data.empty:
+    st.error("No data found for selected symbol")
+    st.stop()
 
     volume = data["Volume"]
 
