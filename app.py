@@ -117,17 +117,10 @@ with col2:
         "EMA50",
         round(ema50, 2)
     )
-    )
  
-    st.metric(
-        "EMA50",
-        round(ema50), 2)
-    )
-
-
-st.write("PCR:", "Coming Soon")
-
-st.write("PCR Trend:", "Coming Soon")
+    st.write("PCR:", "Coming Soon")
+ 
+    st.write("PCR Trend:", "Coming Soon")
 
 st.write(
     "Last Updated:",
