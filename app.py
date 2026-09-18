@@ -53,15 +53,15 @@ if st.button("Fetch Data"):
  
     last_vwap = vwap.iloc[-1]
  
-    close_price = data["Close"].iloc[-1]
+    close_price = data["Close"].iloc[-1].item()
  
     data["EMA20"] = data["Close"].ewm(span=20).mean()
  
-    ema20 = data["EMA20"].iloc[-1]
+    ema20 = data["EMA20"].iloc[-1].item()
  
     data["EMA50"] = data["Close"].ewm(span=50).mean()
  
-    ema50 = data["EMA50"].iloc[-1]
+    ema50 = data["EMA50"].iloc[-1].item()
 
 
 
