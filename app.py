@@ -51,7 +51,7 @@ if st.button("Fetch Data"):
         / volume.cumsum()
     )
  
-    last_vwap = vwap.iloc[-1]
+    last_vwap = vwap.iloc[-1].item()
  
     close_price = data["Close"].iloc[-1].item()
  
