@@ -121,26 +121,32 @@ if st.button("Fetch Data"):
     if latest_macd > latest_signal:
         st.success("MACD Bullish ✅")
     else:
-        st.error("MACD Bearish ❌")
-        if (
-    ema20 > ema50
-    and close_price > ema20
-    and latest_rsi > 60
-    and latest_macd > latest_signal
-):
-    st.success("🔥 STRONG CALL BUY")
+ if st.button("Fetch Data"):
+    # all calculations here
 
-elif (
-    ema20 < ema50
-    and close_price < ema20
-    and latest_rsi < 40
-    and latest_macd < latest_signal
-):
-    st.error("🔥 STRONG PUT BUY")
+    if (
+        ema20 > ema50
+        and close_price > ema20
+        and latest_rsi > 60
+        and latest_macd > latest_signal
+    ):
+        st.success("🔥 STRONG CALL BUY")
+        confidence = "High"
 
-else:
-    st.warning("⏸️ NO TRADE")
+    elif (
+        ema20 < ema50
+        and close_price < ema20
+        and latest_rsi < 40
+        and latest_macd < latest_signal
+    ):
+        st.error("🔥 STRONG PUT BUY")
+        confidence = "High"
 
+    else:
+        st.warning("⏸️ NO TRADE")
+        confidence = "Low"
+
+    st.write("Signal Strength:", confidence)
     st.write(
         "Last Updated:",
         datetime.now().strftime("%d-%m-%Y %H:%M:%S")
