@@ -75,93 +75,22 @@ if st.button("Fetch Data"):
     if close_price > ema20:
         confidence += 25
 
-        st.write("Confidence Score:", f"{confidence}%")
-        # RSI Calculation
-    delta = data["Close"].diff()
-    
-    gain = delta.where(delta > 0, 0)
-    loss = -delta.where(delta < 0, 0)
-    
-    avg_gain = gain.rolling(window=14).mean()
-    avg_loss = loss.rolling(window=14).mean()
-    
-    avg_loss = avg_loss.replace(0, 1e-10)
-    
-    rs = avg_gain / avg_loss
-    data["RSI"] = 100 - (100 / (1 + rs))
-    
-    latest_rsi = data["RSI"].iloc[-1].item()
-    
-    st.metric("RSI (14)", round(latest_rsi, 2))
-    
-    if latest_rsi > 60:
-        st.success("RSI Bullish ✅")
-    elif latest_rsi < 40:
-        st.error("RSI Bearish ❌")
-    else:
-        st.warning("RSI Neutral ⏸️")
-        # MACD Calculation
-    exp1 = data["Close"].ewm(span=12, adjust=False).mean()
-    exp2 = data["Close"].ewm(span=26, adjust=False).mean()
-    
-    data["MACD"] = exp1 - exp2
-    data["SignalLine"] = data["MACD"].ewm(span=9, adjust=False).mean()
-    
-    latest_macd = data["MACD"].iloc[-1].item()
-    latest_signal = data["SignalLine"].iloc[-1].item()
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.metric("MACD", round(latest_macd, 2))
-    
-    with col2:
-        st.metric("Signal Line", round(latest_signal, 2))
-    
-if latest_macd > latest_signal:
-    st.success("MACD Bullish ✅")
-else:
-    st.error("MACD Bearish ❌")
+    st.write("Confidence Score:", f"{confidence}%")
 
-# Strong Signal Engine
-if (
-    ema20 > ema50
-    and close_price > ema20
-    and latest_rsi > 60
-    and latest_macd > latest_signal
-):
-    st.success("🔥 STRONG CALL BUY")
-    confidence = "High"
+    st.write(
+        "Last Updated:",
+        datetime.now().strftime("%d-%m-%Y %H:%M:%S")
+    )
 
-elif (
-    ema20 < ema50
-    and close_price < ema20
-    and latest_rsi < 40
-    and latest_macd < latest_signal
-):
-    st.error("🔥 STRONG PUT BUY")
-    confidence = "High"
+    st.subheader("Price Chart")
 
-else:
-    st.warning("⏸️ NO TRADE")
-    confidence = "Low"
+    fig, ax = plt.subplots(figsize=(10, 5))
 
-st.write("Signal Strength:", confidence)
+    ax.plot(data["Close"], label="Close")
+    ax.plot(data["EMA20"], label="EMA20")
+    ax.plot(data["EMA50"], label="EMA50")
 
-st.write(
-    "Last Updated:",
-    datetime.now().strftime("%d-%m-%Y %H:%M:%S")
-)
+    ax.legend()
+    ax.grid(True)
 
-st.subheader("Price Chart")
-
-fig, ax = plt.subplots(figsize=(10, 5))
-
-ax.plot(data["Close"], label="Close")
-ax.plot(data["EMA20"], label="EMA20")
-ax.plot(data["EMA50"], label="EMA50")
-
-ax.legend()
-ax.grid(True)
-
-st.pyplot(fig)
+    st.pyplot(fig)
