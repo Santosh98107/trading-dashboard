@@ -61,7 +61,7 @@ ema20 = data["EMA20"].iloc[-1].item()
 data["EMA50"] = data["Close"].ewm(span=50).mean()
 ema50 = data["EMA50"].iloc[-1].item()
  
-   col1, col2 = st.columns(2)
+  col1, col2 = st.columns(2)
 
    with col1:
        st.metric(
