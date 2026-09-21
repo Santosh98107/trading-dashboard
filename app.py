@@ -122,8 +122,8 @@ if latest_macd > latest_signal:
     st.success("MACD Bullish ✅")
 else:
     st.error("MACD Bearish ❌")
-    # Strong Signal Engine
 
+# Strong Signal Engine
 if (
     ema20 > ema50
     and close_price > ema20
@@ -147,10 +147,6 @@ else:
     confidence = "Low"
 
 st.write("Signal Strength:", confidence)
-
-    
-    
-
 
 st.write(
     "Last Updated:",
