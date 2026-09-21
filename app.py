@@ -63,21 +63,21 @@ ema50 = data["EMA50"].iloc[-1].item()
  
   col1, col2 = st.columns(2)
 
-   with col1:
-       st.metric(
-           "Current Price",
-           round(close_price, 2)
-       )
+  with col1:
+      st.metric(
+          "Current Price",
+          round(close_price, 2)
+      )
 
-       st.metric(
-           "EMA20",
-           round(ema20, 2)
-       )
+      st.metric(
+          "EMA20",
+          round(ema20, 2)
+      )
 
-   with col2:
-       st.metric(
-            "VWAP",
-            round(last_vwap, 2)
+  with col2:
+      st.metric(
+           "VWAP",
+           round(last_vwap, 2)
         )
  
         st.metric(
