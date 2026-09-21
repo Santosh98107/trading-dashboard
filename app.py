@@ -100,6 +100,28 @@ elif latest_rsi < 40:
     st.error("RSI Bearish ❌")
 else:
     st.warning("RSI Neutral ⏸️")
+    # MACD Calculation
+exp1 = data["Close"].ewm(span=12, adjust=False).mean()
+exp2 = data["Close"].ewm(span=26, adjust=False).mean()
+
+data["MACD"] = exp1 - exp2
+data["SignalLine"] = data["MACD"].ewm(span=9, adjust=False).mean()
+
+latest_macd = data["MACD"].iloc[-1].item()
+latest_signal = data["SignalLine"].iloc[-1].item()
+
+col1, col2 = st.columns(2)
+
+with col1:
+    st.metric("MACD", round(latest_macd, 2))
+
+with col2:
+    st.metric("Signal Line", round(latest_signal, 2))
+
+if latest_macd > latest_signal:
+    st.success("MACD Bullish ✅")
+else:
+    st.error("MACD Bearish ❌")
 
     st.write(
         "Last Updated:",
