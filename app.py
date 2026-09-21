@@ -76,33 +76,32 @@ if st.button("Fetch Data"):
  
     trend = "🟢 BULLISH 📈" if ema20 > ema50 else "🔴 BEARISH 📉"
  
-    if "BULLISH" in trend:
-        st.success(trend)
-    else:
-        st.error(trend)
+if "BULLISH" in trend:
+    st.success(trend)
+else:
+    st.error(trend)
  
-    call_signal = (ema20 > ema50) and (close_price > ema20)
-    put_signal = (ema20 < ema50) and (close_price < ema20)
+call_signal = (ema20 > ema50) and (close_price > ema20)
+put_signal = (ema20 < ema50) and (close_price < ema20)
  
-    confidence = 50
+confidence = 50
  
-    if ema20 > ema50:
-        confidence += 25
+if ema20 > ema50:
+    confidence += 25
  
-    if close_price > ema20:
-        confidence += 25
+if close_price > ema20:
+    confidence += 25
  
-    st.write("Confidence Score:", f"{confidence}%")
+st.write("Confidence Score:", f"{confidence}%")
  
-    if call_signal:
-        signal = "✅ CALL BUY"
-    elif put_signal:
-        signal = "✅ PUT BUY"
-    else:
-        signal = "⏸️ NO TRADE"
+if call_signal:
+    signal = "✅ CALL BUY"
+elif put_signal:
+    signal = "✅ PUT BUY"
+else:
+    signal = "⏸️ NO TRADE"
  
-    st.write("Signal:", signal) 
-
+st.write("Signal:", signal)
  
 if ema20 > ema50:
     confidence += 25
