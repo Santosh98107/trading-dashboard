@@ -53,6 +53,25 @@ if st.button("Fetch Data"):
 
     ema20 = data["EMA20"].iloc[-1].item()
     ema50 = data["EMA50"].iloc[-1].item()
+    # ATR (14)
+high_low = data["High"] - data["Low"]
+
+high_close = abs(
+    data["High"] - data["Close"].shift(1)
+)
+
+low_close = abs(
+    data["Low"] - data["Close"].shift(1)
+)
+
+true_range = pd.concat(
+    [high_low, high_close, low_close],
+    axis=1
+).max(axis=1)
+
+data["ATR"] = true_range.rolling(14).mean()
+
+latest_atr = data["ATR"].iloc[-1].item()
 
     col1, col2 = st.columns(2)
 
