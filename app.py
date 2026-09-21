@@ -121,8 +121,7 @@ if st.button("Fetch Data"):
     if latest_macd > latest_signal:
         st.success("MACD Bullish ✅")
     else:
- if st.button("Fetch Data"):
-    # all calculations here
+ 
 
     if (
         ema20 > ema50
