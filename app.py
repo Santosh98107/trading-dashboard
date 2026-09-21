@@ -76,6 +76,30 @@ if st.button("Fetch Data"):
         confidence += 25
 
     st.write("Confidence Score:", f"{confidence}%")
+    # RSI Calculation
+delta = data["Close"].diff()
+
+gain = delta.where(delta > 0, 0)
+loss = -delta.where(delta < 0, 0)
+
+avg_gain = gain.rolling(window=14).mean()
+avg_loss = loss.rolling(window=14).mean()
+
+avg_loss = avg_loss.replace(0, 1e-10)
+
+rs = avg_gain / avg_loss
+data["RSI"] = 100 - (100 / (1 + rs))
+
+latest_rsi = data["RSI"].iloc[-1].item()
+
+st.metric("RSI (14)", round(latest_rsi, 2))
+
+if latest_rsi > 60:
+    st.success("RSI Bullish ✅")
+elif latest_rsi < 40:
+    st.error("RSI Bearish ❌")
+else:
+    st.warning("RSI Neutral ⏸️")
 
     st.write(
         "Last Updated:",
