@@ -51,7 +51,8 @@ if st.button("Fetch Data"):
         / volume.cumsum()
     )
  
-    last_vwap = vwap.iloc[-1].item()close_price = data["Close"].iloc[-1].item()
+    last_vwap = vwap.iloc[-1].item()
+ close_price = data["Close"].iloc[-1].item()
  
 data["EMA20"] = data["Close"].ewm(span=20).mean()
 ema20 = data["EMA20"].iloc[-1].item()
