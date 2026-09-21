@@ -44,14 +44,14 @@ if st.button("Fetch Data"):
         st.error("No data found for selected symbol")
         st.stop()
  
- volume = data["Volume"]
-  
- vwap = (
-     (data["Close"] * volume).cumsum()
-     / volume.cumsum()
- )
-  
- last_vwap = vwap.iloc[-1].item()
+  volume = data["Volume"]
+   
+  vwap = (
+      (data["Close"] * volume).cumsum()
+      / volume.cumsum()
+  )
+   
+  last_vwap = vwap.iloc[-1].item()
   
 close_price = data["Close"].iloc[-1].item()
  
