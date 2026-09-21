@@ -48,8 +48,8 @@ if st.button("Fetch Data"):
     last_vwap = vwap.iloc[-1].item()
     close_price = data["Close"].iloc[-1].item()
 
-    data["EMA20"] = data["Close"].ewm(span=20).mean()
-    data["EMA50"] = data["Close"].ewm(span=50).mean()
+    data["EMA20"] = data["Close"].ewm(span=20, adjust=False).mean()
+    data["EMA50"] = data["Close"].ewm(span=50, adjust=False).mean()
 
     ema20 = data["EMA20"].iloc[-1].item()
     ema50 = data["EMA50"].iloc[-1].item()
@@ -65,9 +65,73 @@ if st.button("Fetch Data"):
         st.metric("EMA50", round(ema50, 2))
 
     trend = "🟢 BULLISH 📈" if ema20 > ema50 else "🔴 BEARISH 📉"
-    st.write("Trend:", trend)
 
-    confidence = 50
+    if "BULLISH" in trend:
+        st.success(trend)
+    else:
+        st.error(trend)
+
+    # RSI
+    delta = data["Close"].diff()
+
+    gain = delta.where(delta > 0, 0)
+    loss = -delta.where(delta < 0, 0)
+
+    avg_gain = gain.rolling(window=14).mean()
+    avg_loss = loss.rolling(window=14).mean()
+
+    avg_loss = avg_loss.replace(0, 1e-10)
+
+    rs = avg_gain / avg_loss
+    data["RSI"] = 100 - (100 / (1 + rs))
+
+    latest_rsi = data["RSI"].iloc[-1].item()
+
+    st.metric("RSI (14)", round(latest_rsi, 2))
+
+    if latest_rsi > 60:
+        st.success("RSI Bullish ✅")
+    elif latest_rsi < 40:
+        st.error("RSI Bearish ❌")
+    else:
+        st.warning("RSI Neutral ⏸️")
+
+    # MACD
+    exp1 = data["Close"].ewm(
+        span=12,
+        adjust=False
+    ).mean()
+
+    exp2 = data["Close"].ewm(
+        span=26,
+        adjust=False
+    ).mean()
+
+    data["MACD"] = exp1 - exp2
+
+    data["SignalLine"] = data["MACD"].ewm(
+        span=9,
+        adjust=False
+    ).mean()
+
+    latest_macd = data["MACD"].iloc[-1].item()
+    latest_signal = data["SignalLine"].iloc[-1].item()
+
+    col3, col4 = st.columns(2)
+
+    with col3:
+        st.metric("MACD", round(latest_macd, 2))
+
+    with col4:
+        st.metric("Signal Line", round(latest_signal, 2))
+
+    if latest_macd > latest_signal:
+        st.success("MACD Bullish ✅")
+    else:
+        st.error("MACD Bearish ❌")
+
+    # Confidence Score
+    confidence = 0
 
     if ema20 > ema50:
         confidence += 25
@@ -75,7 +139,33 @@ if st.button("Fetch Data"):
     if close_price > ema20:
         confidence += 25
 
+    if latest_rsi > 60:
+        confidence += 25
+
+    if latest_macd > latest_signal:
+        confidence += 25
+
     st.write("Confidence Score:", f"{confidence}%")
+
+    # Strong Signal
+    if (
+        ema20 > ema50
+        and close_price > ema20
+        and latest_rsi > 60
+        and latest_macd > latest_signal
+    ):
+        st.success("🔥 STRONG CALL BUY")
+
+    elif (
+        ema20 < ema50
+        and close_price < ema20
+        and latest_rsi < 40
+        and latest_macd < latest_signal
+    ):
+        st.error("🔥 STRONG PUT BUY")
+
+    else:
+        st.warning("⏸️ NO TRADE")
 
     st.write(
         "Last Updated:",
