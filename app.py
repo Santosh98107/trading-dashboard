@@ -157,15 +157,15 @@ st.write(
     datetime.now().strftime("%d-%m-%Y %H:%M:%S")
 )
 
-    st.subheader("Price Chart")
+st.subheader("Price Chart")
 
-    fig, ax = plt.subplots(figsize=(10, 5))
+fig, ax = plt.subplots(figsize=(10, 5))
 
-    ax.plot(data["Close"], label="Close")
-    ax.plot(data["EMA20"], label="EMA20")
-    ax.plot(data["EMA50"], label="EMA50")
+ax.plot(data["Close"], label="Close")
+ax.plot(data["EMA20"], label="EMA20")
+ax.plot(data["EMA50"], label="EMA50")
 
-    ax.legend()
-    ax.grid(True)
+ax.legend()
+ax.grid(True)
 
-    st.pyplot(fig)
+st.pyplot(fig)
