@@ -150,10 +150,12 @@ st.write("Signal Strength:", confidence)
 
     
     
-    st.write(
-        "Last Updated:",
-        datetime.now().strftime("%d-%m-%Y %H:%M:%S")
-    )
+
+
+st.write(
+    "Last Updated:",
+    datetime.now().strftime("%d-%m-%Y %H:%M:%S")
+)
 
     st.subheader("Price Chart")
 
