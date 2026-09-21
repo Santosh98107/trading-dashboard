@@ -118,7 +118,7 @@ if st.button("Fetch Data"):
     with col2:
         st.metric("Signal Line", round(latest_signal, 2))
     
-    if latest_macd > latest_signal:
+if latest_macd > latest_signal:
     st.success("MACD Bullish ✅")
 else:
     st.error("MACD Bearish ❌")
