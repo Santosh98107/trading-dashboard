@@ -122,6 +122,24 @@ if st.button("Fetch Data"):
         st.success("MACD Bullish ✅")
     else:
         st.error("MACD Bearish ❌")
+        if (
+    ema20 > ema50
+    and close_price > ema20
+    and latest_rsi > 60
+    and latest_macd > latest_signal
+):
+    st.success("🔥 STRONG CALL BUY")
+
+elif (
+    ema20 < ema50
+    and close_price < ema20
+    and latest_rsi < 40
+    and latest_macd < latest_signal
+):
+    st.error("🔥 STRONG PUT BUY")
+
+else:
+    st.warning("⏸️ NO TRADE")
 
     st.write(
         "Last Updated:",
