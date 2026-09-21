@@ -149,7 +149,7 @@ else:
 st.write("Signal Strength:", confidence)
 
     
-    st.write("Signal Strength:", confidence)
+    
     st.write(
         "Last Updated:",
         datetime.now().strftime("%d-%m-%Y %H:%M:%S")
