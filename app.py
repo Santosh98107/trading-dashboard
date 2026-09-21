@@ -41,27 +41,25 @@ if st.button("Fetch Data"):
     data = yf.download(ticker, period="5d")
  
     if data.empty:
-     st.error("No data found for selected symbol")
-     st.stop()
+    st.error("No data found for selected symbol")
+    st.stop()
  
- volume = data["Volume"]
-  
- vwap = (
-     (data["Close"] * volume).cumsum()
-     / volume.cumsum()
- )
-  
- last_vwap = vwap.iloc[-1].item()
-  
- close_price = data["Close"].iloc[-1].item()
-  
- data["EMA20"] = data["Close"].ewm(span=20).mean()
- ema20 = data["EMA20"].iloc[-1].item()
-  
- data["EMA50"] = data["Close"].ewm(span=50).mean()
-  
- ema50 = data["EMA50"].iloc[-1].item()
- ema50 = data["EMA50"].iloc[-1].item()
+volume = data["Volume"]
+ 
+vwap = (
+    (data["Close"] * volume).cumsum()
+    / volume.cumsum()
+)
+ 
+last_vwap = vwap.iloc[-1].item()
+ 
+close_price = data["Close"].iloc[-1].item()
+ 
+data["EMA20"] = data["Close"].ewm(span=20).mean()
+ema20 = data["EMA20"].iloc[-1].item()
+ 
+data["EMA50"] = data["Close"].ewm(span=50).mean()
+ema50 = data["EMA50"].iloc[-1].item()
  
 col1, col2 = st.columns(2)
  
