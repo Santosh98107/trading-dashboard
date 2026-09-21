@@ -46,90 +46,62 @@ if st.button("Fetch Data"):
  
     volume = data["Volume"]
  
-vwap = (
-    (data["Close"] * volume).cumsum()
-    / volume.cumsum()
-)
- 
-last_vwap = vwap.iloc[-1].item()
- 
-close_price = data["Close"].iloc[-1].item()
- 
-data["EMA20"] = data["Close"].ewm(span=20).mean()
-ema20 = data["EMA20"].iloc[-1].item()
- 
-data["EMA50"] = data["Close"].ewm(span=50).mean()
-ema50 = data["EMA50"].iloc[-1].item()
- 
-col1, col2 = st.columns(2)
- 
-with col1:
-    st.metric(
-        "Current Price",
-        round(close_price, 2)
+    vwap = (
+        (data["Close"] * volume).cumsum()
+        / volume.cumsum()
     )
  
-    st.metric(
-        "EMA20",
-        round(ema20, 2)
-    )
+    last_vwap = vwap.iloc[-1].item()
  
-with col2:
-    st.metric(
-        "VWAP",
-        round(last_vwap, 2)
-    )
+    close_price = data["Close"].iloc[-1].item()
  
-    st.metric(
-        "EMA50",
-        round(ema50, 2)
-    )
+    data["EMA20"] = data["Close"].ewm(span=20).mean()
+    ema20 = data["EMA20"].iloc[-1].item()
  
-st.write("PCR:", "Coming Soon")
-st.write("PCR Trend:", "Coming Soon")
+    data["EMA50"] = data["Close"].ewm(span=50).mean()
+    ema50 = data["EMA50"].iloc[-1].item()
  
-st.write(
-    "Last Updated:",
-    datetime.now().strftime("%d-%m-%Y %H:%M:%S")
-)
+    col1, col2 = st.columns(2)
  
-if ema20 > ema50:
-    trend = "🟢 BULLISH 📈"
-else:
-    trend = "🔴 BEARISH 📉"
+    with col1:
+        st.metric("Current Price", round(close_price, 2))
+        st.metric("EMA20", round(ema20, 2))
  
-if "BULLISH" in trend:
-    st.success(trend)
-else:
-    st.error(trend)
+    with col2:
+        st.metric("VWAP", round(last_vwap, 2))
+        st.metric("EMA50", round(ema50, 2))
  
-call_signal = (ema20 > ema50) and (close_price > ema20)
-put_signal = (ema20 < ema50) and (close_price < ema20)
+    st.write("PCR:", "Coming Soon")
+    st.write("PCR Trend:", "Coming Soon")
  
-confidence = 50
+    trend = "🟢 BULLISH 📈" if ema20 > ema50 else "🔴 BEARISH 📉"
  
-if ema20 > ema50:
-    confidence += 25
+    if "BULLISH" in trend:
+        st.success(trend)
+    else:
+        st.error(trend)
  
-if close_price > ema20:
-    confidence += 25
+    call_signal = (ema20 > ema50) and (close_price > ema20)
+    put_signal = (ema20 < ema50) and (close_price < ema20)
  
-st.write(
-    "Confidence Score:",
-    f"{confidence}%"
-)
+    confidence = 50
  
-if call_signal:
-    signal = "✅ CALL BUY"
+    if ema20 > ema50:
+        confidence += 25
  
-elif put_signal:
-    signal = "✅ PUT BUY"
+    if close_price > ema20:
+        confidence += 25
  
-else:
-    signal = "⏸️ NO TRADE"
+    st.write("Confidence Score:", f"{confidence}%")
  
-st.write("Signal:", signal)
+    if call_signal:
+        signal = "✅ CALL BUY"
+    elif put_signal:
+        signal = "✅ PUT BUY"
+    else:
+        signal = "⏸️ NO TRADE"
  
+    st.write("Signal:", signal) 
 
  
 if ema20 > ema50:
