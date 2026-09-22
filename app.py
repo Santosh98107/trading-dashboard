@@ -260,7 +260,20 @@ def resample_to_10m(df):
     }).dropna()
 
 
-def compute_rsi(series, window=14):
+    def compute_rsi(series, window=14):
+    delta = series.diff()
+ 
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+ 
+    avg_gain = gain.rolling(window=window).mean()
+    avg_loss = loss.rolling(window=window).mean()
+ 
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+ 
+    rsi = 100 - (100 / (1 + rs))
+ 
+    return rsi.fillna(50)
     delta = series.diff()
     gain = delta.where(delta > 0, 0.0)
     loss = -delta.where(delta < 0, 0.0)
