@@ -796,10 +796,16 @@ if data.empty:
 if timeframe == "10m":
     data = resample_to_10m(data)
 
-data = add_indicators(data).dropna().copy()
-
-if len(data) < 80:
-    st.warning("Not enough data to calculate indicators.")
+data = add_indicators(data)
+ 
+st.write("Rows after indicators:", len(data))
+ 
+data = data.dropna().copy()
+ 
+st.write("Rows after dropna:", len(data))
+ 
+if len(data) < 30:
+    st.warning(f"Only {len(data)} rows available after indicator calculation.")
     st.stop()
 
 htf_interval, htf_period = get_higher_timeframe(timeframe)
