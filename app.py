@@ -312,12 +312,12 @@ def add_indicators(df):
 
     vol_cum = df["Volume"].cumsum()
  
-df["VWAP"] = (
+    df["VWAP"] = (
     (df["Close"] * df["Volume"]).cumsum()
     / vol_cum.replace(0, 1)
-)
+     )
  
-df["VWAP"] = df["VWAP"].fillna(df["Close"])
+    df["VWAP"] = df["VWAP"].fillna(df["Close"])
     
 
     df["RSI"] = compute_rsi(df["Close"], 14)
