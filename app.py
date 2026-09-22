@@ -798,9 +798,19 @@ if timeframe == "10m":
 
 data = add_indicators(data)
  
-st.write("Rows after indicators:", len(data))
+# Only drop rows where critical indicators are missing
+required_cols = [
+    "EMA20",
+    "EMA50",
+    "RSI",
+    "MACD",
+    "SignalLine",
+    "ATR"
+]
  
-data = data.dropna().copy()
+data = data.dropna(subset=required_cols).copy()
+ 
+st.write("Rows after dropna:", len(data))
  
 st.write("Rows after dropna:", len(data))
  
