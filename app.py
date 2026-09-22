@@ -330,6 +330,7 @@ def add_indicators(df):
     / vol_cum.replace(0, 1)
      )
  
+    df["VWAP"] = df["VWAP"].replace([np.inf, -np.inf], np.nan)
     df["VWAP"] = df["VWAP"].fillna(df["Close"])
     
 
