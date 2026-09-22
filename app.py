@@ -347,7 +347,10 @@ def add_indicators(df):
     df["Breakout"] = df["Close"] > df["PivotHigh"].shift(1)
     df["Breakdown"] = df["Close"] < df["PivotLow"].shift(1)
 
-    df["StochK"], df["StochD"] = compute_stochastic(df)
+    k, d = compute_stochastic(df)
+ 
+    df["StochK"] = k.rolling(3).mean()
+    df["StochD"] = d.rolling(3).mean()
     df["ADX"], df["PlusDI"], df["MinusDI"] = compute_adx(df)
 
     candle_body = (df["Close"] - df["Open"]).abs()
