@@ -861,10 +861,10 @@ required_cols = [
     "ATR"
 ]
  
-# data = data.dropna(subset=required_cols).copy()
+ # data = data.dropna(subset=required_cols).copy()
  
-data = data.fillna(method="bfill")
-data = data.fillna(method="ffill")
+ data = data.fillna(method="bfill")
+ data = data.fillna(method="ffill")
  
 
  
