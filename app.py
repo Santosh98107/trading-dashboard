@@ -703,9 +703,9 @@ def simple_backtest(df):
     results = []
     df = df.copy().dropna()
 
-    for i in range(80, len(df) - 3):
+    for i in range(30, len(df) - 3):
         sub = df.iloc[:i + 1]
-        if len(sub) < 80:
+        if len(sub) < 30:
             continue
 
         analysis = analyze_signal(sub, htf_bias=None, timeframe_label="1d", backtest_win_rate=50)
