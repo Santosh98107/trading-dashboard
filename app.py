@@ -810,9 +810,7 @@ required_cols = [
  
 data = data.dropna(subset=required_cols).copy()
  
-st.write("Rows after dropna:", len(data))
- 
-st.write("Rows after dropna:", len(data))
+
  
 if len(data) < 30:
     st.warning(f"Only {len(data)} rows available after indicator calculation.")
