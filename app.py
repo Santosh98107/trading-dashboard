@@ -310,8 +310,15 @@ def add_indicators(df):
     df["EMA20"] = df["Close"].ewm(span=20, adjust=False).mean()
     df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
 
-    vol_cum = df["Volume"].replace(0, np.nan).cumsum()
-    df["VWAP"] = (df["Close"] * df["Volume"]).cumsum() / vol_cum
+    vol_cum = df["Volume"].cumsum()
+ 
+df["VWAP"] = (
+    (df["Close"] * df["Volume"]).cumsum()
+    / vol_cum.replace(0, 1)
+)
+ 
+df["VWAP"] = df["VWAP"].fillna(df["Close"])
+    
 
     df["RSI"] = compute_rsi(df["Close"], 14)
 
