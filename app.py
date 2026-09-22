@@ -247,8 +247,8 @@ def fetch_data(ticker, interval, period):
 
     df = df[needed].dropna().copy()
  
-df["Volume"] = df["Volume"].fillna(1)
-df["Volume"] = df["Volume"].replace(0, 1)
+    df["Volume"] = df["Volume"].fillna(1)
+    df["Volume"] = df["Volume"].replace(0, 1)
  
 return df
 
