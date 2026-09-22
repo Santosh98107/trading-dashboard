@@ -719,6 +719,7 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
 def simple_backtest(df):
     results = []
     df = df.copy().dropna()
+    st.write("Backtest candles:", len(df))
 
     for i in range(30, len(df) - 3):
         sub = df.iloc[:i + 1]
