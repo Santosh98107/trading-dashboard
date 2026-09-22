@@ -245,7 +245,12 @@ def fetch_data(ticker, interval, period):
     if missing:
         return pd.DataFrame()
 
-    return df[needed].dropna().copy()
+    df = df[needed].dropna().copy()
+ 
+df["Volume"] = df["Volume"].fillna(1)
+df["Volume"] = df["Volume"].replace(0, 1)
+ 
+return df
 
 
 def resample_to_10m(df):
