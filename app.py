@@ -788,7 +788,7 @@ else:
 ticker = stocks[selected]
 data = fetch_data(ticker, yf_interval, yf_period)
  
-st.write("Rows fetched from Yahoo:", len(data))
+
  
 if data.empty:
     st.error("No data found")
