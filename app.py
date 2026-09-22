@@ -260,7 +260,7 @@ def resample_to_10m(df):
     }).dropna()
 
 
-    def compute_rsi(series, window=14):
+def compute_rsi(series, window=14):
     delta = series.diff()
  
     gain = delta.clip(lower=0)
