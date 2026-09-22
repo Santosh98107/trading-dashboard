@@ -274,13 +274,7 @@ def compute_rsi(series, window=14):
     rsi = 100 - (100 / (1 + rs))
  
     return rsi.fillna(50)
-    delta = series.diff()
-    gain = delta.where(delta > 0, 0.0)
-    loss = -delta.where(delta < 0, 0.0)
-    avg_gain = gain.rolling(window).mean()
-    avg_loss = loss.rolling(window).mean().replace(0, 1e-10)
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
+    
 
 
 def compute_stochastic(df, k_window=14, d_window=3):
