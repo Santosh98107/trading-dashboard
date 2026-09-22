@@ -250,7 +250,7 @@ def fetch_data(ticker, interval, period):
     df["Volume"] = df["Volume"].fillna(1)
     df["Volume"] = df["Volume"].replace(0, 1)
  
-return df
+    return df
 
 
 def resample_to_10m(df):
