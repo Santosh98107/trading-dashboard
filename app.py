@@ -376,18 +376,7 @@ def add_indicators(df):
     upper_shadow = df["High"] - df[["Open", "Close"]].max(axis=1)
     lower_shadow = df[["Open", "Close"]].min(axis=1) - df["Low"]
     
-    df["Hammer"] = (
-        (lower_shadow > candle_body * 2)
-        & (upper_shadow < candle_body)
-    )
-    
-    df["ShootingStar"] = (
-        (upper_shadow > candle_body * 2)
-        & (lower_shadow < candle_body)
-    )
-    
-    df["BullishMarubozu"] = (
-        (df["Close"] > df["Open"])
+            (df["Close"] > df["Open"])
         & (upper_shadow < candle_body * 0.1)
         & (lower_shadow < candle_body * 0.1)
     )
