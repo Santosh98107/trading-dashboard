@@ -570,6 +570,11 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
     breakout = bool(latest["Breakout"])
     breakdown = bool(latest["Breakdown"])
     body_strength = float(latest["BodyStrength"])
+    hammer = bool(latest["Hammer"])
+    shooting_star = bool(latest["ShootingStar"])
+    bull_maru = bool(latest["BullishMarubozu"])
+    bear_maru = bool(latest["BearishMarubozu"])
+    doji = bool(latest["Doji"])
     plus_di = float(latest["PlusDI"])
     minus_di = float(latest["MinusDI"])
 
