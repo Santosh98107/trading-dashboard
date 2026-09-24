@@ -848,9 +848,7 @@ if timeframe == "10m":
 data = add_indicators(data)
 
 
-st.write("Last Volume :", data["Volume"].iloc[-1])
-st.write("Last VWAP :", data["VWAP"].iloc[-1])
-st.write("Last RSI :", data["RSI"].iloc[-1])
+
  
 # Only drop rows where critical indicators are missing
 required_cols = [
