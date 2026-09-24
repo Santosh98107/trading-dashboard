@@ -646,7 +646,7 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
         bullish += 2
         reasons.append("Resistance breakout")
 
-if hammer:
+    if hammer:
     bullish += 2
     reasons.append("Hammer pattern detected")
 
