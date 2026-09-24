@@ -780,7 +780,7 @@ def simple_backtest(df):
     
     
     
-st.write(df.columns.tolist())
+    st.write(df.columns.tolist())
     for i in range(30, len(df) - 3):
         sub = df.iloc[:i + 1]
         if len(sub) < 30:
