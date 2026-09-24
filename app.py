@@ -450,7 +450,7 @@ def session_filter(df, tf):
         if time(12, 15) <= current_t <= time(13, 15):
             return {"valid": False, "message": "Lunch/session low momentum zone"}
         return {"valid": True, "message": "Session timing looks okay"}
-        except Exception:
+    except Exception:
         return {"valid": True, "message": "Session filter unavailable"}
 
 
@@ -462,6 +462,7 @@ def calculate_win_chance(bullish, bearish, adx, volume_spike, breakout, breakdow
         score += 8
     elif adx < 18:
         score -= 10
+
     if volume_spike:
         score += 5
     if breakout:
@@ -646,27 +647,13 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
         bullish += 2
         reasons.append("Resistance breakout")
 
-    if hammer:
-        bullish += 2
-        reasons.append("Hammer pattern detected")
+    if breakdown:
+        bearish += 2
+        reasons.append("Support breakdown")
 
-    if bull_maru:
-        bullish += 2
-        reasons.append("Bullish Marubozu detected")
-    
-    if shooting_star:
-        bearish += 2
-        reasons.append("Shooting Star detected")
-    
-    if bear_maru:
-        bearish += 2
-        reasons.append("Bearish Marubozu detected")
-    
-    if doji:
-        reasons.append("Doji pattern (market indecision)")
     if volume_spike:
         reasons.append("Volume spike present")
-    if close_price > ema20:
+        if close_price > ema20:
             bullish += 1
         else:
             bearish += 1
