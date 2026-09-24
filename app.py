@@ -649,7 +649,24 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
     if breakdown:
         bearish += 2
         reasons.append("Support breakdown")
+    if hammer:
+    bullish += 2
+    reasons.append("Hammer pattern detected")
 
+    if bull_maru:
+    bullish += 2
+    reasons.append("Bullish Marubozu detected")
+
+    if shooting_star:
+    bearish += 2
+    reasons.append("Shooting Star detected")
+
+    if bear_maru:
+    bearish += 2
+    reasons.append("Bearish Marubozu detected")
+
+    if doji:
+    reasons.append("Doji pattern (market indecision)")
     if volume_spike:
         reasons.append("Volume spike present")
         if close_price > ema20:
