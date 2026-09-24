@@ -462,7 +462,24 @@ def calculate_win_chance(bullish, bearish, adx, volume_spike, breakout, breakdow
         score += 8
     elif adx < 18:
         score -= 10
-
+    if hammer:
+        bullish += 2
+        reasons.append("Hammer pattern detected")
+    
+    if bull_maru:
+        bullish += 2
+        reasons.append("Bullish Marubozu detected")
+    
+    if shooting_star:
+        bearish += 2
+        reasons.append("Shooting Star detected")
+    
+    if bear_maru:
+        bearish += 2
+        reasons.append("Bearish Marubozu detected")
+    
+    if doji:
+        reasons.append("Doji pattern (market indecision)")
     if volume_spike:
         score += 5
     if breakout:
