@@ -370,38 +370,38 @@ def add_indicators(df):
     df["StochD"] = d.rolling(3).mean()
     df["ADX"], df["PlusDI"], df["MinusDI"] = compute_adx(df)
 
-candle_body = (df["Close"] - df["Open"]).abs()
-candle_range = (df["High"] - df["Low"]).replace(0, 1e-10)
-
-upper_shadow = df["High"] - df[["Open", "Close"]].max(axis=1)
-lower_shadow = df[["Open", "Close"]].min(axis=1) - df["Low"]
-
-df["Hammer"] = (
-    (lower_shadow > candle_body * 2)
-    & (upper_shadow < candle_body)
-)
-
-df["ShootingStar"] = (
-    (upper_shadow > candle_body * 2)
-    & (lower_shadow < candle_body)
-)
-
-df["BullishMarubozu"] = (
-    (df["Close"] > df["Open"])
-    & (upper_shadow < candle_body * 0.1)
-    & (lower_shadow < candle_body * 0.1)
-)
-
-df["BearishMarubozu"] = (
-    (df["Close"] < df["Open"])
-    & (upper_shadow < candle_body * 0.1)
-    & (lower_shadow < candle_body * 0.1)
-)
-
-df["Doji"] = candle_body <= (candle_range * 0.1)
-
-df["BodyStrength"] = candle_body / candle_range
-df["BuyMarker"] = np.where(
+    candle_body = (df["Close"] - df["Open"]).abs()
+    candle_range = (df["High"] - df["Low"]).replace(0, 1e-10)
+    
+    upper_shadow = df["High"] - df[["Open", "Close"]].max(axis=1)
+    lower_shadow = df[["Open", "Close"]].min(axis=1) - df["Low"]
+    
+    df["Hammer"] = (
+        (lower_shadow > candle_body * 2)
+        & (upper_shadow < candle_body)
+    )
+    
+    df["ShootingStar"] = (
+        (upper_shadow > candle_body * 2)
+        & (lower_shadow < candle_body)
+    )
+    
+    df["BullishMarubozu"] = (
+        (df["Close"] > df["Open"])
+        & (upper_shadow < candle_body * 0.1)
+        & (lower_shadow < candle_body * 0.1)
+    )
+    
+    df["BearishMarubozu"] = (
+        (df["Close"] < df["Open"])
+        & (upper_shadow < candle_body * 0.1)
+        & (lower_shadow < candle_body * 0.1)
+    )
+    
+    df["Doji"] = candle_body <= (candle_range * 0.1)
+    
+    df["BodyStrength"] = candle_body / candle_range
+    df["BuyMarker"] = np.where(
         (df["EMA20"] > df["EMA50"]) & (df["EMA20"].shift(1) <= df["EMA50"].shift(1)),
         df["Low"] * 0.995,
         np.nan
