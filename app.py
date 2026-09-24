@@ -666,7 +666,7 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
         reasons.append("Doji pattern (market indecision)")
     if volume_spike:
         reasons.append("Volume spike present")
-        if close_price > ema20:
+    if close_price > ema20:
             bullish += 1
         else:
             bearish += 1
