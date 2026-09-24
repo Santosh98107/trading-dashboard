@@ -399,7 +399,13 @@ def add_indicators(df):
     )
     
     df["Doji"] = candle_body <= (candle_range * 0.1)
+        upper_shadow = df["High"] - df[["Open", "Close"]].max(axis=1)
+    lower_shadow = df[["Open", "Close"]].min(axis=1) - df["Low"]
     
+    df["Hammer"] = (
+        (lower_shadow > candle_body * 2)
+        & (upper_shadow < candle_body)
+    )
     df["BodyStrength"] = candle_body / candle_range
     df["BuyMarker"] = np.where(
         (df["EMA20"] > df["EMA50"]) & (df["EMA20"].shift(1) <= df["EMA50"].shift(1)),
