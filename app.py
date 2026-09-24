@@ -371,6 +371,35 @@ def add_indicators(df):
     df["ADX"], df["PlusDI"], df["MinusDI"] = compute_adx(df)
 
     candle_body = (df["Close"] - df["Open"]).abs()
+    candle_body = (df["Close"] - df["Open"]).abs()
+candle_range = df["High"] - df["Low"]
+
+upper_shadow = df["High"] - df[["Open", "Close"]].max(axis=1)
+lower_shadow = df[["Open", "Close"]].min(axis=1) - df["Low"]
+
+df["Hammer"] = (
+    (lower_shadow > candle_body * 2) &
+    (upper_shadow < candle_body)
+)
+
+df["ShootingStar"] = (
+    (upper_shadow > candle_body * 2) &
+    (lower_shadow < candle_body)
+)
+
+df["BullishMarubozu"] = (
+    (df["Close"] > df["Open"]) &
+    (upper_shadow < candle_body * 0.1) &
+    (lower_shadow < candle_body * 0.1)
+)
+
+df["BearishMarubozu"] = (
+    (df["Close"] < df["Open"]) &
+    (upper_shadow < candle_body * 0.1) &
+    (lower_shadow < candle_body * 0.1)
+)
+
+df["Doji"] = candle_body <= (candle_range * 0.1)
     candle_range = (df["High"] - df["Low"]).replace(0, 1e-10)
     df["BodyStrength"] = candle_body / candle_range
 
