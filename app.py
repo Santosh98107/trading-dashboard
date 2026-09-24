@@ -374,12 +374,16 @@ def add_indicators(df):
     candle_range = (df["High"] - df["Low"]).replace(0, 1e-10)
     
     upper_shadow = df["High"] - df[["Open", "Close"]].max(axis=1)
-    lower_shadow = df[["Open", "Close"]].min(axis=1) - df["Low"]
-    
-            (df["Close"] > df["Open"])
-        & (upper_shadow < candle_body * 0.1)
-        & (lower_shadow < candle_body * 0.1)
+    lower_shadow = df[["Open", "Close"]].min(axis=1) - df["Low"]    
+    df["BullishMarubozu"] = (
+    (df["Close"] > df["Open"])
+    & (upper_shadow < candle_body * 0.1)
+    & (lower_shadow < candle_body * 0.1)
     )
+    
+        
+        
+    
     
     df["BearishMarubozu"] = (
         (df["Close"] < df["Open"])
