@@ -846,15 +846,7 @@ if timeframe == "10m":
     data = resample_to_10m(data)
 
 data = add_indicators(data)
-st.write(data[[
-    "Close",
-    "RSI",
-    "VWAP",
-    "ATR",
-    "ADX",
-    "StochK",
-    "StochD"
-]].tail())
+
 st.write("Last Close :", data["Close"].iloc[-1])
 st.write("Last Volume :", data["Volume"].iloc[-1])
 st.write("Last VWAP :", data["VWAP"].iloc[-1])
