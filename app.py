@@ -450,7 +450,7 @@ def session_filter(df, tf):
         if time(12, 15) <= current_t <= time(13, 15):
             return {"valid": False, "message": "Lunch/session low momentum zone"}
         return {"valid": True, "message": "Session timing looks okay"}
-    except Exception:
+        except Exception:
         return {"valid": True, "message": "Session filter unavailable"}
 
 
@@ -647,8 +647,8 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
         reasons.append("Resistance breakout")
 
     if hammer:
-    bullish += 2
-    reasons.append("Hammer pattern detected")
+        bullish += 2
+        reasons.append("Hammer pattern detected")
 
     if bull_maru:
         bullish += 2
