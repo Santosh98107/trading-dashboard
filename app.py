@@ -835,7 +835,7 @@ else:
 
 ticker = stocks[selected]
 data = fetch_data(ticker, yf_interval, yf_period)
-st.write(data.tail())
+
  
 
  
