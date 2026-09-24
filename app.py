@@ -335,6 +335,10 @@ def add_indicators(df):
 
     df["RSI"] = compute_rsi(df["Close"], 14)
 
+df["RSI"] = df["RSI"].replace([np.inf, -np.inf], np.nan)
+df["RSI"] = df["RSI"].fillna(50)
+df["RSI"] = df["RSI"].clip(lower=1, upper=99)
+
     ema12 = df["Close"].ewm(span=12, adjust=False).mean()
     ema26 = df["Close"].ewm(span=26, adjust=False).mean()
     df["MACD"] = ema12 - ema26
