@@ -970,8 +970,8 @@ elif analysis["signal_type"] == "sell" and htf_bias == "bearish":
 
 elif analysis["signal_type"] in ["buy", "sell"]:
     mtf_confirmation = "⚠️ Timeframe Conflict"
-    else:
-        htf_bias = None
+else:
+    htf_bias = None
 else:
     htf_bias = None
 
