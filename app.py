@@ -399,6 +399,10 @@ def add_indicators(df):
     (lower_shadow > candle_body * 2)
     & (upper_shadow < candle_body)
     )
+    df["ShootingStar"] = (
+    (upper_shadow > candle_body * 2)
+    & (lower_shadow < candle_body)
+    )
 
     df["BodyStrength"] = candle_body / candle_range
     df["BuyMarker"] = np.where(
