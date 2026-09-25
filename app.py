@@ -945,7 +945,24 @@ analysis = analyze_signal(
     timeframe_label=timeframe,
     backtest_win_rate=backtest_win_rate
 )
+latest = data.iloc[-1]
 
+patterns = []
+
+if latest["Hammer"]:
+    patterns.append("🟢 Hammer")
+
+if latest["ShootingStar"]:
+    patterns.append("🔴 Shooting Star")
+
+if latest["BullishMarubozu"]:
+    patterns.append("🟢 Bullish Marubozu")
+
+if latest["BearishMarubozu"]:
+    patterns.append("🔴 Bearish Marubozu")
+
+if latest["Doji"]:
+    patterns.append("🟡 Doji")
 option_suggestion = suggest_option_strike(selected, analysis["close_price"], analysis["signal_type"])
 
 alert_text = (
