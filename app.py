@@ -972,6 +972,16 @@ analysis = analyze_signal(
     timeframe_label=timeframe,
     backtest_win_rate=backtest_win_rate
 )
+mtf_confirmation = "➖ Neutral"
+
+if analysis["signal_type"] == "buy" and htf_bias == "bullish":
+    mtf_confirmation = "✅ Bullish Alignment"
+
+elif analysis["signal_type"] == "sell" and htf_bias == "bearish":
+    mtf_confirmation = "✅ Bearish Alignment"
+
+elif analysis["signal_type"] in ["buy", "sell"]:
+    mtf_confirmation = "⚠️ Timeframe Conflict"
 quality_score = (
     analysis["win_chance"] +
     analysis["confidence"]
@@ -1080,7 +1090,7 @@ with m6:
 with m7:
     st.metric("Signal Quality", signal_quality)
 
-a1, a2, a3, a4, a5 = st.columns(5)
+a1, a2, a3, a4, a5,a6 = st.columns(6)
 
 with a1:
     st.metric("Support", round(analysis["support"], 2))
@@ -1092,7 +1102,8 @@ with a4:
     st.metric("Backtest Losses", losses)
 with a5:
     st.metric("Backtest Win Rate", f"{backtest_win_rate:.1f}%")
-
+with a6:
+    st.metric("MTF Status", mtf_confirmation)
 st.subheader("🎯 Option CALL/PUT Suggestion")
 if option_suggestion["type"] == "CALL":
     st.success(option_suggestion["text"])
