@@ -959,8 +959,8 @@ if not htf_data.empty:
     htf_data = add_indicators(htf_data).dropna().copy()
     if len(htf_data) > 20:
         htf_latest = htf_data.iloc[-1]
-        htf_bias = "bullish" if htf_latest["EMA20"] > htf_latest["EMA50"] else 
-"bearish"
+        htf_bias = "bullish" if htf_latest["EMA20"] > htf_latest["EMA50"] 
+else "bearish"
     
     else:
         htf_bias = None
