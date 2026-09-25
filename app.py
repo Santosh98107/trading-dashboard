@@ -961,8 +961,7 @@ if not htf_data.empty:
         htf_latest = htf_data.iloc[-1]
 htf_bias = "bullish" if htf_latest["EMA20"] > htf_latest["EMA50"] else "bearish"
     
-    else:
-        htf_bias = None
+
 else:
     htf_bias = None
 
