@@ -714,10 +714,10 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
         reasons.append("Weak candle body")
 
     if htf_bias == "bullish":
-        bullish += 1
+        bullish += 2
         reasons.append("Higher timeframe bullish confirmation")
     elif htf_bias == "bearish":
-        bearish += 1
+        bearish += 2
         reasons.append("Higher timeframe bearish confirmation")
 
     sideways = bool(adx < 18 and abs(ema20 - ema50) / close_price < 0.003)
