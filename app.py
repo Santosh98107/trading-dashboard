@@ -1077,6 +1077,8 @@ with m5:
 with m6:
     st.metric("Bullish Score", analysis["bullish_score"])
     st.metric("Bearish Score", analysis["bearish_score"])
+with m7:
+    st.metric("Signal Quality", signal_quality)
 
 a1, a2, a3, a4, a5 = st.columns(5)
 
