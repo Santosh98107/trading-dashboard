@@ -964,7 +964,6 @@ htf_bias = "bullish" if htf_latest["EMA20"] > htf_latest["EMA50"] else "bearish"
 
 else:
     htf_bias = None
-
 wins, losses, total_trades, backtest_win_rate = simple_backtest(data)
 analysis = analyze_signal(
     data,
