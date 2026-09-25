@@ -390,7 +390,19 @@ def add_indicators(df):
         & (upper_shadow < candle_body * 0.1)
         & (lower_shadow < candle_body * 0.1)
     )
-    
+    df["BullishEngulfing"] = (
+    (df["Close"] > df["Open"])
+    & (df["Close"].shift(1) < df["Open"].shift(1))
+    & (df["Open"] <= df["Close"].shift(1))
+    & (df["Close"] >= df["Open"].shift(1))
+    )
+
+    df["BearishEngulfing"] = (
+    (df["Close"] < df["Open"])
+    & (df["Close"].shift(1) > df["Open"].shift(1))
+    & (df["Open"] >= df["Close"].shift(1))
+    & (df["Close"] <= df["Open"].shift(1))
+    )
     df["Doji"] = candle_body <= (candle_range * 0.1)
     
     
