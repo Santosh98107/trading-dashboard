@@ -1020,6 +1020,11 @@ if latest["BullishEngulfing"]:
 
 if latest["BearishEngulfing"]:
     patterns.append("🔴 Bearish Engulfing")
+if bool(latest.get("RetestBull", False)):
+    patterns.append("🚀 Bullish Retest")
+
+if bool(latest.get("RetestBear", False)):
+    patterns.append("🔻 Bearish Retest")
 option_suggestion = suggest_option_strike(selected, analysis["close_price"], analysis["signal_type"])
 
 alert_text = (
