@@ -697,6 +697,13 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
     if bear_engulf and volume_spike:
         bearish += 2
         reasons.append("Bearish Engulfing with Volume Confirmation")
+    if retest_bull:
+    bullish += 2
+    reasons.append("Bullish breakout retest confirmed")
+
+    if retest_bear:
+        bearish += 2
+        reasons.append("Bearish breakdown retest confirmed")
     if volume_spike:
         reasons.append("Volume spike present")
         if close_price > ema20:
