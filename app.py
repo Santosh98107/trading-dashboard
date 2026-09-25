@@ -959,19 +959,11 @@ if not htf_data.empty:
     htf_data = add_indicators(htf_data).dropna().copy()
     if len(htf_data) > 20:
         htf_latest = htf_data.iloc[-1]
-        htf_bias = "bullish" if htf_latest["EMA20"] > htf_latest["EMA50"] else "bearish"
-    mtf_confirmation = "Neutral"
-
-if analysis["signal_type"] == "buy" and htf_bias == "bullish":
-    mtf_confirmation = "✅ Bullish Alignment"
-
-elif analysis["signal_type"] == "sell" and htf_bias == "bearish":
-    mtf_confirmation = "✅ Bearish Alignment"
-
-elif analysis["signal_type"] in ["buy", "sell"]:
-    mtf_confirmation = "⚠️ Timeframe Conflict"
-else:
-    htf_bias = None
+        htf_bias = "bullish" if htf_latest["EMA20"] > htf_latest["EMA50"] else 
+"bearish"
+    
+    else:
+        htf_bias = None
 else:
     htf_bias = None
 
