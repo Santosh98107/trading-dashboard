@@ -972,6 +972,19 @@ analysis = analyze_signal(
     timeframe_label=timeframe,
     backtest_win_rate=backtest_win_rate
 )
+quality_score = (
+    analysis["win_chance"] +
+    analysis["confidence"]
+) / 2
+
+if quality_score >= 85:
+    signal_quality = "🔥 Excellent"
+elif quality_score >= 70:
+    signal_quality = "✅ Strong"
+elif quality_score >= 55:
+    signal_quality = "⚠️ Moderate"
+else:
+    signal_quality = "❌ Weak"
 latest = data.iloc[-1]
 
 patterns = []
