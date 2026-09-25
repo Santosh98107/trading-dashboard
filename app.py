@@ -650,8 +650,8 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
         bearish += 2
         reasons.append("Support breakdown")
     if hammer:
-    bullish += 2
-    reasons.append("Hammer pattern detected")
+        bullish += 2
+        reasons.append("Hammer pattern detected")
 
     if bull_maru:
         bullish += 2
