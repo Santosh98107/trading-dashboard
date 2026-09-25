@@ -683,7 +683,7 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
         reasons.append("Doji pattern (market indecision)")   
     if bull_engulf:
         bullish += 3
-    reasons.append("Bullish Engulfing detected")
+        reasons.append("Bullish Engulfing detected")
 
     if bear_engulf:
         bearish += 3
