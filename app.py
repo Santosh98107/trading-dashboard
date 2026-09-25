@@ -363,7 +363,15 @@ def add_indicators(df):
     df["PivotLow"] = df["Low"].rolling(20).min()
     df["Breakout"] = df["Close"] > df["PivotHigh"].shift(1)
     df["Breakdown"] = df["Close"] < df["PivotLow"].shift(1)
+    df["RetestBull"] = (
+    df["Breakout"].shift(1)
+    & (df["Low"] <= df["PivotHigh"].shift(1))
+)
 
+df["RetestBear"] = (
+    df["Breakdown"].shift(1)
+    & (df["High"] >= df["PivotLow"].shift(1))
+)
     k, d = compute_stochastic(df)
  
     df["StochK"] = k.rolling(3).mean()
