@@ -959,11 +959,12 @@ if not htf_data.empty:
     htf_data = add_indicators(htf_data).dropna().copy()
     if len(htf_data) > 20:
         htf_latest = htf_data.iloc[-1]
-htf_bias = "bullish" if htf_latest["EMA20"] > htf_latest["EMA50"] else "bearish"
-    
-
+        htf_bias = "bullish" if htf_latest["EMA20"] > htf_latest["EMA50"] else "bearish"
+    else:
+        htf_bias = None
 else:
     htf_bias = None
+
 wins, losses, total_trades, backtest_win_rate = simple_backtest(data)
 analysis = analyze_signal(
     data,
@@ -1076,8 +1077,6 @@ with m5:
 with m6:
     st.metric("Bullish Score", analysis["bullish_score"])
     st.metric("Bearish Score", analysis["bearish_score"])
-with m7:
-    st.metric("Signal Quality", signal_quality)
 
 a1, a2, a3, a4, a5 = st.columns(5)
 
