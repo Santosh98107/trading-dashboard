@@ -994,7 +994,12 @@ if telegram_enabled and telegram_bot_token and telegram_chat_id:
                 f.write(current_signal_key)
 
 st.subheader("🚨 Live Signal Analytics")
+st.subheader("🕯 Candlestick Patterns")
 
+if patterns:
+    st.success(" | ".join(patterns))
+else:
+    st.info("No major candlestick pattern detected")
 if analysis["signal_type"] == "buy":
     st.success(alert_text)
 elif analysis["signal_type"] == "sell":
