@@ -1052,7 +1052,7 @@ elif analysis["signal_type"] == "sell":
 else:
     st.warning(alert_text)
 
-m1, m2, m3, m4, m5, m6 = st.columns(6)
+m1, m2, m3, m4, m5, m6, m7 = st.columns(7)
 
 with m1:
     st.metric("Current Price", round(analysis["close_price"], 2))
