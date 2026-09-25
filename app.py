@@ -586,6 +586,8 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
     bull_maru = bool(latest.get("BullishMarubozu", False))
     bear_maru = bool(latest.get("BearishMarubozu", False))
     doji = bool(latest.get("Doji", False))
+    bull_engulf = bool(latest.get("BullishEngulfing", False))
+    bear_engulf = bool(latest.get("BearishEngulfing", False))
     plus_di = float(latest["PlusDI"])
     minus_di = float(latest["MinusDI"])
 
