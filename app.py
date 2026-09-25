@@ -588,6 +588,8 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
     doji = bool(latest.get("Doji", False))
     bull_engulf = bool(latest.get("BullishEngulfing", False))
     bear_engulf = bool(latest.get("BearishEngulfing", False))
+    retest_bull = bool(latest.get("RetestBull", False))
+    retest_bear = bool(latest.get("RetestBear", False))
     plus_di = float(latest["PlusDI"])
     minus_di = float(latest["MinusDI"])
 
