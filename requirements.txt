@@ -1,8 +1,5 @@
 streamlit
-plotly
+fastapi
+uvicorn
 pandas
 numpy
-requests
-yfinance
-streamlit-autorefresh
-openpyxl
