@@ -1,0 +1,49 @@
+import pandas as pd
+import numpy as np
+
+
+class VolumeDecisionEngine:
+    def __init__(self, config):
+        self.cfg = config
+
+    def get_volume_snapshot(self, df):
+        if df is None or df.empty:
+            return {
+                "CurrentVolume": None,
+                "VolumeMA": None,
+                "RVOL": None,
+                "VolumeSpike": False,
+                "VolumeScore": 0,
+                "VolumeBias": "NEUTRAL"
+            }
+
+        latest = df.iloc[-1]
+
+        volume = latest.get("Volume", np.nan)
+        volume_ma = latest.get("Volume_MA20", np.nan)
+        rvol = latest.get("RVOL", np.nan)
+        volume_spike = latest.get("Volume_Spike", False)
+
+        score = 0
+
+        if pd.notna(rvol):
+            if rvol >= 2.0:
+                score += 2
+            elif rvol >= 1.2:
+                score += 1
+            elif rvol < 0.8:
+                score -= 1
+
+        if bool(volume_spike):
+            score += 1
+
+        bias = "BULLISH" if score >= 2 else "WEAK" if score <= -1 else "NEUTRAL"
+
+        return {
+            "CurrentVolume": None if pd.isna(volume) else float(volume),
+            "VolumeMA": None if pd.isna(volume_ma) else float(volume_ma),
+            "RVOL": None if pd.isna(rvol) else round(float(rvol), 4),
+            "VolumeSpike": bool(volume_spike),
+            "VolumeScore": score,
+            "VolumeBias": bias
+        }
