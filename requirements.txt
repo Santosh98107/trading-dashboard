@@ -3,4 +3,3 @@ fastapi
 uvicorn
 pandas
 numpy
-TA-Lib
