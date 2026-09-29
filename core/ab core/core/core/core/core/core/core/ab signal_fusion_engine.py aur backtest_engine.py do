@@ -1,0 +1,85 @@
+class SignalFusionEngine:
+    def __init__(self, config):
+        self.cfg = config
+
+    def fuse(
+        self,
+        tech_rec,
+        hist_prob,
+        macro_snapshot,
+        breadth_snapshot,
+        bank_snapshot,
+        pcr_snapshot,
+        volume_snapshot,
+        regime_snapshot
+    ):
+        tech_signal = tech_rec.get("SignalType", "NEUTRAL")
+        tech_conf = tech_rec.get("ConfidencePct", 50)
+
+        total_context_score = (
+            macro_snapshot.get("MacroScore", 0) +
+            breadth_snapshot.get("BreadthScore", 0) +
+            bank_snapshot.get("BankScore", 0) +
+            pcr_snapshot.get("PCRScore", 0) +
+            volume_snapshot.get("VolumeScore", 0) +
+            regime_snapshot.get("RegimeScore", 0)
+        )
+
+        final_recommendation = tech_rec.get("Recommendation", "HOLD")
+        adjusted_confidence = tech_conf
+
+        if tech_signal == "BUY":
+            adjusted_confidence += total_context_score * 3
+        elif tech_signal == "SELL":
+            adjusted_confidence -= total_context_score * 3
+        else:
+            adjusted_confidence += total_context_score * 1.5
+
+        adjusted_confidence = max(1, min(99, adjusted_confidence))
+
+        if tech_signal == "BUY":
+            if total_context_score >= 4:
+                final_recommendation = "STRONG BUY"
+            elif total_context_score >= 1:
+                final_recommendation = "BUY"
+            elif total_context_score <= -3:
+                final_recommendation = "WEAK BUY / HOLD"
+            else:
+                final_recommendation = "BUY WITH CAUTION"
+
+        elif tech_signal == "SELL":
+            if total_context_score <= -4:
+                final_recommendation = "STRONG SELL"
+            elif total_context_score <= -1:
+                final_recommendation = "SELL"
+            elif total_context_score >= 3:
+                final_recommendation = "WEAK SELL / HOLD"
+            else:
+                final_recommendation = "SELL WITH CAUTION"
+
+        else:
+            if total_context_score >= 5:
+                final_recommendation = "WATCHLIST BULLISH"
+            elif total_context_score <= -5:
+                final_recommendation = "WATCHLIST BEARISH"
+            else:
+                final_recommendation = "HOLD"
+
+        estimated_win = hist_prob.get("EstimatedWinRatePct", None)
+
+        if estimated_win is None:
+            combined_win_chance = adjusted_confidence
+        else:
+            combined_win_chance = (estimated_win * 0.6) + (adjusted_confidence * 0.4)
+
+        combined_win_chance = round(max(1, min(99, combined_win_chance)), 2)
+
+        grade = "A" if combined_win_chance >= 75 else "B" if combined_win_chance >= 60 else "C"
+
+        return {
+            "FinalRecommendation": final_recommendation,
+            "AdjustedConfidencePct": round(adjusted_confidence, 2),
+            "CombinedWinChancePct": combined_win_chance,
+            "ContextScore": total_context_score,
+            "TradeQualityGrade": grade
+        }
