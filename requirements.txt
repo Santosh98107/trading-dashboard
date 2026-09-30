@@ -1,6 +1,9 @@
 streamlit
-fastapi
-uvicorn
 pandas
 numpy
 plotly
+requests
+yfinance
+streamlit-autorefresh
+fastapi
+uvicorn
