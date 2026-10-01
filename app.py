@@ -23,6 +23,7 @@ PAPER_STATE_FILE = BASE_DIR / "paper_trade_state.csv"
 USERS_FILE = BASE_DIR / "users.csv"
 SESSION_SUMMARY_FILE = BASE_DIR / "daily_summary.csv"
 AUTH_STATE_FILE = BASE_DIR / "auth_state.txt"
+WATCHLIST_FILE = BASE_DIR / "watchlist.csv"
 
 # ===== STOCK DICTIONARIES =====
 TOP_10_INDIAN_COMPANIES = {
@@ -200,6 +201,23 @@ def init_paper_state():
 def init_daily_summary():
     if not SESSION_SUMMARY_FILE.exists():
         pd.DataFrame(columns=["Date", "TotalTrades", "Wins", "Losses", "RealizedPnL", "WinRate"]).to_csv(SESSION_SUMMARY_FILE, index=False)
+
+
+def init_watchlist():
+    if not WATCHLIST_FILE.exists():
+        pd.DataFrame(columns=["symbol", "name"]).to_csv(WATCHLIST_FILE, index=False)
+
+
+def load_watchlist():
+    init_watchlist()
+    try:
+        return pd.read_csv(WATCHLIST_FILE)
+    except Exception:
+        return pd.DataFrame(columns=["symbol", "name"])
+
+
+def save_watchlist(df):
+    df.to_csv(WATCHLIST_FILE, index=False)
 
 
 def load_journal():
@@ -433,7 +451,7 @@ def compute_heikin_ashi(df):
     df["HA_Low"] = df[["Low", "HA_Open", "HA_Close"]].min(axis=1)
     return df
 
-# ===== ALL INDICATORS =====
+
 def add_indicators(df):
     df = df.copy()
 
@@ -553,6 +571,75 @@ def detect_trend_pattern(df):
         return "Sideways / Consolidation ➖"
     return "Trend not enough data"
 
+
+def get_trade_signal(df):
+    if df.empty or len(df) < 20:
+        return "HOLD", 0
+
+    latest = df.iloc[-1]
+    rsi = latest.get("RSI", 50)
+    macd = latest.get("MACD", 0)
+    signal_line = latest.get("SignalLine", 0)
+    close = latest.get("Close", 0)
+    ema20 = latest.get("EMA20", close)
+    ema50 = latest.get("EMA50", close)
+    bb_upper = latest.get("BB_Upper", close)
+    bb_lower = latest.get("BB_Lower", close)
+
+    score = 0
+    if close > ema20:
+        score += 1
+    if close > ema50:
+        score += 1
+    if rsi > 55:
+        score += 1
+    if macd > signal_line:
+        score += 1
+    if close < bb_upper and close > bb_lower:
+        score += 1
+
+    if score >= 4:
+        return "BUY", score
+    if score <= 1:
+        return "SELL", score
+    return "HOLD", score
+
+
+def get_today_summary():
+    journal = load_journal()
+    if journal.empty:
+        return {"total": 0, "wins": 0, "losses": 0, "pnl": 0.0, "win_rate": 0.0}
+
+    today = datetime.now().strftime("%d-%m-%Y")
+    day_df = journal[journal["DateTime"].astype(str).str.contains(today, na=False)]
+    if day_df.empty:
+        return {"total": 0, "wins": 0, "losses": 0, "pnl": 0.0, "win_rate": 0.0}
+
+    pnl_series = pd.to_numeric(day_df["PnL"], errors="coerce").fillna(0)
+    wins = int((pnl_series > 0).sum())
+    losses = int((pnl_series < 0).sum())
+    total = len(day_df)
+    pnl = float(pnl_series.sum())
+    win_rate = (wins / total) * 100 if total else 0.0
+    return {"total": total, "wins": wins, "losses": losses, "pnl": pnl, "win_rate": win_rate}
+
+
+def add_symbol_to_watchlist(symbol_name, symbol_value):
+    df = load_watchlist()
+    if df.empty:
+        df = pd.DataFrame(columns=["symbol", "name"])
+    if symbol_name not in df["name"].astype(str).tolist():
+        new_row = pd.DataFrame([{"symbol": symbol_value, "name": symbol_name}])
+        df = pd.concat([df, new_row], ignore_index=True)
+        save_watchlist(df)
+
+
+def get_watchlist_symbols():
+    df = load_watchlist()
+    if df.empty:
+        return []
+    return df["name"].astype(str).tolist()
+
 # ===== MAIN APP =====
 def main():
     login_panel()
@@ -586,6 +673,17 @@ def main():
             scrolling=False,
         )
 
+    st.sidebar.subheader("📋 Watchlist")
+    selected_watchlist = st.sidebar.multiselect(
+        "Watchlist Symbols",
+        options=get_watchlist_symbols() if get_watchlist_symbols() else [symbol_name],
+        default=get_watchlist_symbols()[:1] if get_watchlist_symbols() else []
+    )
+    if st.sidebar.button("Add to Watchlist"):
+        add_symbol_to_watchlist(symbol_name, symbol)
+        st.sidebar.success(f"Added {symbol_name} to watchlist")
+        st.rerun()
+
     df = fetch_data_cached(symbol, timeframe, period)
     if df.empty:
         st.error("❌ Could not fetch data. Try again later.")
@@ -594,6 +692,7 @@ def main():
     df = add_indicators(df)
     latest = df.iloc[-1].to_dict()
     trend_state = detect_trend_pattern(df)
+    signal, signal_score = get_trade_signal(df)
 
     pcr_value = None
     if market_group in ["Indices", "Top 10 Indian Companies", "Banking Stocks", "Forex"]:
@@ -601,6 +700,7 @@ def main():
 
     st.caption(f"Market: {market_group} | Asset: {symbol_name} | Symbol: {symbol}")
 
+    summary = get_today_summary()
     col1, col2, col3, col4, col5 = st.columns(5)
     if "USDINR" in symbol:
         price_label = f"₹{latest.get('Close', 0):.4f}"
@@ -617,6 +717,14 @@ def main():
     st.write(f"- Support Zone: ₹{latest.get('TrendSupport', 0):.2f}")
     st.write(f"- Resistance Zone: ₹{latest.get('TrendResistance', 0):.2f}")
     st.write(f"- MACD: {latest.get('MACD', 0):.4f} | Signal: {latest.get('SignalLine', 0):.4f} | Histogram: {latest.get('MACD_Hist', 0):.4f}")
+
+    st.subheader("🚦 Trade Signal")
+    if signal == "BUY":
+        st.success(f"BUY Signal: Strong bullish setup (score {signal_score}/5)")
+    elif signal == "SELL":
+        st.error(f"SELL Signal: Strong bearish setup (score {signal_score}/5)")
+    else:
+        st.info(f"HOLD Signal: Neutral setup (score {signal_score}/5)")
 
     use_heikin_ashi = st.checkbox("Show Heikin Ashi chart", value=False)
     chart_df = compute_heikin_ashi(df) if use_heikin_ashi else df.copy()
@@ -682,6 +790,14 @@ def main():
     else:
         st.subheader("📉 Put-Call Ratio (PCR)")
         st.info("PCR is not available from the live feed in this session.")
+
+    st.subheader("📈 Daily Summary")
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Trades", summary["total"])
+    col2.metric("Wins", summary["wins"])
+    col3.metric("Losses", summary["losses"])
+    col4.metric("PnL", f"₹{summary['pnl']:.2f}")
+    st.caption(f"Win Rate: {summary['win_rate']:.1f}%")
 
     st.subheader("📓 Trade Journal")
     journal = load_journal()
