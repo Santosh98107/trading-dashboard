@@ -721,10 +721,13 @@ def main():
     market_group = st.sidebar.selectbox("📊 Market Group", list(MARKET_GROUPS.keys()), index=0)
     symbol_name = st.sidebar.selectbox("📈 Select Asset", list(MARKET_GROUPS[market_group].keys()), index=0)
     symbol = MARKET_GROUPS[market_group][symbol_name]
-    timeframe = st.sidebar.selectbox("⏱️ Timeframe", ["1h", "4h", "1d"], index=2)
 
-    period_map = {"1h": "60d", "4h": "90d", "1d": "1y"}
+    timeframe_options = ["1m", "3m", "5m", "15m", "30m", "1h", "4h", "1d"]
+    timeframe = st.sidebar.selectbox("⏱️ Timeframe", timeframe_options, index=5)
+
+    period_map = {"1m": "5d", "3m": "5d", "5m": "60d", "15m": "90d", "30m": "120d", "1h": "180d", "4h": "1y", "1d": "3y"}
     period = period_map.get(timeframe, "90d")
+    actual_interval = {"3m": "2m"}.get(timeframe, timeframe)
 
     if st.sidebar.button("🔄 Refresh Data"):
         st.cache_data.clear()
@@ -749,7 +752,7 @@ def main():
         st.sidebar.success(f"Added {symbol_name} to watchlist")
         st.rerun()
 
-    df = fetch_data_cached(symbol, timeframe, period)
+    df = fetch_data_cached(symbol, actual_interval, period)
     if df.empty:
         st.error("❌ Could not fetch data. Try again later.")
         return
