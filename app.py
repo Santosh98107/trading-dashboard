@@ -1,6 +1,6 @@
 import os
 import hashlib
-from datetime import datetime, time
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -8,16 +8,17 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 import yfinance as yf
-from streamlit_autorefresh import st_autorefresh
 
 st.set_page_config(page_title="Elite Trading Dashboard Ultimate+", layout="wide")
 
+# ===== FILE PATHS =====
 JOURNAL_FILE = "trade_journal.csv"
 SIGNAL_STATE_FILE = "last_signal_state.txt"
 PAPER_STATE_FILE = "paper_trade_state.csv"
 USERS_FILE = "users.csv"
 SESSION_SUMMARY_FILE = "daily_summary.csv"
 
+# ===== STOCK DICTIONARIES =====
 TOP_INDIAN_COMPANIES = {
     "RELIANCE": "RELIANCE.NS",
     "TCS": "TCS.NS",
@@ -28,7 +29,7 @@ TOP_INDIAN_COMPANIES = {
     "BHARTIARTL": "BHARTIARTL.NS",
     "ASIANPAINT": "ASIANPAINT.NS",
     "MARUTI": "MARUTI.NS",
-    "TITAN": "TITAN.NS",
+    "TITAN": "TITAN.NS"
 }
 
 BANKING_STOCKS = {
@@ -39,38 +40,30 @@ BANKING_STOCKS = {
     "KOTAKBANK": "KOTAKBANK.NS",
     "BANKBARODA": "BANKBARODA.NS",
     "PNB": "PNB.NS",
-    "INDUSINDBK": "INDUSINDBK.NS",
+    "INDUSINDBK": "INDUSINDBK.NS"
 }
 
 INDEX_STOCKS = {
     "NIFTY": "^NSEI",
-    "BANKNIFTY": "^NSEBANK",
+    "BANKNIFTY": "^NSEBANK"
 }
 
-stocks = {
-    **INDEX_STOCKS,
-    **TOP_INDIAN_COMPANIES,
-    **BANKING_STOCKS,
-}
+stocks = {**INDEX_STOCKS, **TOP_INDIAN_COMPANIES, **BANKING_STOCKS}
 
-
+# ===== AUTHENTICATION =====
 def hash_password(password: str) -> str:
     return hashlib.sha256(password.encode("utf-8")).hexdigest()
 
 
 def init_users():
     if not os.path.exists(USERS_FILE):
-        pd.DataFrame([
-            {"username": "admin", "password": hash_password("admin123")}
-        ]).to_csv(USERS_FILE, index=False)
+        pd.DataFrame([{"username": "admin", "password": hash_password("admin123")}]).to_csv(USERS_FILE, index=False)
 
 
 def login_panel():
     init_users()
-
     if "logged_in" not in st.session_state:
         st.session_state.logged_in = False
-
     if "username" not in st.session_state:
         st.session_state.username = ""
 
@@ -84,7 +77,6 @@ def login_panel():
                 users = pd.read_csv(USERS_FILE)
                 entered_hash = hash_password(password)
                 valid = ((users["username"] == username) & (users["password"] == entered_hash)).any()
-
                 if valid:
                     st.session_state.logged_in = True
                     st.session_state.username = username
@@ -102,37 +94,25 @@ def login_panel():
         st.session_state.username = ""
         st.rerun()
 
-
+# ===== FILE INITIALIZATION =====
 def init_journal():
     if not os.path.exists(JOURNAL_FILE):
-        cols = [
-            "DateTime", "Symbol", "Timeframe", "Signal", "EntryPrice",
-            "ExitPrice", "Quantity", "StopLoss", "Target1", "Target2",
-            "TrailingStop", "Status", "PnL", "PnLPercent", "Notes", "TradeMode"
-        ]
+        cols = ["DateTime", "Symbol", "Timeframe", "Signal", "EntryPrice", "ExitPrice", "Quantity", "StopLoss", "Target1", "Target2", "TrailingStop", "Status", "PnL", "PnLPercent", "Notes", "TradeMode"]
         pd.DataFrame(columns=cols).to_csv(JOURNAL_FILE, index=False)
 
 
 def init_paper_state():
     if not os.path.exists(PAPER_STATE_FILE):
-        pd.DataFrame([{
-            "Balance": 100000.0,
-            "UsedMargin": 0.0,
-            "OpenPositions": 0
-        }]).to_csv(PAPER_STATE_FILE, index=False)
+        pd.DataFrame([{"Balance": 100000.0, "UsedMargin": 0.0, "OpenPositions": 0}]).to_csv(PAPER_STATE_FILE, index=False)
 
 
 def init_daily_summary():
     if not os.path.exists(SESSION_SUMMARY_FILE):
-        pd.DataFrame(columns=[
-            "Date", "TotalTrades", "Wins", "Losses", "RealizedPnL", "WinRate"
-        ]).to_csv(SESSION_SUMMARY_FILE, index=False)
+        pd.DataFrame(columns=["Date", "TotalTrades", "Wins", "Losses", "RealizedPnL", "WinRate"]).to_csv(SESSION_SUMMARY_FILE, index=False)
 
 
 def load_journal():
     init_journal()
-    if not os.path.exists(JOURNAL_FILE):
-        return pd.DataFrame()
     return pd.read_csv(JOURNAL_FILE)
 
 
@@ -148,7 +128,7 @@ def load_paper_state():
 def save_paper_state(df):
     df.to_csv(PAPER_STATE_FILE, index=False)
 
-
+# ===== JOURNAL OPERATIONS =====
 def add_trade_to_journal(symbol, timeframe, signal, entry_price, quantity, stop_loss, target1, target2, trailing_stop, notes="", trade_mode="MANUAL"):
     journal = load_journal()
     new_row = {
@@ -167,7 +147,7 @@ def add_trade_to_journal(symbol, timeframe, signal, entry_price, quantity, stop_
         "PnL": np.nan,
         "PnLPercent": np.nan,
         "Notes": notes,
-        "TradeMode": trade_mode,
+        "TradeMode": trade_mode
     }
     journal = pd.concat([journal, pd.DataFrame([new_row])], ignore_index=True)
     save_journal(journal)
@@ -194,131 +174,31 @@ def close_trade_in_journal(index_id, exit_price):
         journal.at[index_id, "PnLPercent"] = round(pnl_pct, 2)
         save_journal(journal)
 
-
-def update_daily_summary():
-    init_daily_summary()
-    journal = load_journal()
-    closed = journal[journal["Status"] == "CLOSED"].copy()
-
-    if closed.empty:
-        return
-
-    closed["DateOnly"] = pd.to_datetime(
-        closed["DateTime"],
-        format="%d-%m-%Y %H:%M:%S",
-        errors="coerce"
-    ).dt.date
-
-    today = datetime.now().date()
-    day_df = closed[closed["DateOnly"] == today]
-
-    if day_df.empty:
-        return
-
-    total = len(day_df)
-    wins = (pd.to_numeric(day_df["PnL"], errors="coerce").fillna(0) > 0).sum()
-    losses = total - wins
-    pnl = pd.to_numeric(day_df["PnL"], errors="coerce").fillna(0).sum()
-    win_rate = (wins / total * 100) if total > 0 else 0
-
-    summary = pd.read_csv(SESSION_SUMMARY_FILE)
-    summary = summary[summary["Date"] != str(today)]
-
-    new_row = {
-        "Date": str(today),
-        "TotalTrades": total,
-        "Wins": wins,
-        "Losses": losses,
-        "RealizedPnL": round(pnl, 2),
-        "WinRate": round(win_rate, 2),
-    }
-
-    summary = pd.concat([summary, pd.DataFrame([new_row])], ignore_index=True)
-    summary.to_csv(SESSION_SUMMARY_FILE, index=False)
-
-
-def paper_trade_entry(price, quantity):
-    state = load_paper_state()
-    bal = float(state.loc[0, "Balance"])
-    used = float(state.loc[0, "UsedMargin"])
-    cost = price * quantity
-
-    if bal >= cost:
-        state.loc[0, "Balance"] = bal - cost
-        state.loc[0, "UsedMargin"] = used + cost
-        state.loc[0, "OpenPositions"] = int(state.loc[0, "OpenPositions"]) + 1
-        save_paper_state(state)
-        return True
-    return False
-
-
-def paper_trade_exit(entry_price, exit_price, quantity, signal):
-    state = load_paper_state()
-    bal = float(state.loc[0, "Balance"])
-    used = float(state.loc[0, "UsedMargin"])
-    invested = entry_price * quantity
-
-    if "BUY" in signal.upper() or "CALL" in signal.upper():
-        pnl = (exit_price - entry_price) * quantity
-    else:
-        pnl = (entry_price - exit_price) * quantity
-
-    state.loc[0, "Balance"] = bal + invested + pnl
-    state.loc[0, "UsedMargin"] = max(0.0, used - invested)
-    state.loc[0, "OpenPositions"] = max(0, int(state.loc[0, "OpenPositions"]) - 1)
-    save_paper_state(state)
-    return pnl
-
-
+# ===== DATA FETCHING =====
 def fetch_data(ticker, interval, period):
     try:
-        df = yf.download(
-            ticker,
-            interval=interval,
-            period=period,
-            progress=False,
-            auto_adjust=False,
-        )
-
+        df = yf.download(ticker, interval=interval, period=period, progress=False, auto_adjust=False)
         if df.empty:
             return df
-
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
-
         needed = ["Open", "High", "Low", "Close", "Volume"]
         missing = [c for c in needed if c not in df.columns]
         if missing:
             return pd.DataFrame()
-
         df = df[needed].dropna().copy()
-        df["Volume"] = df["Volume"].fillna(1)
-        df["Volume"] = df["Volume"].replace(0, 1)
+        df["Volume"] = df["Volume"].fillna(1).replace(0, 1)
         return df
     except Exception:
         return pd.DataFrame()
 
-
-def resample_to_10m(df):
-    df = df.copy()
-    df.index = pd.to_datetime(df.index)
-    return df.resample("10min").agg({
-        "Open": "first",
-        "High": "max",
-        "Low": "min",
-        "Close": "last",
-        "Volume": "sum",
-    }).dropna()
-
-
+# ===== TECHNICAL INDICATORS =====
 def compute_rsi(series, window=14):
     delta = series.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
-
     avg_gain = gain.rolling(window=window).mean()
     avg_loss = loss.rolling(window=window).mean()
-
     rs = avg_gain / avg_loss.replace(0, np.nan)
     rsi = 100 - (100 / (1 + rs))
     return rsi.fillna(50)
@@ -336,213 +216,150 @@ def compute_adx(df, period=14):
     high = df["High"]
     low = df["Low"]
     close = df["Close"]
-
     plus_dm_raw = high.diff()
     minus_dm_raw = -low.diff()
-
     plus_dm = np.where((plus_dm_raw > minus_dm_raw) & (plus_dm_raw > 0), plus_dm_raw, 0.0)
     minus_dm = np.where((minus_dm_raw > plus_dm_raw) & (minus_dm_raw > 0), minus_dm_raw, 0.0)
-
     tr1 = high - low
     tr2 = (high - close.shift(1)).abs()
     tr3 = (low - close.shift(1)).abs()
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-
     atr = tr.rolling(period).mean().replace(0, 1e-10)
     plus_di = 100 * (pd.Series(plus_dm, index=df.index).rolling(period).mean() / atr)
     minus_di = 100 * (pd.Series(minus_dm, index=df.index).rolling(period).mean() / atr)
-
     dx = ((plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, 1e-10)) * 100
     adx = dx.rolling(period).mean()
-
     return adx, plus_di, minus_di
 
-
+# ===== CANDLESTICK PATTERNS =====
 def add_candlestick_patterns(df):
     df = df.copy()
-
     o = df["Open"]
     h = df["High"]
     l = df["Low"]
     c = df["Close"]
-
     body = (c - o).abs()
     rng = (h - l).replace(0, 1e-10)
     upper = h - pd.concat([o, c], axis=1).max(axis=1)
     lower = pd.concat([o, c], axis=1).min(axis=1) - l
-
     prev_o = o.shift(1)
     prev_c = c.shift(1)
     prev_h = h.shift(1)
     prev_l = l.shift(1)
     prev_body = body.shift(1)
 
+    # Doji patterns
     df["Doji"] = body <= rng * 0.1
     df["LongLeggedDoji"] = df["Doji"] & (upper > body * 2) & (lower > body * 2)
     df["DragonflyDoji"] = df["Doji"] & (lower > body * 2) & (upper <= body)
     df["GravestoneDoji"] = df["Doji"] & (upper > body * 2) & (lower <= body)
 
+    # Hammer patterns
     df["Hammer"] = (lower >= body * 2) & (upper <= body)
     df["HangingMan"] = df["Hammer"] & (c < o)
     df["InvertedHammer"] = (upper >= body * 2) & (lower <= body)
     df["ShootingStar"] = df["InvertedHammer"] & (c < o)
 
+    # Marubozu patterns
     df["BullishMarubozu"] = (c > o) & (upper <= body * 0.1) & (lower <= body * 0.1)
     df["BearishMarubozu"] = (c < o) & (upper <= body * 0.1) & (lower <= body * 0.1)
 
-    df["BullishEngulfing"] = (
-        (prev_c < prev_o) &
-        (c > o) &
-        (o <= prev_c) &
-        (c >= prev_o)
-    )
+    # Engulfing patterns
+    df["BullishEngulfing"] = (prev_c < prev_o) & (c > o) & (o <= prev_c) & (c >= prev_o)
+    df["BearishEngulfing"] = (prev_c > prev_o) & (c < o) & (o >= prev_c) & (c <= prev_o)
 
-    df["BearishEngulfing"] = (
-        (prev_c > prev_o) &
-        (c < o) &
-        (o >= prev_c) &
-        (c <= prev_o)
-    )
+    # Harami patterns
+    df["BullishHarami"] = (prev_c < prev_o) & (c > o) & (o > prev_c) & (c < prev_o)
+    df["BearishHarami"] = (prev_c > prev_o) & (c < o) & (o < prev_c) & (c > prev_o)
 
-    df["BullishHarami"] = (
-        (prev_c < prev_o) &
-        (c > o) &
-        (o > prev_c) &
-        (c < prev_o)
-    )
+    # Piercing & Dark Cloud
+    df["PiercingPattern"] = (prev_c < prev_o) & (c > o) & (o < prev_l) & (c > (prev_o + prev_c) / 2) & (c < prev_o)
+    df["DarkCloudCover"] = (prev_c > prev_o) & (c < o) & (o > prev_h) & (c < (prev_o + prev_c) / 2) & (c > prev_o)
 
-    df["BearishHarami"] = (
-        (prev_c > prev_o) &
-        (c < o) &
-        (o < prev_c) &
-        (c > prev_o)
-    )
-
-    df["PiercingPattern"] = (
-        (prev_c < prev_o) &
-        (c > o) &
-        (o < prev_l) &
-        (c > (prev_o + prev_c) / 2) &
-        (c < prev_o)
-    )
-
-    df["DarkCloudCover"] = (
-        (prev_c > prev_o) &
-        (c < o) &
-        (o > prev_h) &
-        (c < (prev_o + prev_c) / 2) &
-        (c > prev_o)
-    )
-
+    # Spinning Top
     df["SpinningTop"] = (body / rng < 0.3) & (upper > body) & (lower > body)
 
+    # Inside/Outside bars
     df["InsideBar"] = (h < prev_h) & (l > prev_l)
     df["OutsideBar"] = (h > prev_h) & (l < prev_l)
 
+    # Kicker patterns
     df["BullishKicker"] = (prev_c < prev_o) & (c > o) & (o > prev_o)
     df["BearishKicker"] = (prev_c > prev_o) & (c < o) & (o < prev_o)
 
-    df["MorningStar"] = (
-        (prev_c.shift(1) < prev_o.shift(1)) &
-        (prev_body < prev_body.rolling(5).mean()) &
-        (c > o) &
-        (c > ((prev_o.shift(1) + prev_c.shift(1)) / 2))
-    )
+    # Morning Star & Evening Star
+    df["MorningStar"] = (prev_c.shift(1) < prev_o.shift(1)) & (prev_body < prev_body.rolling(5).mean()) & (c > o) & (c > ((prev_o.shift(1) + prev_c.shift(1)) / 2))
+    df["EveningStar"] = (prev_c.shift(1) > prev_o.shift(1)) & (prev_body < prev_body.rolling(5).mean()) & (c < o) & (c < ((prev_o.shift(1) + prev_c.shift(1)) / 2))
 
-    df["EveningStar"] = (
-        (prev_c.shift(1) > prev_o.shift(1)) &
-        (prev_body < prev_body.rolling(5).mean()) &
-        (c < o) &
-        (c < ((prev_o.shift(1) + prev_c.shift(1)) / 2))
-    )
-
-    df["ThreeWhiteSoldiers"] = (
-        (c.shift(2) > o.shift(2)) &
-        (c.shift(1) > o.shift(1)) &
-        (c > o) &
-        (c.shift(1) > c.shift(2)) &
-        (c > c.shift(1))
-    )
-
-    df["ThreeBlackCrows"] = (
-        (c.shift(2) < o.shift(2)) &
-        (c.shift(1) < o.shift(1)) &
-        (c < o) &
-        (c.shift(1) < c.shift(2)) &
-        (c < c.shift(1))
-    )
+    # Three White Soldiers & Three Black Crows
+    df["ThreeWhiteSoldiers"] = (c.shift(2) > o.shift(2)) & (c.shift(1) > o.shift(1)) & (c > o) & (c.shift(1) > c.shift(2)) & (c > c.shift(1))
+    df["ThreeBlackCrows"] = (c.shift(2) < o.shift(2)) & (c.shift(1) < o.shift(1)) & (c < o) & (c.shift(1) < c.shift(2)) & (c < c.shift(1))
 
     return df
 
-
+# ===== ALL INDICATORS =====
 def add_indicators(df):
     df = df.copy()
 
+    # Moving averages
     df["EMA20"] = df["Close"].ewm(span=20, adjust=False).mean()
     df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
 
+    # VWAP
     vol_cum = df["Volume"].cumsum()
     df["VWAP"] = ((df["Close"] * df["Volume"]).cumsum() / vol_cum.replace(0, 1))
-    df["VWAP"] = df["VWAP"].replace([np.inf, -np.inf], np.nan)
-    df["VWAP"] = df["VWAP"].fillna(df["Close"])
+    df["VWAP"] = df["VWAP"].replace([np.inf, -np.inf], np.nan).fillna(df["Close"])
 
-    df["RSI"] = compute_rsi(df["Close"], 14)
-    df["RSI"] = df["RSI"].replace([np.inf, -np.inf], np.nan).fillna(50).clip(lower=1, upper=99)
+    # RSI
+    df["RSI"] = compute_rsi(df["Close"], 14).replace([np.inf, -np.inf], np.nan).fillna(50).clip(lower=1, upper=99)
 
+    # MACD
     ema12 = df["Close"].ewm(span=12, adjust=False).mean()
     ema26 = df["Close"].ewm(span=26, adjust=False).mean()
     df["MACD"] = ema12 - ema26
     df["SignalLine"] = df["MACD"].ewm(span=9, adjust=False).mean()
     df["MACD_Hist"] = df["MACD"] - df["SignalLine"]
 
+    # ATR
     high_low = df["High"] - df["Low"]
     high_close = (df["High"] - df["Close"].shift(1)).abs()
     low_close = (df["Low"] - df["Close"].shift(1)).abs()
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     df["ATR"] = tr.rolling(14).mean()
 
+    # Bollinger Bands
     df["SMA20"] = df["Close"].rolling(20).mean()
     std20 = df["Close"].rolling(20).std()
     df["BB_Upper"] = df["SMA20"] + 2 * std20
     df["BB_Lower"] = df["SMA20"] - 2 * std20
 
+    # Volume analysis
     df["Volume_MA20"] = df["Volume"].rolling(20).mean()
     df["Volume_Spike"] = df["Volume"] > (1.5 * df["Volume_MA20"])
     df["RVOL"] = df["Volume"] / df["Volume_MA20"].replace(0, np.nan)
 
+    # Pivot analysis
     df["PivotHigh"] = df["High"].rolling(20).max()
     df["PivotLow"] = df["Low"].rolling(20).min()
     df["Breakout"] = (df["Close"] > df["PivotHigh"].shift(1)) & (df["Volume_Spike"])
     df["Breakdown"] = (df["Close"] < df["PivotLow"].shift(1)) & (df["Volume_Spike"])
-
     df["RetestBull"] = (df["Close"] > df["PivotHigh"].shift(1)) & (df["Low"] <= df["PivotHigh"].shift(1))
     df["RetestBear"] = (df["Close"] < df["PivotLow"].shift(1)) & (df["High"] >= df["PivotLow"].shift(1))
 
+    # Stochastic
     k, d = compute_stochastic(df)
     df["StochK"] = k.rolling(3).mean()
     df["StochD"] = d.rolling(3).mean()
+
+    # ADX
     df["ADX"], df["PlusDI"], df["MinusDI"] = compute_adx(df)
 
-    candle_body = (df["Close"] - df["Open"]).abs()
-    candle_range = (df["High"] - df["Low"]).replace(0, 1e-10)
-    df["BodyStrength"] = candle_body / candle_range
-
-    df["BuyMarker"] = np.where(
-        (df["EMA20"] > df["EMA50"]) & (df["EMA20"].shift(1) <= df["EMA50"].shift(1)),
-        df["Low"] * 0.995,
-        np.nan,
-    )
-
-    df["SellMarker"] = np.where(
-        (df["EMA20"] < df["EMA50"]) & (df["EMA20"].shift(1) >= df["EMA50"].shift(1)),
-        df["High"] * 1.005,
-        np.nan,
-    )
-
+    # Candlestick patterns
     df = add_candlestick_patterns(df)
+
     return df
 
-
+# ===== PATTERN DETECTION =====
 def get_detected_patterns(latest):
     pattern_map = {
         "Doji": "🟡 Doji",
@@ -571,546 +388,72 @@ def get_detected_patterns(latest):
         "ThreeWhiteSoldiers": "🟢 Three White Soldiers",
         "ThreeBlackCrows": "🔴 Three Black Crows",
         "RetestBull": "🚀 Bullish Retest",
-        "RetestBear": "🔻 Bearish Retest",
+        "RetestBear": "🔻 Bearish Retest"
     }
-
     found = []
     for key, label in pattern_map.items():
         if bool(latest.get(key, False)):
             found.append(label)
     return found
 
-
-def get_higher_timeframe(tf):
-    mapping = {
-        "1m": ("5m", "30d"),
-        "5m": ("15m", "30d"),
-        "10m": ("30m", "60d"),
-        "15m": ("30m", "60d"),
-        "30m": ("60m", "90d"),
-        "1h": ("4h", "180d"),
-        "4h": ("1d", "365d"),
-        "1d": ("1w", "365d"),
-    }
-    return mapping.get(tf, ("1d", "365d"))
-
-
-def calculate_signal_score(
-    rsi=None,
-    macd_hist=None,
-    volume_spike=False,
-    breakout=False,
-    breakdown=False,
-    htf_bias="NEUTRAL",
-    sideways=False,
-    rr_ratio=None,
-    backtest_win_rate=50,
-):
-    score = 15
-
-    if rsi is not None:
-        if rsi > 70:
-            score += 10
-        elif rsi < 30:
-            score -= 10
-        elif rsi > 55:
-            score += 5
-        elif rsi < 45:
-            score -= 5
-
-    if macd_hist is not None:
-        if macd_hist > 0:
-            score += 8
-        else:
-            score -= 8
-
-    if volume_spike:
-        score += 5
-    if breakout:
-        score += 6
-    if breakdown:
-        score += 6
-    if htf_bias in ["bullish", "bearish"]:
-        score += 5
-    if sideways:
-        score -= 12
-
-    if rr_ratio is not None:
-        if rr_ratio >= 2:
-            score += 6
-        elif rr_ratio < 1.2:
-            score -= 8
-
-    if backtest_win_rate >= 60:
-        score += 8
-    elif backtest_win_rate < 45:
-        score -= 8
-
-    return int(max(5, min(score, 95)))
-
-
-def suggest_option_strike(symbol, spot_price, signal_type):
-    if symbol == "NIFTY":
-        step = 50
-    elif symbol == "BANKNIFTY":
-        step = 100
-    else:
-        step = 10
-
-    atm = round(spot_price / step) * step
-
-    if signal_type == "buy":
-        return {
-            "type": "CALL",
-            "atm": atm,
-            "otm": atm + step,
-            "text": f"Suggested CALL strikes: ATM {atm} CE, OTM {atm + step} CE",
-        }
-    elif signal_type == "sell":
-        return {
-            "type": "PUT",
-            "atm": atm,
-            "otm": atm - step,
-            "text": f"Suggested PUT strikes: ATM {atm} PE, OTM {atm - step} PE",
-        }
-
-    return {
-        "type": "NONE",
-        "atm": None,
-        "otm": None,
-        "text": "No option strike suggestion",
-    }
-
-
-def send_telegram_alert(token, chat_id, message):
-    try:
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
-        payload = {"chat_id": chat_id, "text": message}
-        response = requests.post(url, data=payload, timeout=10)
-        return response.status_code == 200
-    except Exception:
-        return False
-
-
-def calculate_pcr_metrics(total_put_oi, total_call_oi, total_put_vol, total_call_vol):
-    pcr_oi = None
-    pcr_vol = None
-    pcr_score = 0
-    pcr_bias = "NEUTRAL"
-
-    try:
-        if total_call_oi and total_call_oi != 0:
-            pcr_oi = total_put_oi / total_call_oi
-        if total_call_vol and total_call_vol != 0:
-            pcr_vol = total_put_vol / total_call_vol
-    except Exception:
-        pass
-
-    if pcr_oi is not None:
-        if pcr_oi > 1.2:
-            pcr_score += 2
-        elif pcr_oi > 1.0:
-            pcr_score += 1
-        elif pcr_oi < 0.8:
-            pcr_score -= 2
-        elif pcr_oi < 1.0:
-            pcr_score -= 1
-
-    if pcr_vol is not None:
-        if pcr_vol > 1.2:
-            pcr_score += 1
-        elif pcr_vol < 0.8:
-            pcr_score -= 1
-
-    if pcr_score >= 2:
-        pcr_bias = "BULLISH"
-    elif pcr_score <= -2:
-        pcr_bias = "BEARISH"
-
-    return {
-        "pcr_oi": None if pcr_oi is None else round(pcr_oi, 4),
-        "pcr_vol": None if pcr_vol is None else round(pcr_vol, 4),
-        "pcr_score": pcr_score,
-        "pcr_bias": pcr_bias,
-    }
-
-
-def calculate_macro_score(crude_now, crude_prev, brent_now, brent_prev, usdinr_now, usdinr_prev):
-    score = 0
-
-    try:
-        if crude_now is not None and crude_prev is not None:
-            score += 1 if crude_now < crude_prev else -1
-        if brent_now is not None and brent_prev is not None:
-            score += 1 if brent_now < brent_prev else -1
-        if usdinr_now is not None and usdinr_prev is not None:
-            score += 1 if usdinr_now < usdinr_prev else -1
-    except Exception:
-        pass
-
-    bias = "NEUTRAL"
-    if score >= 2:
-        bias = "BULLISH"
-    elif score <= -2:
-        bias = "BEARISH"
-
-    return {"macro_score": score, "macro_bias": bias}
-
-
-def calculate_breadth_score(top_green, top_red, breadth_pct):
-    score = 0
-
-    try:
-        if breadth_pct is not None:
-            if breadth_pct >= 60:
-                score += 2
-            elif breadth_pct >= 50:
-                score += 1
-            elif breadth_pct < 40:
-                score -= 2
-            elif breadth_pct < 50:
-                score -= 1
-
-        if top_green is not None and top_red is not None:
-            if top_green > top_red:
-                score += 1
-            elif top_red > top_green:
-                score -= 1
-    except Exception:
-        pass
-
-    bias = "NEUTRAL"
-    if score >= 2:
-        bias = "BULLISH"
-    elif score <= -2:
-        bias = "BEARISH"
-
-    return {"breadth_score": score, "breadth_bias": bias}
-
-
-def calculate_bank_score(hdfc, icici, sbin, axis, kotak):
-    vals = [hdfc, icici, sbin, axis, kotak]
-    pos = 0
-    neg = 0
-
-    for v in vals:
-        if v is None or pd.isna(v):
-            continue
-        if v > 0:
-            pos += 1
-        elif v < 0:
-            neg += 1
-
-    score = 0
-    if pos >= 4:
-        score += 2
-    elif pos >= 3:
-        score += 1
-
-    if neg >= 4:
-        score -= 2
-    elif neg >= 3:
-        score -= 1
-
-    bias = "NEUTRAL"
-    if score >= 2:
-        bias = "BULLISH"
-    elif score <= -2:
-        bias = "BEARISH"
-
-    return {
-        "bank_score": score,
-        "bank_bias": bias,
-        "positive_banks": pos,
-        "negative_banks": neg,
-    }
-
-
-def calculate_volume_score(latest):
-    score = 0
-    bias = "NEUTRAL"
-
-    rvol = latest.get("RVOL", np.nan)
-    volume_spike = bool(latest.get("Volume_Spike", False))
-    close_price = latest.get("Close", np.nan)
-    vwap = latest.get("VWAP", np.nan)
-
-    if pd.notna(rvol):
-        if rvol >= 2.0:
-            score += 2
-        elif rvol >= 1.2:
-            score += 1
-        elif rvol < 0.8:
-            score -= 1
-
-    if volume_spike:
-        score += 1
-
-    if pd.notna(close_price) and pd.notna(vwap):
-        if close_price > vwap and score >= 2:
-            bias = "BULLISH"
-        elif close_price < vwap and score >= 2:
-            bias = "BEARISH"
-        elif score <= -1:
-            bias = "WEAK"
-
-    return {"volume_score": score, "volume_bias": bias}
-
-
-def calculate_regime(latest):
-    adx = latest.get("ADX", np.nan)
-    atr = latest.get("ATR", np.nan)
-    close_price = latest.get("Close", np.nan)
-
-    score = 0
-    regime = "NEUTRAL"
-
-    if pd.notna(adx):
-        if adx >= 25:
-            score += 2
-        elif adx < 15:
-            score -= 1
-
-    if pd.notna(atr) and pd.notna(close_price) and close_price != 0:
-        atr_pct = (atr / close_price) * 100
-        if atr_pct > 1.5:
-            score += 1
-
-    if score >= 2:
-        regime = "TRENDING"
-    elif score <= -1:
-        regime = "SIDEWAYS"
-
-    return {"regime": regime, "regime_score": score}
-
-
-def fetch_geopolitical_news(news_api_key=None):
-    if not news_api_key:
-        return [{"title": "No live API key provided", "source": "System", "sentiment": "Neutral"}]
-
-    try:
-        url = "https://newsapi.org/v2/everything"
-        params = {
-            "q": "geopolitics OR war OR sanctions OR crude oil OR middle east OR fed OR china taiwan OR russia ukraine",
-            "language": "en",
-            "sortBy": "publishedAt",
-            "pageSize": 10,
-            "apiKey": news_api_key,
-        }
-        r = requests.get(url, params=params, timeout=10)
-        data = r.json()
-
-        articles = []
-        for item in data.get("articles", []):
-            title = item.get("title", "No title")
-            source = item.get("source", {}).get("name", "Unknown")
-            sentiment = "Neutral"
-
-            lower_title = title.lower()
-            negative_words = ["war", "attack", "sanction", "conflict", "missile", "tension", "crisis"]
-            positive_words = ["deal", "ceasefire", "agreement", "peace", "recovery"]
-
-            if any(word in lower_title for word in negative_words):
-                sentiment = "Negative"
-            elif any(word in lower_title for word in positive_words):
-                sentiment = "Positive"
-
-            articles.append({
-                "title": title,
-                "source": source,
-                "sentiment": sentiment,
-            })
-
-        return articles if articles else [{"title": "No geopolitical news found", "source": "API", "sentiment": "Neutral"}]
-    except Exception as e:
-        return [{"title": f"News fetch error: {e}", "source": "System", "sentiment": "Neutral"}]
-
-
-def calculate_news_score(news_items):
-    score = 0
-    for item in news_items:
-        sentiment = str(item.get("sentiment", "Neutral")).lower()
-        if sentiment == "positive":
-            score += 1
-        elif sentiment == "negative":
-            score -= 1
-    return score
-
-
-def generate_signal(df):
-    if df.empty or len(df) < 2:
-        return {
-            "signal": "NO TRADE",
-            "confidence": 0,
-            "bias": "NEUTRAL",
-            "text": "Not enough data to generate a signal.",
-        }
-
-    latest = df.iloc[-1]
-    prev = df.iloc[-2]
-    rsi = float(latest.get("RSI", 50))
-    macd_hist = float(latest.get("MACD_Hist", 0))
-    ema20 = float(latest.get("EMA20", 0))
-    ema50 = float(latest.get("EMA50", 0))
-    close = float(latest.get("Close", 0))
-    vwap = float(latest.get("VWAP", close))
-    volume_spike = bool(latest.get("Volume_Spike", False))
-    breakout = bool(latest.get("Breakout", False))
-    breakdown = bool(latest.get("Breakdown", False))
-
-    if ema20 > ema50 and close > vwap and rsi > 55 and macd_hist > 0:
-        signal = "BUY"
-        bias = "BULLISH"
-        confidence = int(max(55, min(95, 60 + (rsi - 50) * 0.6 + (close - vwap) / max(vwap, 1) * 1000)))
-        text = "Bullish structure confirmed by EMA, RSI, VWAP and MACD."
-    elif ema20 < ema50 and close < vwap and rsi < 45 and macd_hist < 0:
-        signal = "SELL"
-        bias = "BEARISH"
-        confidence = int(max(55, min(95, 60 + (50 - rsi) * 0.6 + (vwap - close) / max(vwap, 1) * 1000)))
-        text = "Bearish structure confirmed by EMA, RSI, VWAP and MACD."
-    else:
-        signal = "NO TRADE"
-        bias = "NEUTRAL"
-        confidence = 50
-        text = "Market is mixed; waiting for stronger confirmation."
-
-    if volume_spike:
-        confidence += 5
-    if breakout:
-        confidence += 4
-    if breakdown:
-        confidence += 4
-
-    if signal == "BUY" and prev.get("Close", 0) > prev.get("Open", 0):
-        confidence += 3
-    if signal == "SELL" and prev.get("Close", 0) < prev.get("Open", 0):
-        confidence += 3
-
-    confidence = int(max(0, min(99, confidence)))
-    return {
-        "signal": signal,
-        "confidence": confidence,
-        "bias": bias,
-        "text": text,
-    }
-
-
-def render_main_page():
+# ===== MAIN APP =====
+def main():
     login_panel()
-    st_autorefresh(interval=60000, key="market_refresh")
 
-    st.title("Elite Trading Dashboard Ultimate+")
-    st.caption("Live market snapshot, signal engine, trade journal, and paper trading")
+    st.title("🚀 Elite Trading Dashboard Ultimate+")
+    st.subheader("Professional Trading & Analysis Terminal")
 
-    with st.sidebar:
-        st.header("Market Controls")
-        selected_symbol = st.selectbox("Symbol", list(stocks.keys()), index=0)
-        ticker = stocks[selected_symbol]
-        interval = st.selectbox("Interval", ["1m", "5m", "15m", "30m", "1h", "1d"], index=3)
-        period = st.selectbox("Period", ["5d", "1mo", "3mo", "6mo", "1y", "2y"], index=3)
-        refresh = st.button("Refresh Data")
+    st.sidebar.header("⚙️ Settings")
+    symbol_name = st.sidebar.selectbox("📊 Select Stock", list(stocks.keys()), index=0)
+    symbol = stocks[symbol_name]
+    timeframe = st.sidebar.selectbox("⏱️ Timeframe", ["1h", "4h", "1d"], index=2)
 
-    if refresh:
-        st.rerun()
+    period_map = {"1h": "60d", "4h": "90d", "1d": "1y"}
+    period = period_map.get(timeframe, "90d")
 
-    placeholder = st.empty()
-    with placeholder:
-        market_data = fetch_data(ticker, interval, period)
+    df = fetch_data(symbol, timeframe, period)
+    if df.empty:
+        st.error("❌ Could not fetch data. Try again later.")
+        return
 
-        if market_data.empty:
-            st.warning("No market data returned for the selected symbol. Please try another symbol or interval.")
-            return
+    df = add_indicators(df)
+    latest = df.iloc[-1].to_dict()
 
-        df = add_indicators(market_data)
-        signal_info = generate_signal(df)
-        latest = df.iloc[-1]
-        pattern_list = get_detected_patterns(latest)
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("📈 Price", f"₹{latest.get('Close', 0):.2f}")
+    col2.metric("📊 RSI", f"{latest.get('RSI', 50):.1f}")
+    col3.metric("🔊 Volume", f"{latest.get('Volume', 0):,.0f}")
+    col4.metric("🎯 ADX", f"{latest.get('ADX', 0):.1f}")
 
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Price", f"₹{latest['Close']:.2f}")
-        col2.metric("RSI", f"{latest['RSI']:.2f}")
-        col3.metric("MACD Hist", f"{latest['MACD_Hist']:.2f}")
-        col4.metric("VWAP", f"{latest['VWAP']:.2f}")
+    fig = go.Figure()
+    fig.add_trace(go.Candlestick(x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"], name="Price"))
+    fig.add_trace(go.Scatter(x=df.index, y=df["EMA20"], name="EMA20", line=dict(color="blue")))
+    fig.add_trace(go.Scatter(x=df.index, y=df["EMA50"], name="EMA50", line=dict(color="red")))
+    fig.update_layout(title=f"{symbol_name} - {timeframe}", template="plotly_dark", height=500, xaxis_rangeslider_visible=False)
+    st.plotly_chart(fig, use_container_width=True)
 
-        signal_color = "green" if signal_info["signal"] == "BUY" else "red" if signal_info["signal"] == "SELL" else "gray"
-        st.markdown(
-            f"<div style='padding:12px;border-radius:8px;background:{signal_color};color:white;'>"
-            f"<b>Signal:</b> {signal_info['signal']} &nbsp;|&nbsp; <b>Confidence:</b> {signal_info['confidence']}% &nbsp;|&nbsp; <b>Bias:</b> {signal_info['bias']}"
-            f"</div>",
-            unsafe_allow_html=True,
-        )
-        st.write(signal_info["text"])
+    st.subheader("🎯 Detected Patterns")
+    patterns = get_detected_patterns(latest)
+    if patterns:
+        for pattern in patterns:
+            st.success(pattern)
+    else:
+        st.info("No patterns detected")
 
-        fig = go.Figure(data=[
-            go.Candlestick(
-                x=df.index,
-                open=df["Open"],
-                high=df["High"],
-                low=df["Low"],
-                close=df["Close"],
-                name="Price",
-                increasing_line_color="#26a69a",
-                decreasing_line_color="#ef5350",
-            )
-        ])
-        fig.add_trace(go.Scatter(x=df.index, y=df["EMA20"], mode="lines", name="EMA20", line={"color": "#ffb300"}))
-        fig.add_trace(go.Scatter(x=df.index, y=df["EMA50"], mode="lines", name="EMA50", line={"color": "#7e57c2"}))
-        fig.add_trace(go.Scatter(x=df.index, y=df["VWAP"], mode="lines", name="VWAP", line={"color": "#00acc1"}))
-        fig.update_layout(title=f"{selected_symbol} {interval} Chart", xaxis_rangeslider_visible=False, height=600)
-        st.plotly_chart(fig, use_container_width=True)
+    st.subheader("📓 Trade Journal")
+    journal = load_journal()
+    if not journal.empty:
+        st.dataframe(journal.tail(10), use_container_width=True)
+    else:
+        st.info("No trades yet")
 
-        st.subheader("Pattern / Context")
-        if pattern_list:
-            st.write(", ".join(pattern_list))
-        else:
-            st.write("No major patterns detected in the latest candle.")
-
-        st.subheader("Trade Journal")
-        journal_df = load_journal()
-        if journal_df.empty:
-            st.info("No trades saved yet.")
-        else:
-            st.dataframe(journal_df.tail(10), use_container_width=True)
-
-        st.subheader("Paper Trading")
-        paper_state = load_paper_state()
-        st.dataframe(paper_state, use_container_width=True)
-
-        with st.form("manual_trade_form"):
-            col_a, col_b, col_c = st.columns(3)
-            entry_price = col_a.number_input("Entry Price", min_value=0.0, value=float(latest["Close"]))
-            quantity = col_b.number_input("Quantity", min_value=1, value=10, step=1)
-            stop_loss = col_c.number_input("Stop Loss", min_value=0.0, value=float(latest["Close"]) * 0.98)
-
-            target1 = st.number_input("Target 1", min_value=0.0, value=float(latest["Close"]) * 1.02)
-            target2 = st.number_input("Target 2", min_value=0.0, value=float(latest["Close"]) * 1.04)
-            trailing_stop = st.number_input("Trailing Stop", min_value=0.0, value=float(latest["Close"]) * 0.99)
-            notes = st.text_input("Notes", value="Manual trade")
-            submitted = st.form_submit_button("Save Trade")
-
-            if submitted:
-                add_trade_to_journal(
-                    symbol=selected_symbol,
-                    timeframe=interval,
-                    signal=signal_info["signal"],
-                    entry_price=entry_price,
-                    quantity=quantity,
-                    stop_loss=stop_loss,
-                    target1=target1,
-                    target2=target2,
-                    trailing_stop=trailing_stop,
-                    notes=notes,
-                    trade_mode="MANUAL",
-                )
-                st.success("Trade saved to journal.")
-
-        summary_path = SESSION_SUMMARY_FILE
-        if os.path.exists(summary_path):
-            summary_df = pd.read_csv(summary_path)
-            if not summary_df.empty:
-                st.subheader("Daily Summary")
-                st.dataframe(summary_df.tail(10), use_container_width=True)
+    st.subheader("📊 Paper Trading")
+    state = load_paper_state()
+    col1, col2, col3 = st.columns(3)
+    col1.metric("💰 Balance", f"₹{state.loc[0, 'Balance']:.2f}")
+    col2.metric("💸 Used Margin", f"₹{state.loc[0, 'UsedMargin']:.2f}")
+    col3.metric("📍 Open Positions", int(state.loc[0, 'OpenPositions']))
 
 
 if __name__ == "__main__":
-    render_main_page()
+    main()
