@@ -4,6 +4,3 @@ numpy
 plotly
 requests
 yfinance
-streamlit-autorefresh
-fastapi
-uvicorn
