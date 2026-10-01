@@ -21,6 +21,7 @@ SIGNAL_STATE_FILE = BASE_DIR / "last_signal_state.txt"
 PAPER_STATE_FILE = BASE_DIR / "paper_trade_state.csv"
 USERS_FILE = BASE_DIR / "users.csv"
 SESSION_SUMMARY_FILE = BASE_DIR / "daily_summary.csv"
+AUTH_STATE_FILE = BASE_DIR / "auth_state.txt"
 
 # ===== STOCK DICTIONARIES =====
 TOP_INDIAN_COMPANIES = {
@@ -95,12 +96,50 @@ def init_users():
         default_user.to_csv(USERS_FILE, index=False)
 
 
+def read_server_session():
+    try:
+        if AUTH_STATE_FILE.exists():
+            value = AUTH_STATE_FILE.read_text(encoding="utf-8").strip()
+            if value:
+                return value
+    except Exception:
+        pass
+    return ""
+
+
+def write_server_session(username: str):
+    try:
+        AUTH_STATE_FILE.write_text(str(username).strip(), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def clear_server_session():
+    try:
+        if AUTH_STATE_FILE.exists():
+            AUTH_STATE_FILE.unlink()
+    except Exception:
+        pass
+
+
+def is_valid_login(username: str, password: str) -> bool:
+    users = load_users()
+    entered_hash = hash_password(password)
+    return bool(((users["username"] == str(username).strip()) & (users["password"] == entered_hash)).any())
+
+
 def login_panel():
     init_users()
+
     if "logged_in" not in st.session_state:
         st.session_state.logged_in = False
     if "username" not in st.session_state:
         st.session_state.username = ""
+
+    saved_user = read_server_session()
+    if not st.session_state.logged_in and saved_user and saved_user == DEFAULT_USERNAME:
+        st.session_state.logged_in = True
+        st.session_state.username = saved_user
 
     if not st.session_state.logged_in:
         st.sidebar.subheader("🔐 Login")
@@ -109,17 +148,17 @@ def login_panel():
 
         if st.sidebar.button("Login"):
             try:
-                users = load_users()
-                entered_hash = hash_password(password)
-                valid = ((users["username"] == username) & (users["password"] == entered_hash)).any()
-                if valid:
+                if is_valid_login(username, password):
                     st.session_state.logged_in = True
                     st.session_state.username = username
+                    write_server_session(username)
                     st.sidebar.success("Login successful")
                     st.rerun()
                 else:
+                    clear_server_session()
                     st.sidebar.error("Invalid credentials")
             except Exception as e:
+                clear_server_session()
                 st.sidebar.error(f"Login error: {e}")
         st.stop()
 
@@ -127,6 +166,7 @@ def login_panel():
     if st.sidebar.button("Logout"):
         st.session_state.logged_in = False
         st.session_state.username = ""
+        clear_server_session()
         st.rerun()
 
 # ===== FILE INITIALIZATION =====
