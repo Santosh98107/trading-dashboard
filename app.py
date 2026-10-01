@@ -8,6 +8,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 import yfinance as yf
 
 st.set_page_config(page_title="Elite Trading Dashboard Ultimate+", layout="wide")
@@ -24,7 +25,7 @@ SESSION_SUMMARY_FILE = BASE_DIR / "daily_summary.csv"
 AUTH_STATE_FILE = BASE_DIR / "auth_state.txt"
 
 # ===== STOCK DICTIONARIES =====
-TOP_INDIAN_COMPANIES = {
+TOP_10_INDIAN_COMPANIES = {
     "RELIANCE": "RELIANCE.NS",
     "TCS": "TCS.NS",
     "INFY": "INFY.NS",
@@ -53,7 +54,18 @@ INDEX_STOCKS = {
     "BANKNIFTY": "^NSEBANK"
 }
 
-stocks = {**INDEX_STOCKS, **TOP_INDIAN_COMPANIES, **BANKING_STOCKS}
+FOREX_PAIRS = {
+    "USD/INR": "USDINR=X"
+}
+
+MARKET_GROUPS = {
+    "Top 10 Indian Companies": TOP_10_INDIAN_COMPANIES,
+    "Banking Stocks": BANKING_STOCKS,
+    "Indices": INDEX_STOCKS,
+    "Forex": FOREX_PAIRS,
+}
+
+stocks = {**INDEX_STOCKS, **TOP_10_INDIAN_COMPANIES, **BANKING_STOCKS, **FOREX_PAIRS}
 
 # ===== AUTHENTICATION =====
 DEFAULT_USERNAME = "admin"
@@ -271,6 +283,41 @@ def fetch_data(ticker, interval, period):
     except Exception:
         return pd.DataFrame()
 
+
+@st.cache_data(ttl=300)
+def fetch_data_cached(ticker, interval, period):
+    return fetch_data(ticker, interval, period)
+
+
+def fetch_pcr_data(symbol="NIFTY"):
+    try:
+        symbol_url = symbol.upper()
+        url = f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol_url}"
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://www.nseindia.com/"
+        }
+        resp = requests.get(url, headers=headers, timeout=12)
+        if resp.status_code != 200:
+            return None
+        payload = resp.json()
+        records = payload.get("records", {}).get("data", [])
+        if not records:
+            return None
+        total_calls_oi = 0
+        total_puts_oi = 0
+        for item in records:
+            ce = item.get("CE") or {}
+            pe = item.get("PE") or {}
+            total_calls_oi += float(ce.get("openInterest", 0) or 0)
+            total_puts_oi += float(pe.get("openInterest", 0) or 0)
+        if total_calls_oi == 0:
+            return None
+        return round(total_puts_oi / total_calls_oi, 2)
+    except Exception:
+        return None
+
 # ===== TECHNICAL INDICATORS =====
 def compute_rsi(series, window=14):
     delta = series.diff()
@@ -376,6 +423,16 @@ def add_candlestick_patterns(df):
 
     return df
 
+
+def compute_heikin_ashi(df):
+    df = df.copy()
+    df["HA_Close"] = (df["Open"] + df["High"] + df["Low"] + df["Close"]) / 4
+    df["HA_Open"] = (df["Open"].shift(1) + df["Close"].shift(1)) / 2
+    df["HA_Open"] = df["HA_Open"].fillna(df["Open"])
+    df["HA_High"] = df[["High", "HA_Open", "HA_Close"]].max(axis=1)
+    df["HA_Low"] = df[["Low", "HA_Open", "HA_Close"]].min(axis=1)
+    return df
+
 # ===== ALL INDICATORS =====
 def add_indicators(df):
     df = df.copy()
@@ -424,6 +481,10 @@ def add_indicators(df):
     df["Breakdown"] = (df["Close"] < df["PivotLow"].shift(1)) & (df["Volume_Spike"])
     df["RetestBull"] = (df["Close"] > df["PivotHigh"].shift(1)) & (df["Low"] <= df["PivotHigh"].shift(1))
     df["RetestBear"] = (df["Close"] < df["PivotLow"].shift(1)) & (df["High"] >= df["PivotLow"].shift(1))
+
+    # Trend levels
+    df["TrendSupport"] = df["Low"].rolling(20).min()
+    df["TrendResistance"] = df["High"].rolling(20).max()
 
     # Stochastic
     k, d = compute_stochastic(df)
@@ -475,6 +536,23 @@ def get_detected_patterns(latest):
             found.append(label)
     return found
 
+
+def detect_trend_pattern(df):
+    if df.empty or len(df) < 20:
+        return "Trend not enough data"
+
+    close = df["Close"].iloc[-1]
+    ema20 = df["EMA20"].iloc[-1]
+    ema50 = df["EMA50"].iloc[-1]
+
+    if pd.notna(close) and pd.notna(ema20) and pd.notna(ema50):
+        if close > ema20 > ema50:
+            return "Bullish Uptrend ✅"
+        if close < ema20 < ema50:
+            return "Bearish Downtrend ❌"
+        return "Sideways / Consolidation ➖"
+    return "Trend not enough data"
+
 # ===== MAIN APP =====
 def main():
     login_panel()
@@ -483,33 +561,106 @@ def main():
     st.subheader("Professional Trading & Analysis Terminal")
 
     st.sidebar.header("⚙️ Settings")
-    symbol_name = st.sidebar.selectbox("📊 Select Stock", list(stocks.keys()), index=0)
-    symbol = stocks[symbol_name]
+    market_group = st.sidebar.selectbox("📊 Market Group", list(MARKET_GROUPS.keys()), index=0)
+    symbol_name = st.sidebar.selectbox("📈 Select Asset", list(MARKET_GROUPS[market_group].keys()), index=0)
+    symbol = MARKET_GROUPS[market_group][symbol_name]
     timeframe = st.sidebar.selectbox("⏱️ Timeframe", ["1h", "4h", "1d"], index=2)
 
     period_map = {"1h": "60d", "4h": "90d", "1d": "1y"}
     period = period_map.get(timeframe, "90d")
 
-    df = fetch_data(symbol, timeframe, period)
+    if st.sidebar.button("🔄 Refresh Data"):
+        st.cache_data.clear()
+        st.rerun()
+
+    auto_refresh = st.sidebar.checkbox("Auto Refresh", value=False)
+    refresh_seconds = st.sidebar.slider("Refresh Every (sec)", min_value=15, max_value=180, value=60, step=5)
+    if auto_refresh:
+        components.html(
+            f"""
+            <script>
+                setTimeout(function(){{ window.location.reload(); }}, {refresh_seconds * 1000});
+            </script>
+            """,
+            height=0,
+            scrolling=False,
+        )
+
+    df = fetch_data_cached(symbol, timeframe, period)
     if df.empty:
         st.error("❌ Could not fetch data. Try again later.")
         return
 
     df = add_indicators(df)
     latest = df.iloc[-1].to_dict()
+    trend_state = detect_trend_pattern(df)
 
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("📈 Price", f"₹{latest.get('Close', 0):.2f}")
+    pcr_value = None
+    if market_group in ["Indices", "Top 10 Indian Companies", "Banking Stocks", "Forex"]:
+        pcr_value = fetch_pcr_data("NIFTY")
+
+    st.caption(f"Market: {market_group} | Asset: {symbol_name} | Symbol: {symbol}")
+
+    col1, col2, col3, col4, col5 = st.columns(5)
+    if "USDINR" in symbol:
+        price_label = f"₹{latest.get('Close', 0):.4f}"
+    else:
+        price_label = f"₹{latest.get('Close', 0):.2f}"
+    col1.metric("📈 Price", price_label)
     col2.metric("📊 RSI", f"{latest.get('RSI', 50):.1f}")
     col3.metric("🔊 Volume", f"{latest.get('Volume', 0):,.0f}")
     col4.metric("🎯 ADX", f"{latest.get('ADX', 0):.1f}")
+    col5.metric("🧠 PCR", f"{pcr_value:.2f}" if pcr_value is not None else "N/A")
+
+    st.subheader("📌 Trend & Market Context")
+    st.success(trend_state)
+    st.write(f"- Support Zone: ₹{latest.get('TrendSupport', 0):.2f}")
+    st.write(f"- Resistance Zone: ₹{latest.get('TrendResistance', 0):.2f}")
+    st.write(f"- MACD: {latest.get('MACD', 0):.4f} | Signal: {latest.get('SignalLine', 0):.4f} | Histogram: {latest.get('MACD_Hist', 0):.4f}")
+
+    use_heikin_ashi = st.checkbox("Show Heikin Ashi chart", value=False)
+    chart_df = compute_heikin_ashi(df) if use_heikin_ashi else df.copy()
 
     fig = go.Figure()
-    fig.add_trace(go.Candlestick(x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"], name="Price"))
-    fig.add_trace(go.Scatter(x=df.index, y=df["EMA20"], name="EMA20", line=dict(color="blue")))
-    fig.add_trace(go.Scatter(x=df.index, y=df["EMA50"], name="EMA50", line=dict(color="red")))
-    fig.update_layout(title=f"{symbol_name} - {timeframe}", template="plotly_dark", height=500, xaxis_rangeslider_visible=False)
+    if use_heikin_ashi:
+        fig.add_trace(go.Candlestick(
+            x=chart_df.index,
+            open=chart_df["HA_Open"],
+            high=chart_df["HA_High"],
+            low=chart_df["HA_Low"],
+            close=chart_df["HA_Close"],
+            name="Heikin Ashi"
+        ))
+    else:
+        fig.add_trace(go.Candlestick(
+            x=chart_df.index,
+            open=chart_df["Open"],
+            high=chart_df["High"],
+            low=chart_df["Low"],
+            close=chart_df["Close"],
+            name="Price"
+        ))
+
+    fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df["EMA20"], name="EMA20", line=dict(color="blue", width=2)))
+    fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df["EMA50"], name="EMA50", line=dict(color="red", width=2)))
+    fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df["TrendSupport"], name="Trend Support", line=dict(color="lime", dash="dot")))
+    fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df["TrendResistance"], name="Trend Resistance", line=dict(color="orange", dash="dot")))
+    fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df["BB_Upper"], name="BB Upper", line=dict(color="purple", dash="dash")))
+    fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df["BB_Lower"], name="BB Lower", line=dict(color="purple", dash="dash")))
+    fig.update_layout(title=f"{symbol_name} - {timeframe} | {market_group}", template="plotly_dark", height=560, xaxis_rangeslider_visible=False)
     st.plotly_chart(fig, use_container_width=True)
+
+    st.subheader("📊 Bollinger Bands & MACD")
+    bb_upper = latest.get("BB_Upper", 0)
+    bb_lower = latest.get("BB_Lower", 0)
+    macd = latest.get("MACD", 0)
+    hist = latest.get("MACD_Hist", 0)
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("BB Upper", f"₹{bb_upper:.2f}")
+    col2.metric("BB Lower", f"₹{bb_lower:.2f}")
+    col3.metric("MACD", f"{macd:.4f}")
+    col4.metric("MACD Hist", f"{hist:.4f}")
 
     st.subheader("🎯 Detected Patterns")
     patterns = get_detected_patterns(latest)
@@ -518,6 +669,19 @@ def main():
             st.success(pattern)
     else:
         st.info("No patterns detected")
+
+    if pcr_value is not None:
+        st.subheader("📉 Put-Call Ratio (PCR)")
+        st.metric("NIFTY PCR", f"{pcr_value:.2f}")
+        if pcr_value > 1.2:
+            st.info("PCR suggests bullish put interest; markets may be defensive.")
+        elif pcr_value < 0.8:
+            st.info("PCR suggests strong call interest; momentum may be bullish.")
+        else:
+            st.info("PCR is near neutral; trend is balanced.")
+    else:
+        st.subheader("📉 Put-Call Ratio (PCR)")
+        st.info("PCR is not available from the live feed in this session.")
 
     st.subheader("📓 Trade Journal")
     journal = load_journal()
