@@ -1,105 +1,63 @@
-# Elite Trading Dashboard Ultimate
+# Elite Trading Dashboard Ultimate+
 
-A Streamlit-based trading dashboard for live market analysis, paper trading, signal generation, journaling, and performance tracking.
+A Streamlit-based trading dashboard for market tracking, technical analysis, candlestick pattern detection, paper trading, and journaling.
 
 ## Features
 
-### Live Signal Engine
-- Buy / Sell / No Trade signal generation
-- Confidence %
-- Win Chance %
-- Signal strength
-- Higher timeframe confirmation
-- Support / Resistance detection
-- Option strike suggestion
+- Secure login system with default admin credentials
+- Live price dashboard for Indian stocks and major market indices
+- Candlestick chart with EMA trend overlays
+- Technical indicators:
+  - RSI
+  - MACD
+  - ADX
+  - EMA 20 / 50
+  - VWAP
+  - ATR
+  - Bollinger Bands
+  - Stochastic
+  - Volume analysis
+- Candlestick pattern detection
+- Trade journal persistence using CSV files
+- Paper trading balance and open positions tracking
+- Simple and lightweight setup for local use
 
-### Technical Indicators
-- EMA20
-- EMA50
-- VWAP
-- RSI
-- MACD
-- Signal Line
-- MACD Histogram
-- ATR
-- Bollinger Bands
-- Stochastic K / D
-- ADX
-- PlusDI / MinusDI
-- Volume MA20
-- Volume Spike
-- RVOL
+## Default Login
 
-### Candlestick / Chart Pattern Detection
-- Bullish Marubozu
-- Bearish Marubozu
-- Bullish Engulfing
-- Bearish Engulfing
-- Doji
-- Hammer
-- Shooting Star
-
-### Advanced Context Inputs
-- PCR OI
-- PCR Volume
-- Crude Oil
-- Brent Crude
-- USD/INR
-- Top companies breadth
-- Bank performance
-- Volume bias
-- Regime detection
-- Final fused recommendation
-
-### Backtesting
-- Historical trade outcome simulation
-- Win / Loss count
-- Win rate calculation
-- Backtest quality reference
-
-### Paper Trading
-- Paper trade entry
-- Entry / Exit tracking
-- Balance and used margin
-- Journal integration
-- Realized PnL
-- Trade closure support
-
-### Trade Journal
-- Manual signal save
-- Paper trade journal save
-- Entry / Exit history
-- Notes field
-- Download CSV
-
-### Alerts
-- Telegram alert support
-- Auto-send on new signal
-
-### Reports / Downloads
-- Market data CSV export
-- Trade journal export
-- Daily summary export
-
----
-
-## Files Used by App
-
-### Main App File
-- `your_app_file.py`  
-  Rename this to your preferred file name, for example:
-  - `app.py`
-  - `elite_dashboard.py`
-
-### Generated / Persistent Files
-- `trade_journal.csv`
-- `last_signal_state.txt`
-- `paper_trade_state.csv`
-- `users.csv`
-- `daily_summary.csv`
-
----
+- Username: admin
+- Password: admin123
 
 ## Requirements
 
-Create a `requirements.txt` file with:
+Install the app dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+## Run the App
+
+```bash
+streamlit run app.py
+```
+
+Then open the local URL shown in the terminal, usually:
+
+```text
+http://localhost:8501
+```
+
+## Project Files
+
+- `app.py` — main dashboard application
+- `requirements.txt` — Python dependencies
+- `trade_journal.csv` — trade journal data
+- `paper_trade_state.csv` — paper trading balance state
+- `users.csv` — login credentials storage
+- `daily_summary.csv` — summary data
+
+## Notes
+
+- The app creates its required CSV files automatically on first run.
+- The default admin account is created if `users.csv` does not already exist.
+- This is designed for local trading dashboard use and not for production deployment.
