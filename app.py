@@ -18,7 +18,6 @@ PAPER_STATE_FILE = "paper_trade_state.csv"
 USERS_FILE = "users.csv"
 SESSION_SUMMARY_FILE = "daily_summary.csv"
 
-
 TOP_INDIAN_COMPANIES = {
     "RELIANCE": "RELIANCE.NS",
     "TCS": "TCS.NS",
@@ -29,7 +28,7 @@ TOP_INDIAN_COMPANIES = {
     "BHARTIARTL": "BHARTIARTL.NS",
     "ASIANPAINT": "ASIANPAINT.NS",
     "MARUTI": "MARUTI.NS",
-    "TITAN": "TITAN.NS"
+    "TITAN": "TITAN.NS",
 }
 
 BANKING_STOCKS = {
@@ -40,18 +39,18 @@ BANKING_STOCKS = {
     "KOTAKBANK": "KOTAKBANK.NS",
     "BANKBARODA": "BANKBARODA.NS",
     "PNB": "PNB.NS",
-    "INDUSINDBK": "INDUSINDBK.NS"
+    "INDUSINDBK": "INDUSINDBK.NS",
 }
 
 INDEX_STOCKS = {
     "NIFTY": "^NSEI",
-    "BANKNIFTY": "^NSEBANK"
+    "BANKNIFTY": "^NSEBANK",
 }
 
 stocks = {
     **INDEX_STOCKS,
     **TOP_INDIAN_COMPANIES,
-    **BANKING_STOCKS
+    **BANKING_STOCKS,
 }
 
 
@@ -132,6 +131,8 @@ def init_daily_summary():
 
 def load_journal():
     init_journal()
+    if not os.path.exists(JOURNAL_FILE):
+        return pd.DataFrame()
     return pd.read_csv(JOURNAL_FILE)
 
 
@@ -166,7 +167,7 @@ def add_trade_to_journal(symbol, timeframe, signal, entry_price, quantity, stop_
         "PnL": np.nan,
         "PnLPercent": np.nan,
         "Notes": notes,
-        "TradeMode": trade_mode
+        "TradeMode": trade_mode,
     }
     journal = pd.concat([journal, pd.DataFrame([new_row])], ignore_index=True)
     save_journal(journal)
@@ -229,7 +230,7 @@ def update_daily_summary():
         "Wins": wins,
         "Losses": losses,
         "RealizedPnL": round(pnl, 2),
-        "WinRate": round(win_rate, 2)
+        "WinRate": round(win_rate, 2),
     }
 
     summary = pd.concat([summary, pd.DataFrame([new_row])], ignore_index=True)
@@ -276,7 +277,7 @@ def fetch_data(ticker, interval, period):
             interval=interval,
             period=period,
             progress=False,
-            auto_adjust=False
+            auto_adjust=False,
         )
 
         if df.empty:
@@ -306,7 +307,7 @@ def resample_to_10m(df):
         "High": "max",
         "Low": "min",
         "Close": "last",
-        "Volume": "sum"
+        "Volume": "sum",
     }).dropna()
 
 
@@ -529,13 +530,13 @@ def add_indicators(df):
     df["BuyMarker"] = np.where(
         (df["EMA20"] > df["EMA50"]) & (df["EMA20"].shift(1) <= df["EMA50"].shift(1)),
         df["Low"] * 0.995,
-        np.nan
+        np.nan,
     )
 
     df["SellMarker"] = np.where(
         (df["EMA20"] < df["EMA50"]) & (df["EMA20"].shift(1) >= df["EMA50"].shift(1)),
         df["High"] * 1.005,
-        np.nan
+        np.nan,
     )
 
     df = add_candlestick_patterns(df)
@@ -570,7 +571,7 @@ def get_detected_patterns(latest):
         "ThreeWhiteSoldiers": "🟢 Three White Soldiers",
         "ThreeBlackCrows": "🔴 Three Black Crows",
         "RetestBull": "🚀 Bullish Retest",
-        "RetestBear": "🔻 Bearish Retest"
+        "RetestBear": "🔻 Bearish Retest",
     }
 
     found = []
@@ -589,7 +590,7 @@ def get_higher_timeframe(tf):
         "30m": ("60m", "90d"),
         "1h": ("4h", "180d"),
         "4h": ("1d", "365d"),
-        "1d": ("1w", "365d")
+        "1d": ("1w", "365d"),
     }
     return mapping.get(tf, ("1d", "365d"))
 
@@ -663,21 +664,21 @@ def suggest_option_strike(symbol, spot_price, signal_type):
             "type": "CALL",
             "atm": atm,
             "otm": atm + step,
-            "text": f"Suggested CALL strikes: ATM {atm} CE, OTM {atm + step} CE"
+            "text": f"Suggested CALL strikes: ATM {atm} CE, OTM {atm + step} CE",
         }
     elif signal_type == "sell":
         return {
             "type": "PUT",
             "atm": atm,
             "otm": atm - step,
-            "text": f"Suggested PUT strikes: ATM {atm} PE, OTM {atm - step} PE"
+            "text": f"Suggested PUT strikes: ATM {atm} PE, OTM {atm - step} PE",
         }
 
     return {
         "type": "NONE",
         "atm": None,
         "otm": None,
-        "text": "No option strike suggestion"
+        "text": "No option strike suggestion",
     }
 
 
@@ -730,7 +731,7 @@ def calculate_pcr_metrics(total_put_oi, total_call_oi, total_put_vol, total_call
         "pcr_oi": None if pcr_oi is None else round(pcr_oi, 4),
         "pcr_vol": None if pcr_vol is None else round(pcr_vol, 4),
         "pcr_score": pcr_score,
-        "pcr_bias": pcr_bias
+        "pcr_bias": pcr_bias,
     }
 
 
@@ -821,7 +822,7 @@ def calculate_bank_score(hdfc, icici, sbin, axis, kotak):
         "bank_score": score,
         "bank_bias": bias,
         "positive_banks": pos,
-        "negative_banks": neg
+        "negative_banks": neg,
     }
 
 
@@ -894,7 +895,7 @@ def fetch_geopolitical_news(news_api_key=None):
             "language": "en",
             "sortBy": "publishedAt",
             "pageSize": 10,
-            "apiKey": news_api_key
+            "apiKey": news_api_key,
         }
         r = requests.get(url, params=params, timeout=10)
         data = r.json()
@@ -917,7 +918,7 @@ def fetch_geopolitical_news(news_api_key=None):
             articles.append({
                 "title": title,
                 "source": source,
-                "sentiment": sentiment
+                "sentiment": sentiment,
             })
 
         return articles if articles else [{"title": "No geopolitical news found", "source": "API", "sentiment": "Neutral"}]
@@ -933,12 +934,183 @@ def calculate_news_score(news_items):
             score += 1
         elif sentiment == "negative":
             score -= 1
-        elif sentiment == "neutral":
-            score += 0
     return score
 
 
-# Minimal app guard to avoid issues when imported as a module.
+def generate_signal(df):
+    if df.empty or len(df) < 2:
+        return {
+            "signal": "NO TRADE",
+            "confidence": 0,
+            "bias": "NEUTRAL",
+            "text": "Not enough data to generate a signal.",
+        }
+
+    latest = df.iloc[-1]
+    prev = df.iloc[-2]
+    rsi = float(latest.get("RSI", 50))
+    macd_hist = float(latest.get("MACD_Hist", 0))
+    ema20 = float(latest.get("EMA20", 0))
+    ema50 = float(latest.get("EMA50", 0))
+    close = float(latest.get("Close", 0))
+    vwap = float(latest.get("VWAP", close))
+    volume_spike = bool(latest.get("Volume_Spike", False))
+    breakout = bool(latest.get("Breakout", False))
+    breakdown = bool(latest.get("Breakdown", False))
+
+    if ema20 > ema50 and close > vwap and rsi > 55 and macd_hist > 0:
+        signal = "BUY"
+        bias = "BULLISH"
+        confidence = int(max(55, min(95, 60 + (rsi - 50) * 0.6 + (close - vwap) / max(vwap, 1) * 1000)))
+        text = "Bullish structure confirmed by EMA, RSI, VWAP and MACD."
+    elif ema20 < ema50 and close < vwap and rsi < 45 and macd_hist < 0:
+        signal = "SELL"
+        bias = "BEARISH"
+        confidence = int(max(55, min(95, 60 + (50 - rsi) * 0.6 + (vwap - close) / max(vwap, 1) * 1000)))
+        text = "Bearish structure confirmed by EMA, RSI, VWAP and MACD."
+    else:
+        signal = "NO TRADE"
+        bias = "NEUTRAL"
+        confidence = 50
+        text = "Market is mixed; waiting for stronger confirmation."
+
+    if volume_spike:
+        confidence += 5
+    if breakout:
+        confidence += 4
+    if breakdown:
+        confidence += 4
+
+    if signal == "BUY" and prev.get("Close", 0) > prev.get("Open", 0):
+        confidence += 3
+    if signal == "SELL" and prev.get("Close", 0) < prev.get("Open", 0):
+        confidence += 3
+
+    confidence = int(max(0, min(99, confidence)))
+    return {
+        "signal": signal,
+        "confidence": confidence,
+        "bias": bias,
+        "text": text,
+    }
+
+
+def render_main_page():
+    login_panel()
+    st_autorefresh(interval=60000, key="market_refresh")
+
+    st.title("Elite Trading Dashboard Ultimate+")
+    st.caption("Live market snapshot, signal engine, trade journal, and paper trading")
+
+    with st.sidebar:
+        st.header("Market Controls")
+        selected_symbol = st.selectbox("Symbol", list(stocks.keys()), index=0)
+        ticker = stocks[selected_symbol]
+        interval = st.selectbox("Interval", ["1m", "5m", "15m", "30m", "1h", "1d"], index=3)
+        period = st.selectbox("Period", ["5d", "1mo", "3mo", "6mo", "1y", "2y"], index=3)
+        refresh = st.button("Refresh Data")
+
+    if refresh:
+        st.rerun()
+
+    placeholder = st.empty()
+    with placeholder:
+        market_data = fetch_data(ticker, interval, period)
+
+        if market_data.empty:
+            st.warning("No market data returned for the selected symbol. Please try another symbol or interval.")
+            return
+
+        df = add_indicators(market_data)
+        signal_info = generate_signal(df)
+        latest = df.iloc[-1]
+        pattern_list = get_detected_patterns(latest)
+
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Price", f"₹{latest['Close']:.2f}")
+        col2.metric("RSI", f"{latest['RSI']:.2f}")
+        col3.metric("MACD Hist", f"{latest['MACD_Hist']:.2f}")
+        col4.metric("VWAP", f"{latest['VWAP']:.2f}")
+
+        signal_color = "green" if signal_info["signal"] == "BUY" else "red" if signal_info["signal"] == "SELL" else "gray"
+        st.markdown(
+            f"<div style='padding:12px;border-radius:8px;background:{signal_color};color:white;'>"
+            f"<b>Signal:</b> {signal_info['signal']} &nbsp;|&nbsp; <b>Confidence:</b> {signal_info['confidence']}% &nbsp;|&nbsp; <b>Bias:</b> {signal_info['bias']}"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+        st.write(signal_info["text"])
+
+        fig = go.Figure(data=[
+            go.Candlestick(
+                x=df.index,
+                open=df["Open"],
+                high=df["High"],
+                low=df["Low"],
+                close=df["Close"],
+                name="Price",
+                increasing_line_color="#26a69a",
+                decreasing_line_color="#ef5350",
+            )
+        ])
+        fig.add_trace(go.Scatter(x=df.index, y=df["EMA20"], mode="lines", name="EMA20", line={"color": "#ffb300"}))
+        fig.add_trace(go.Scatter(x=df.index, y=df["EMA50"], mode="lines", name="EMA50", line={"color": "#7e57c2"}))
+        fig.add_trace(go.Scatter(x=df.index, y=df["VWAP"], mode="lines", name="VWAP", line={"color": "#00acc1"}))
+        fig.update_layout(title=f"{selected_symbol} {interval} Chart", xaxis_rangeslider_visible=False, height=600)
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.subheader("Pattern / Context")
+        if pattern_list:
+            st.write(", ".join(pattern_list))
+        else:
+            st.write("No major patterns detected in the latest candle.")
+
+        st.subheader("Trade Journal")
+        journal_df = load_journal()
+        if journal_df.empty:
+            st.info("No trades saved yet.")
+        else:
+            st.dataframe(journal_df.tail(10), use_container_width=True)
+
+        st.subheader("Paper Trading")
+        paper_state = load_paper_state()
+        st.dataframe(paper_state, use_container_width=True)
+
+        with st.form("manual_trade_form"):
+            col_a, col_b, col_c = st.columns(3)
+            entry_price = col_a.number_input("Entry Price", min_value=0.0, value=float(latest["Close"]))
+            quantity = col_b.number_input("Quantity", min_value=1, value=10, step=1)
+            stop_loss = col_c.number_input("Stop Loss", min_value=0.0, value=float(latest["Close"]) * 0.98)
+
+            target1 = st.number_input("Target 1", min_value=0.0, value=float(latest["Close"]) * 1.02)
+            target2 = st.number_input("Target 2", min_value=0.0, value=float(latest["Close"]) * 1.04)
+            trailing_stop = st.number_input("Trailing Stop", min_value=0.0, value=float(latest["Close"]) * 0.99)
+            notes = st.text_input("Notes", value="Manual trade")
+            submitted = st.form_submit_button("Save Trade")
+
+            if submitted:
+                add_trade_to_journal(
+                    symbol=selected_symbol,
+                    timeframe=interval,
+                    signal=signal_info["signal"],
+                    entry_price=entry_price,
+                    quantity=quantity,
+                    stop_loss=stop_loss,
+                    target1=target1,
+                    target2=target2,
+                    trailing_stop=trailing_stop,
+                    notes=notes,
+                    trade_mode="MANUAL",
+                )
+                st.success("Trade saved to journal.")
+
+        summary_path = SESSION_SUMMARY_FILE
+        if os.path.exists(summary_path):
+            summary_df = pd.read_csv(summary_path)
+            if not summary_df.empty:
+                st.subheader("Daily Summary")
+                st.dataframe(summary_df.tail(10), use_container_width=True)
+
+
 if __name__ == "__main__":
-    st.title("Elite Trading Dashboard")
-    st.write("Dashboard loaded successfully.")
+    render_main_page()
