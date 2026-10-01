@@ -24,6 +24,7 @@ USERS_FILE = BASE_DIR / "users.csv"
 SESSION_SUMMARY_FILE = BASE_DIR / "daily_summary.csv"
 AUTH_STATE_FILE = BASE_DIR / "auth_state.txt"
 WATCHLIST_FILE = BASE_DIR / "watchlist.csv"
+BACKTEST_FILE = BASE_DIR / "backtest_results.csv"
 
 # ===== STOCK DICTIONARIES =====
 TOP_10_INDIAN_COMPANIES = {
@@ -187,8 +188,8 @@ def init_journal():
     if not JOURNAL_FILE.exists():
         cols = [
             "DateTime", "Symbol", "Timeframe", "Signal", "EntryPrice", "ExitPrice", "Quantity",
-            "StopLoss", "Target1", "Target2", "TrailingStop", "Status", "PnL", "PnLPercent",
-            "Notes", "TradeMode"
+            "StopLoss", "Target1", "Target2", "Target3", "TrailingStop", "Status", "PnL", "PnLPercent",
+            "ExitReason", "PartialExit", "Notes", "TradeMode", "Confidence"
         ]
         pd.DataFrame(columns=cols).to_csv(JOURNAL_FILE, index=False)
 
@@ -208,6 +209,11 @@ def init_watchlist():
         pd.DataFrame(columns=["symbol", "name"]).to_csv(WATCHLIST_FILE, index=False)
 
 
+def init_backtest():
+    if not BACKTEST_FILE.exists():
+        pd.DataFrame(columns=["Signal", "WinRate", "LossRate", "AvgProfit", "MaxDrawdown"]).to_csv(BACKTEST_FILE, index=False)
+
+
 def load_watchlist():
     init_watchlist()
     try:
@@ -218,6 +224,14 @@ def load_watchlist():
 
 def save_watchlist(df):
     df.to_csv(WATCHLIST_FILE, index=False)
+
+
+def load_backtest_results():
+    init_backtest()
+    try:
+        return pd.read_csv(BACKTEST_FILE)
+    except Exception:
+        return pd.DataFrame(columns=["Signal", "WinRate", "LossRate", "AvgProfit", "MaxDrawdown"])
 
 
 def load_journal():
@@ -238,7 +252,7 @@ def save_paper_state(df):
     df.to_csv(PAPER_STATE_FILE, index=False)
 
 # ===== JOURNAL OPERATIONS =====
-def add_trade_to_journal(symbol, timeframe, signal, entry_price, quantity, stop_loss, target1, target2, trailing_stop, notes="", trade_mode="MANUAL"):
+def add_trade_to_journal(symbol, timeframe, signal, entry_price, quantity, stop_loss, target1, target2, target3, trailing_stop, confidence, notes="", trade_mode="AUTO"):
     journal = load_journal()
     new_row = {
         "DateTime": datetime.now().strftime("%d-%m-%Y %H:%M:%S"),
@@ -251,18 +265,22 @@ def add_trade_to_journal(symbol, timeframe, signal, entry_price, quantity, stop_
         "StopLoss": stop_loss,
         "Target1": target1,
         "Target2": target2,
+        "Target3": target3,
         "TrailingStop": trailing_stop,
         "Status": "OPEN",
         "PnL": np.nan,
         "PnLPercent": np.nan,
+        "ExitReason": "",
+        "PartialExit": "No",
         "Notes": notes,
-        "TradeMode": trade_mode
+        "TradeMode": trade_mode,
+        "Confidence": confidence
     }
     journal = pd.concat([journal, pd.DataFrame([new_row])], ignore_index=True)
     save_journal(journal)
 
 
-def close_trade_in_journal(index_id, exit_price):
+def close_trade_in_journal(index_id, exit_price, exit_reason="Manual", partial_exit="No"):
     journal = load_journal()
     if index_id in journal.index:
         row = journal.loc[index_id]
@@ -281,6 +299,8 @@ def close_trade_in_journal(index_id, exit_price):
         journal.at[index_id, "Status"] = "CLOSED"
         journal.at[index_id, "PnL"] = round(pnl, 2)
         journal.at[index_id, "PnLPercent"] = round(pnl_pct, 2)
+        journal.at[index_id, "ExitReason"] = exit_reason
+        journal.at[index_id, "PartialExit"] = partial_exit
         save_journal(journal)
 
 # ===== DATA FETCHING =====
@@ -572,9 +592,10 @@ def detect_trend_pattern(df):
     return "Trend not enough data"
 
 
-def get_trade_signal(df):
+def get_trade_signal_with_confidence(df):
+    """Returns signal, confidence (0-100), entry_price, stop_loss, target1, target2, target3, trailing_sl"""
     if df.empty or len(df) < 20:
-        return "HOLD", 0
+        return "HOLD", 0, None, None, None, None, None, None
 
     latest = df.iloc[-1]
     rsi = latest.get("RSI", 50)
@@ -585,24 +606,83 @@ def get_trade_signal(df):
     ema50 = latest.get("EMA50", close)
     bb_upper = latest.get("BB_Upper", close)
     bb_lower = latest.get("BB_Lower", close)
+    atr = latest.get("ATR", close * 0.02)
+    adx = latest.get("ADX", 0)
 
     score = 0
-    if close > ema20:
-        score += 1
-    if close > ema50:
-        score += 1
-    if rsi > 55:
-        score += 1
-    if macd > signal_line:
-        score += 1
-    if close < bb_upper and close > bb_lower:
-        score += 1
+    buy_signals = 0
 
-    if score >= 4:
-        return "BUY", score
-    if score <= 1:
-        return "SELL", score
-    return "HOLD", score
+    if close > ema20:
+        buy_signals += 1
+    if close > ema50:
+        buy_signals += 1
+    if 50 < rsi < 70:
+        buy_signals += 1
+    if macd > signal_line and macd > 0:
+        buy_signals += 1
+    if close < bb_upper and close > bb_lower:
+        buy_signals += 1
+    if adx > 25:
+        buy_signals += 1
+
+    confidence = (buy_signals / 6) * 100
+
+    entry_price = close
+    stop_loss = close - (atr * 1.5)
+    target1 = close + (atr * 1.5)
+    target2 = close + (atr * 2.5)
+    target3 = close + (atr * 3.5)
+    trailing_sl = atr * 0.75
+
+    if buy_signals >= 4:
+        return "BUY", int(confidence), entry_price, stop_loss, target1, target2, target3, trailing_sl
+    elif buy_signals <= 1:
+        return "SELL", int(confidence), entry_price, close + (atr * 1.5), close - (atr * 1.5), close - (atr * 2.5), close - (atr * 3.5), atr * 0.75
+    else:
+        return "HOLD", int(confidence), entry_price, stop_loss, target1, target2, target3, trailing_sl
+
+
+def backtest_signal_performance(journal_df):
+    """Calculate backtest statistics for signals"""
+    if journal_df.empty:
+        return {"BUY": {"win_rate": 0, "loss_rate": 0}, "SELL": {"win_rate": 0, "loss_rate": 0}, "HOLD": {"win_rate": 0, "loss_rate": 0}}
+
+    closed_trades = journal_df[journal_df["Status"] == "CLOSED"]
+    if closed_trades.empty:
+        return {"BUY": {"win_rate": 0, "loss_rate": 0}, "SELL": {"win_rate": 0, "loss_rate": 0}, "HOLD": {"win_rate": 0, "loss_rate": 0}}
+
+    results = {}
+    for signal_type in ["BUY", "SELL", "HOLD"]:
+        signal_trades = closed_trades[closed_trades["Signal"] == signal_type]
+        if not signal_trades.empty:
+            pnl = pd.to_numeric(signal_trades["PnL"], errors="coerce").fillna(0)
+            wins = (pnl > 0).sum()
+            losses = (pnl < 0).sum()
+            total = len(signal_trades)
+            win_rate = (wins / total * 100) if total > 0 else 0
+            loss_rate = (losses / total * 100) if total > 0 else 0
+            results[signal_type] = {"win_rate": round(win_rate, 1), "loss_rate": round(loss_rate, 1)}
+        else:
+            results[signal_type] = {"win_rate": 0, "loss_rate": 0}
+
+    return results
+
+
+def get_watchlist_symbols():
+    df = load_watchlist()
+    if df.empty:
+        return []
+    return df["name"].astype(str).tolist()
+
+
+def add_symbol_to_watchlist(symbol_name, symbol_value):
+    df = load_watchlist()
+    if df.empty:
+        df = pd.DataFrame(columns=["symbol", "name"])
+    if symbol_name not in df["name"].astype(str).tolist():
+        new_row = pd.DataFrame([{"symbol": symbol_value, "name": symbol_name}])
+        df = pd.concat([df, new_row], ignore_index=True)
+        save_watchlist(df)
 
 
 def get_today_summary():
@@ -622,23 +702,6 @@ def get_today_summary():
     pnl = float(pnl_series.sum())
     win_rate = (wins / total) * 100 if total else 0.0
     return {"total": total, "wins": wins, "losses": losses, "pnl": pnl, "win_rate": win_rate}
-
-
-def add_symbol_to_watchlist(symbol_name, symbol_value):
-    df = load_watchlist()
-    if df.empty:
-        df = pd.DataFrame(columns=["symbol", "name"])
-    if symbol_name not in df["name"].astype(str).tolist():
-        new_row = pd.DataFrame([{"symbol": symbol_value, "name": symbol_name}])
-        df = pd.concat([df, new_row], ignore_index=True)
-        save_watchlist(df)
-
-
-def get_watchlist_symbols():
-    df = load_watchlist()
-    if df.empty:
-        return []
-    return df["name"].astype(str).tolist()
 
 # ===== MAIN APP =====
 def main():
@@ -674,11 +737,6 @@ def main():
         )
 
     st.sidebar.subheader("📋 Watchlist")
-    selected_watchlist = st.sidebar.multiselect(
-        "Watchlist Symbols",
-        options=get_watchlist_symbols() if get_watchlist_symbols() else [symbol_name],
-        default=get_watchlist_symbols()[:1] if get_watchlist_symbols() else []
-    )
     if st.sidebar.button("Add to Watchlist"):
         add_symbol_to_watchlist(symbol_name, symbol)
         st.sidebar.success(f"Added {symbol_name} to watchlist")
@@ -692,11 +750,15 @@ def main():
     df = add_indicators(df)
     latest = df.iloc[-1].to_dict()
     trend_state = detect_trend_pattern(df)
-    signal, signal_score = get_trade_signal(df)
+    signal, confidence, entry_price, stop_loss, target1, target2, target3, trailing_sl = get_trade_signal_with_confidence(df)
 
     pcr_value = None
     if market_group in ["Indices", "Top 10 Indian Companies", "Banking Stocks", "Forex"]:
         pcr_value = fetch_pcr_data("NIFTY")
+
+    # Load backtest results
+    journal = load_journal()
+    backtest_results = backtest_signal_performance(journal)
 
     st.caption(f"Market: {market_group} | Asset: {symbol_name} | Symbol: {symbol}")
 
@@ -712,19 +774,75 @@ def main():
     col4.metric("🎯 ADX", f"{latest.get('ADX', 0):.1f}")
     col5.metric("🧠 PCR", f"{pcr_value:.2f}" if pcr_value is not None else "N/A")
 
+    st.subheader("🚀 AUTO SIGNAL - Live Trading Setup")
+    signal_col1, signal_col2, signal_col3, signal_col4 = st.columns(4)
+
+    with signal_col1:
+        if signal == "BUY":
+            st.success(f"🟢 BUY")
+        elif signal == "SELL":
+            st.error(f"🔴 SELL")
+        else:
+            st.info(f"⚪ HOLD")
+
+    with signal_col2:
+        st.metric("Confidence", f"{confidence}%")
+
+    with signal_col3:
+        win_rate = backtest_results.get(signal, {}).get("win_rate", 0)
+        loss_rate = backtest_results.get(signal, {}).get("loss_rate", 0)
+        st.write(f"**Win Rate:** {win_rate}% | **Loss Rate:** {loss_rate}%")
+
+    with signal_col4:
+        auto_execute = st.checkbox("Auto Execute Trade", value=False, key="auto_execute")
+
+    st.subheader("📋 Trade Setup - Entry & Exits")
+    entry_col1, entry_col2, entry_col3, entry_col4 = st.columns(4)
+
+    with entry_col1:
+        st.write(f"**Entry Price:** ₹{entry_price:.2f}")
+    with entry_col2:
+        st.write(f"**Stop Loss:** ₹{stop_loss:.2f}")
+    with entry_col3:
+        st.write(f"**Trailing SL:** ₹{trailing_sl:.2f}")
+    with entry_col4:
+        pass
+
+    target_col1, target_col2, target_col3, target_col4 = st.columns(4)
+    with target_col1:
+        st.write(f"**Target 1:** ₹{target1:.2f}")
+    with target_col2:
+        st.write(f"**Target 2:** ₹{target2:.2f}")
+    with target_col3:
+        st.write(f"**Target 3:** ₹{target3:.2f}")
+    with target_col4:
+        pass
+
+    st.subheader("📊 Manual Trade Entry")
+    with st.form("trade_entry_form"):
+        trade_signal = st.selectbox("Signal", ["BUY", "SELL", "HOLD"])
+        trade_entry = st.number_input("Entry Price", value=entry_price, step=0.01)
+        trade_qty = st.number_input("Quantity", value=1, step=1)
+        trade_sl = st.number_input("Stop Loss", value=stop_loss, step=0.01)
+        trade_t1 = st.number_input("Target 1", value=target1, step=0.01)
+        trade_t2 = st.number_input("Target 2", value=target2, step=0.01)
+        trade_t3 = st.number_input("Target 3", value=target3, step=0.01)
+        trade_trailing_sl = st.number_input("Trailing Stop Loss", value=trailing_sl, step=0.01)
+        trade_notes = st.text_input("Notes", value="")
+
+        if st.form_submit_button("📝 Log Trade"):
+            add_trade_to_journal(
+                symbol_name, timeframe, trade_signal, trade_entry, trade_qty,
+                trade_sl, trade_t1, trade_t2, trade_t3, trade_trailing_sl, confidence, trade_notes, "MANUAL"
+            )
+            st.success("✅ Trade logged successfully!")
+            st.rerun()
+
     st.subheader("📌 Trend & Market Context")
     st.success(trend_state)
     st.write(f"- Support Zone: ₹{latest.get('TrendSupport', 0):.2f}")
     st.write(f"- Resistance Zone: ₹{latest.get('TrendResistance', 0):.2f}")
     st.write(f"- MACD: {latest.get('MACD', 0):.4f} | Signal: {latest.get('SignalLine', 0):.4f} | Histogram: {latest.get('MACD_Hist', 0):.4f}")
-
-    st.subheader("🚦 Trade Signal")
-    if signal == "BUY":
-        st.success(f"BUY Signal: Strong bullish setup (score {signal_score}/5)")
-    elif signal == "SELL":
-        st.error(f"SELL Signal: Strong bearish setup (score {signal_score}/5)")
-    else:
-        st.info(f"HOLD Signal: Neutral setup (score {signal_score}/5)")
 
     use_heikin_ashi = st.checkbox("Show Heikin Ashi chart", value=False)
     chart_df = compute_heikin_ashi(df) if use_heikin_ashi else df.copy()
@@ -787,9 +905,6 @@ def main():
             st.info("PCR suggests strong call interest; momentum may be bullish.")
         else:
             st.info("PCR is near neutral; trend is balanced.")
-    else:
-        st.subheader("📉 Put-Call Ratio (PCR)")
-        st.info("PCR is not available from the live feed in this session.")
 
     st.subheader("📈 Daily Summary")
     col1, col2, col3, col4 = st.columns(4)
@@ -800,7 +915,6 @@ def main():
     st.caption(f"Win Rate: {summary['win_rate']:.1f}%")
 
     st.subheader("📓 Trade Journal")
-    journal = load_journal()
     if not journal.empty:
         st.dataframe(journal.tail(10), use_container_width=True)
     else:
