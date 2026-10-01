@@ -581,17 +581,47 @@ def get_detected_patterns(latest):
 
 
 def get_higher_timeframe(tf):
-    if tf == "1m":
-        return "5m", "30d"
-    if tf == "5m":
-        return "15m", "30d"
-    if tf == "10m":
-        return "30m", "60d"
-    if tf == "15m":
-        return "30m", "60d"
-    if tf == "30m":
-        return "60m", < 18:
-        score -= 10
+    mapping = {
+        "1m": ("5m", "30d"),
+        "5m": ("15m", "30d"),
+        "10m": ("30m", "60d"),
+        "15m": ("30m", "60d"),
+        "30m": ("60m", "90d"),
+        "1h": ("4h", "180d"),
+        "4h": ("1d", "365d"),
+        "1d": ("1w", "365d")
+    }
+    return mapping.get(tf, ("1d", "365d"))
+
+
+def calculate_signal_score(
+    rsi=None,
+    macd_hist=None,
+    volume_spike=False,
+    breakout=False,
+    breakdown=False,
+    htf_bias="NEUTRAL",
+    sideways=False,
+    rr_ratio=None,
+    backtest_win_rate=50,
+):
+    score = 15
+
+    if rsi is not None:
+        if rsi > 70:
+            score += 10
+        elif rsi < 30:
+            score -= 10
+        elif rsi > 55:
+            score += 5
+        elif rsi < 45:
+            score -= 5
+
+    if macd_hist is not None:
+        if macd_hist > 0:
+            score += 8
+        else:
+            score -= 8
 
     if volume_spike:
         score += 5
@@ -898,4 +928,17 @@ def fetch_geopolitical_news(news_api_key=None):
 def calculate_news_score(news_items):
     score = 0
     for item in news_items:
-        sentiment = str(item.get("sentiment", "Neutral")).
+        sentiment = str(item.get("sentiment", "Neutral")).lower()
+        if sentiment == "positive":
+            score += 1
+        elif sentiment == "negative":
+            score -= 1
+        elif sentiment == "neutral":
+            score += 0
+    return score
+
+
+# Minimal app guard to avoid issues when imported as a module.
+if __name__ == "__main__":
+    st.title("Elite Trading Dashboard")
+    st.write("Dashboard loaded successfully.")
