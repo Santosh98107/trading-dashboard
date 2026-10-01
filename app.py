@@ -1,6 +1,6 @@
 import os
 import hashlib
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -25,6 +25,7 @@ SESSION_SUMMARY_FILE = BASE_DIR / "daily_summary.csv"
 AUTH_STATE_FILE = BASE_DIR / "auth_state.txt"
 WATCHLIST_FILE = BASE_DIR / "watchlist.csv"
 BACKTEST_FILE = BASE_DIR / "backtest_results.csv"
+BACKTEST_HISTORY_FILE = BASE_DIR / "backtest_history.csv"
 
 # ===== STOCK DICTIONARIES =====
 TOP_10_INDIAN_COMPANIES = {
@@ -212,6 +213,12 @@ def init_watchlist():
 def init_backtest():
     if not BACKTEST_FILE.exists():
         pd.DataFrame(columns=["Signal", "WinRate", "LossRate", "AvgProfit", "MaxDrawdown"]).to_csv(BACKTEST_FILE, index=False)
+
+
+def init_backtest_history():
+    if not BACKTEST_HISTORY_FILE.exists():
+        cols = ["Symbol", "Timeframe", "Signal", "Period", "TotalTrades", "Wins", "Losses", "WinRate", "LossRate", "AvgProfit", "MaxDrawdown", "Timestamp"]
+        pd.DataFrame(columns=cols).to_csv(BACKTEST_HISTORY_FILE, index=False)
 
 
 def load_watchlist():
@@ -596,6 +603,56 @@ def detect_trend_pattern(df):
     return "Trend not enough data"
 
 
+def detect_market_bias(df):
+    """Detect overall market bias: Bullish, Bearish, or Neutral"""
+    if df.empty or len(df) < 50:
+        return "Neutral"
+    
+    close = df["Close"].iloc[-1]
+    ema20 = df["EMA20"].iloc[-1]
+    ema50 = df["EMA50"].iloc[-1]
+    rsi = df["RSI"].iloc[-1]
+    adx = df["ADX"].iloc[-1]
+    
+    bullish_count = 0
+    bearish_count = 0
+    
+    if close > ema20 > ema50:
+        bullish_count += 2
+    elif close < ema20 < ema50:
+        bearish_count += 2
+    
+    if rsi > 60:
+        bullish_count += 1
+    elif rsi < 40:
+        bearish_count += 1
+    
+    if adx > 30:
+        if close > ema20:
+            bullish_count += 1
+        else:
+            bearish_count += 1
+    
+    if bullish_count > bearish_count:
+        return "📈 Bullish"
+    elif bearish_count > bullish_count:
+        return "📉 Bearish"
+    else:
+        return "↔️ Neutral"
+
+
+def get_signal_strength(confidence):
+    """Convert confidence to signal strength"""
+    if confidence >= 80:
+        return "💪 STRONGLY BUY" if confidence >= 80 else "💪 STRONGLY SELL"
+    elif confidence >= 60:
+        return "📈 BUY" if confidence >= 60 else "📉 SELL"
+    elif confidence >= 40:
+        return "⚠️ WEAK BUY" if confidence >= 40 else "⚠️ WEAK SELL"
+    else:
+        return "❓ HOLD"
+
+
 def get_trade_signal_with_confidence(df):
     """Returns signal, confidence (0-100), entry_price, stop_loss, target1, target2, target3, trailing_sl"""
     if df.empty or len(df) < 20:
@@ -649,10 +706,16 @@ def get_trade_signal_with_confidence(df):
         return "HOLD", int(confidence), entry_price, stop_loss, target1, target2, target3, trailing_sl
 
 
-def backtest_signal_performance(journal_df):
-    """Calculate backtest statistics for signals"""
+def backtest_signal_performance(journal_df, period="all"):
+    """Calculate backtest statistics for signals with optional period filter"""
     if journal_df.empty:
         return {"BUY": {"win_rate": 0, "loss_rate": 0}, "SELL": {"win_rate": 0, "loss_rate": 0}, "HOLD": {"win_rate": 0, "loss_rate": 0}}
+
+    # Filter by period if needed
+    if period != "all":
+        days_back = {"1m": 30, "3m": 90, "1y": 365, "5y": 1825}.get(period, 365)
+        cutoff_date = datetime.now() - timedelta(days=days_back)
+        journal_df = journal_df[pd.to_datetime(journal_df["DateTime"]).dt.date >= cutoff_date.date()]
 
     closed_trades = journal_df[journal_df["Status"] == "CLOSED"]
     if closed_trades.empty:
@@ -668,9 +731,9 @@ def backtest_signal_performance(journal_df):
             total = len(signal_trades)
             win_rate = (wins / total * 100) if total > 0 else 0
             loss_rate = (losses / total * 100) if total > 0 else 0
-            results[signal_type] = {"win_rate": round(win_rate, 1), "loss_rate": round(loss_rate, 1)}
+            results[signal_type] = {"win_rate": round(win_rate, 1), "loss_rate": round(loss_rate, 1), "total": total}
         else:
-            results[signal_type] = {"win_rate": 0, "loss_rate": 0}
+            results[signal_type] = {"win_rate": 0, "loss_rate": 0, "total": 0}
 
     return results
 
@@ -722,12 +785,15 @@ def main():
     symbol_name = st.sidebar.selectbox("📈 Select Asset", list(MARKET_GROUPS[market_group].keys()), index=0)
     symbol = MARKET_GROUPS[market_group][symbol_name]
 
-    timeframe_options = ["1m", "3m", "5m", "15m", "30m", "1h", "4h", "1d"]
-    timeframe = st.sidebar.selectbox("⏱️ Timeframe", timeframe_options, index=5)
+    timeframe_options = ["1m", "2m", "3m", "5m", "6m", "12m", "15m", "30m", "1h", "2h", "4h", "1d"]
+    timeframe = st.sidebar.selectbox("⏱️ Timeframe", timeframe_options, index=8)
 
-    period_map = {"1m": "5d", "3m": "5d", "5m": "60d", "15m": "90d", "30m": "120d", "1h": "180d", "4h": "1y", "1d": "3y"}
+    period_map = {
+        "1m": "5d", "2m": "5d", "3m": "5d", "5m": "60d", "6m": "60d", "12m": "90d", 
+        "15m": "90d", "30m": "120d", "1h": "180d", "2h": "1y", "4h": "1y", "1d": "5y"
+    }
     period = period_map.get(timeframe, "90d")
-    actual_interval = {"3m": "2m"}.get(timeframe, timeframe)
+    actual_interval = {"3m": "2m", "6m": "5m", "12m": "10m"}.get(timeframe, timeframe)
 
     if st.sidebar.button("🔄 Refresh Data"):
         st.cache_data.clear()
@@ -760,15 +826,18 @@ def main():
     df = add_indicators(df)
     latest = df.iloc[-1].to_dict()
     trend_state = detect_trend_pattern(df)
+    market_bias = detect_market_bias(df)
     signal, confidence, entry_price, stop_loss, target1, target2, target3, trailing_sl = get_trade_signal_with_confidence(df)
+    signal_strength = get_signal_strength(confidence)
 
     pcr_value = None
     if market_group in ["Indices", "Top 10 Indian Companies", "Banking Stocks", "Forex"]:
         pcr_value = fetch_pcr_data("NIFTY")
 
-    # Load backtest results
+    # Load backtest results - for 5 years
     journal = load_journal()
-    backtest_results = backtest_signal_performance(journal)
+    backtest_results_all = backtest_signal_performance(journal, "all")
+    backtest_results_5y = backtest_signal_performance(journal, "5y")
 
     st.caption(f"Market: {market_group} | Asset: {symbol_name} | Symbol: {symbol}")
 
@@ -799,12 +868,35 @@ def main():
         st.metric("Confidence", f"{confidence}%")
 
     with signal_col3:
-        win_rate = backtest_results.get(signal, {}).get("win_rate", 0)
-        loss_rate = backtest_results.get(signal, {}).get("loss_rate", 0)
-        st.write(f"**Win Rate:** {win_rate}% | **Loss Rate:** {loss_rate}%")
+        st.write(f"**Signal Strength:** {signal_strength}")
+        st.write(f"**Market Bias:** {market_bias}")
 
     with signal_col4:
         auto_execute = st.checkbox("Auto Execute Trade", value=False, key="auto_execute")
+
+    # ===== BACKTEST PERFORMANCE DASHBOARD =====
+    st.subheader("📊 BACKTEST PERFORMANCE (5 YEARS)")
+    bt_col1, bt_col2, bt_col3 = st.columns(3)
+    
+    with bt_col1:
+        st.write("**BUY Signals**")
+        buy_stats = backtest_results_5y.get("BUY", {})
+        st.metric("Win Rate", f"{buy_stats.get('win_rate', 0):.1f}%", delta=f"Loss: {buy_stats.get('loss_rate', 0):.1f}%")
+        st.caption(f"Total Trades: {buy_stats.get('total', 0)}")
+    
+    with bt_col2:
+        st.write("**SELL Signals**")
+        sell_stats = backtest_results_5y.get("SELL", {})
+        st.metric("Win Rate", f"{sell_stats.get('win_rate', 0):.1f}%", delta=f"Loss: {sell_stats.get('loss_rate', 0):.1f}%")
+        st.caption(f"Total Trades: {sell_stats.get('total', 0)}")
+    
+    with bt_col3:
+        st.write("**HOLD Signals**")
+        hold_stats = backtest_results_5y.get("HOLD", {})
+        st.metric("Win Rate", f"{hold_stats.get('win_rate', 0):.1f}%", delta=f"Loss: {hold_stats.get('loss_rate', 0):.1f}%")
+        st.caption(f"Total Trades: {hold_stats.get('total', 0)}")
+
+    st.divider()
 
     st.subheader("📋 Trade Setup - Entry & Exits")
     entry_col1, entry_col2, entry_col3, entry_col4 = st.columns(4)
