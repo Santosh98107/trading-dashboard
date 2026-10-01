@@ -1,6 +1,7 @@
 import os
 import hashlib
 from datetime import datetime
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -11,12 +12,15 @@ import yfinance as yf
 
 st.set_page_config(page_title="Elite Trading Dashboard Ultimate+", layout="wide")
 
+# ===== BASE PATHS =====
+BASE_DIR = Path(__file__).resolve().parent
+
 # ===== FILE PATHS =====
-JOURNAL_FILE = "trade_journal.csv"
-SIGNAL_STATE_FILE = "last_signal_state.txt"
-PAPER_STATE_FILE = "paper_trade_state.csv"
-USERS_FILE = "users.csv"
-SESSION_SUMMARY_FILE = "daily_summary.csv"
+JOURNAL_FILE = BASE_DIR / "trade_journal.csv"
+SIGNAL_STATE_FILE = BASE_DIR / "last_signal_state.txt"
+PAPER_STATE_FILE = BASE_DIR / "paper_trade_state.csv"
+USERS_FILE = BASE_DIR / "users.csv"
+SESSION_SUMMARY_FILE = BASE_DIR / "daily_summary.csv"
 
 # ===== STOCK DICTIONARIES =====
 TOP_INDIAN_COMPANIES = {
@@ -51,13 +55,44 @@ INDEX_STOCKS = {
 stocks = {**INDEX_STOCKS, **TOP_INDIAN_COMPANIES, **BANKING_STOCKS}
 
 # ===== AUTHENTICATION =====
+DEFAULT_USERNAME = "admin"
+DEFAULT_PASSWORD = "admin123"
+
+
 def hash_password(password: str) -> str:
     return hashlib.sha256(password.encode("utf-8")).hexdigest()
 
 
+def load_users():
+    try:
+        users = pd.read_csv(USERS_FILE)
+        if "username" not in users.columns or "password" not in users.columns:
+            raise ValueError("Missing username/password columns")
+        users["username"] = users["username"].astype(str).str.strip()
+        users["password"] = users["password"].astype(str).str.strip()
+        return users
+    except Exception:
+        return pd.DataFrame(columns=["username", "password"])
+
+
 def init_users():
-    if not os.path.exists(USERS_FILE):
-        pd.DataFrame([{"username": "admin", "password": hash_password("admin123")}]).to_csv(USERS_FILE, index=False)
+    default_user = pd.DataFrame([
+        {"username": DEFAULT_USERNAME, "password": hash_password(DEFAULT_PASSWORD)}
+    ])
+
+    if not USERS_FILE.exists():
+        default_user.to_csv(USERS_FILE, index=False)
+        return
+
+    try:
+        users = load_users()
+        admin_exists = ((users["username"] == DEFAULT_USERNAME) & (users["password"] == hash_password(DEFAULT_PASSWORD))).any()
+        if users.empty or not admin_exists:
+            merged = pd.concat([users, default_user], ignore_index=True)
+            merged = merged.drop_duplicates(subset=["username"], keep="last")
+            merged.to_csv(USERS_FILE, index=False)
+    except Exception:
+        default_user.to_csv(USERS_FILE, index=False)
 
 
 def login_panel():
@@ -69,12 +104,12 @@ def login_panel():
 
     if not st.session_state.logged_in:
         st.sidebar.subheader("🔐 Login")
-        username = st.sidebar.text_input("Username")
+        username = str(st.sidebar.text_input("Username", value="")).strip()
         password = st.sidebar.text_input("Password", type="password")
 
         if st.sidebar.button("Login"):
             try:
-                users = pd.read_csv(USERS_FILE)
+                users = load_users()
                 entered_hash = hash_password(password)
                 valid = ((users["username"] == username) & (users["password"] == entered_hash)).any()
                 if valid:
@@ -96,18 +131,22 @@ def login_panel():
 
 # ===== FILE INITIALIZATION =====
 def init_journal():
-    if not os.path.exists(JOURNAL_FILE):
-        cols = ["DateTime", "Symbol", "Timeframe", "Signal", "EntryPrice", "ExitPrice", "Quantity", "StopLoss", "Target1", "Target2", "TrailingStop", "Status", "PnL", "PnLPercent", "Notes", "TradeMode"]
+    if not JOURNAL_FILE.exists():
+        cols = [
+            "DateTime", "Symbol", "Timeframe", "Signal", "EntryPrice", "ExitPrice", "Quantity",
+            "StopLoss", "Target1", "Target2", "TrailingStop", "Status", "PnL", "PnLPercent",
+            "Notes", "TradeMode"
+        ]
         pd.DataFrame(columns=cols).to_csv(JOURNAL_FILE, index=False)
 
 
 def init_paper_state():
-    if not os.path.exists(PAPER_STATE_FILE):
+    if not PAPER_STATE_FILE.exists():
         pd.DataFrame([{"Balance": 100000.0, "UsedMargin": 0.0, "OpenPositions": 0}]).to_csv(PAPER_STATE_FILE, index=False)
 
 
 def init_daily_summary():
-    if not os.path.exists(SESSION_SUMMARY_FILE):
+    if not SESSION_SUMMARY_FILE.exists():
         pd.DataFrame(columns=["Date", "TotalTrades", "Wins", "Losses", "RealizedPnL", "WinRate"]).to_csv(SESSION_SUMMARY_FILE, index=False)
 
 
