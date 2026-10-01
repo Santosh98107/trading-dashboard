@@ -278,6 +278,7 @@ def add_trade_to_journal(symbol, timeframe, signal, entry_price, quantity, stop_
     }
     journal = pd.concat([journal, pd.DataFrame([new_row])], ignore_index=True)
     save_journal(journal)
+    return True
 
 
 def close_trade_in_journal(index_id, exit_price, exit_reason="Manual", partial_exit="No"):
@@ -302,6 +303,8 @@ def close_trade_in_journal(index_id, exit_price, exit_reason="Manual", partial_e
         journal.at[index_id, "ExitReason"] = exit_reason
         journal.at[index_id, "PartialExit"] = partial_exit
         save_journal(journal)
+        return True
+    return False
 
 # ===== DATA FETCHING =====
 def fetch_data(ticker, interval, period):
@@ -476,6 +479,7 @@ def add_indicators(df):
     df = df.copy()
 
     # Moving averages
+    df["EMA5"] = df["Close"].ewm(span=5, adjust=False).mean()
     df["EMA20"] = df["Close"].ewm(span=20, adjust=False).mean()
     df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
 
@@ -602,6 +606,7 @@ def get_trade_signal_with_confidence(df):
     macd = latest.get("MACD", 0)
     signal_line = latest.get("SignalLine", 0)
     close = latest.get("Close", 0)
+    ema5 = latest.get("EMA5", close)
     ema20 = latest.get("EMA20", close)
     ema50 = latest.get("EMA50", close)
     bb_upper = latest.get("BB_Upper", close)
@@ -612,6 +617,8 @@ def get_trade_signal_with_confidence(df):
     score = 0
     buy_signals = 0
 
+    if close > ema5:
+        buy_signals += 1
     if close > ema20:
         buy_signals += 1
     if close > ema50:
@@ -625,7 +632,7 @@ def get_trade_signal_with_confidence(df):
     if adx > 25:
         buy_signals += 1
 
-    confidence = (buy_signals / 6) * 100
+    confidence = (buy_signals / 7) * 100
 
     entry_price = close
     stop_loss = close - (atr * 1.5)
@@ -634,7 +641,7 @@ def get_trade_signal_with_confidence(df):
     target3 = close + (atr * 3.5)
     trailing_sl = atr * 0.75
 
-    if buy_signals >= 4:
+    if buy_signals >= 5:
         return "BUY", int(confidence), entry_price, stop_loss, target1, target2, target3, trailing_sl
     elif buy_signals <= 1:
         return "SELL", int(confidence), entry_price, close + (atr * 1.5), close - (atr * 1.5), close - (atr * 2.5), close - (atr * 3.5), atr * 0.75
@@ -818,32 +825,7 @@ def main():
     with target_col4:
         pass
 
-    st.subheader("📊 Manual Trade Entry")
-    with st.form("trade_entry_form"):
-        trade_signal = st.selectbox("Signal", ["BUY", "SELL", "HOLD"])
-        trade_entry = st.number_input("Entry Price", value=entry_price, step=0.01)
-        trade_qty = st.number_input("Quantity", value=1, step=1)
-        trade_sl = st.number_input("Stop Loss", value=stop_loss, step=0.01)
-        trade_t1 = st.number_input("Target 1", value=target1, step=0.01)
-        trade_t2 = st.number_input("Target 2", value=target2, step=0.01)
-        trade_t3 = st.number_input("Target 3", value=target3, step=0.01)
-        trade_trailing_sl = st.number_input("Trailing Stop Loss", value=trailing_sl, step=0.01)
-        trade_notes = st.text_input("Notes", value="")
-
-        if st.form_submit_button("📝 Log Trade"):
-            add_trade_to_journal(
-                symbol_name, timeframe, trade_signal, trade_entry, trade_qty,
-                trade_sl, trade_t1, trade_t2, trade_t3, trade_trailing_sl, confidence, trade_notes, "MANUAL"
-            )
-            st.success("✅ Trade logged successfully!")
-            st.rerun()
-
-    st.subheader("📌 Trend & Market Context")
-    st.success(trend_state)
-    st.write(f"- Support Zone: ₹{latest.get('TrendSupport', 0):.2f}")
-    st.write(f"- Resistance Zone: ₹{latest.get('TrendResistance', 0):.2f}")
-    st.write(f"- MACD: {latest.get('MACD', 0):.4f} | Signal: {latest.get('SignalLine', 0):.4f} | Histogram: {latest.get('MACD_Hist', 0):.4f}")
-
+    st.subheader("💹 Live Chart with All Indicators")
     use_heikin_ashi = st.checkbox("Show Heikin Ashi chart", value=False)
     chart_df = compute_heikin_ashi(df) if use_heikin_ashi else df.copy()
 
@@ -867,26 +849,47 @@ def main():
             name="Price"
         ))
 
+    fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df["EMA5"], name="EMA5", line=dict(color="yellow", width=1)))
     fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df["EMA20"], name="EMA20", line=dict(color="blue", width=2)))
     fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df["EMA50"], name="EMA50", line=dict(color="red", width=2)))
+    fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df["VWAP"], name="VWAP", line=dict(color="green", width=2)))
     fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df["TrendSupport"], name="Trend Support", line=dict(color="lime", dash="dot")))
     fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df["TrendResistance"], name="Trend Resistance", line=dict(color="orange", dash="dot")))
     fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df["BB_Upper"], name="BB Upper", line=dict(color="purple", dash="dash")))
     fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df["BB_Lower"], name="BB Lower", line=dict(color="purple", dash="dash")))
-    fig.update_layout(title=f"{symbol_name} - {timeframe} | {market_group}", template="plotly_dark", height=560, xaxis_rangeslider_visible=False)
+    fig.update_layout(title=f"{symbol_name} - {timeframe} | {market_group}", template="plotly_dark", height=600, xaxis_rangeslider_visible=False)
     st.plotly_chart(fig, use_container_width=True)
 
-    st.subheader("📊 Bollinger Bands & MACD")
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.subheader("📊 MACD Indicator")
+        fig_macd = go.Figure()
+        fig_macd.add_trace(go.Scatter(x=chart_df.index, y=chart_df["MACD"], name="MACD", line=dict(color="blue")))
+        fig_macd.add_trace(go.Scatter(x=chart_df.index, y=chart_df["SignalLine"], name="Signal Line", line=dict(color="red")))
+        fig_macd.add_trace(go.Bar(x=chart_df.index, y=chart_df["MACD_Hist"], name="Histogram", marker=dict(color="gray")))
+        fig_macd.update_layout(template="plotly_dark", height=400, xaxis_rangeslider_visible=False)
+        st.plotly_chart(fig_macd, use_container_width=True)
+
+    with col2:
+        st.subheader("📈 VWAP Analysis")
+        st.write(f"**Current VWAP:** ₹{latest.get('VWAP', 0):.2f}")
+        st.write(f"**Current Price:** ₹{latest.get('Close', 0):.2f}")
+        if latest.get('Close', 0) > latest.get('VWAP', 0):
+            st.success("✅ Price Above VWAP - Bullish")
+        else:
+            st.error("❌ Price Below VWAP - Bearish")
+
+    st.subheader("📊 Bollinger Bands")
     bb_upper = latest.get("BB_Upper", 0)
     bb_lower = latest.get("BB_Lower", 0)
-    macd = latest.get("MACD", 0)
-    hist = latest.get("MACD_Hist", 0)
+    sma20 = latest.get("SMA20", 0)
 
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("BB Upper", f"₹{bb_upper:.2f}")
-    col2.metric("BB Lower", f"₹{bb_lower:.2f}")
-    col3.metric("MACD", f"{macd:.4f}")
-    col4.metric("MACD Hist", f"{hist:.4f}")
+    col2.metric("SMA20", f"₹{sma20:.2f}")
+    col3.metric("BB Lower", f"₹{bb_lower:.2f}")
+    col4.metric("Bandwidth", f"₹{(bb_upper - bb_lower):.2f}")
 
     st.subheader("🎯 Detected Patterns")
     patterns = get_detected_patterns(latest)
@@ -906,6 +909,32 @@ def main():
         else:
             st.info("PCR is near neutral; trend is balanced.")
 
+    st.subheader("📌 Trend & Market Context")
+    st.success(trend_state)
+    st.write(f"- Support Zone: ₹{latest.get('TrendSupport', 0):.2f}")
+    st.write(f"- Resistance Zone: ₹{latest.get('TrendResistance', 0):.2f}")
+    st.write(f"- MACD: {latest.get('MACD', 0):.4f} | Signal: {latest.get('SignalLine', 0):.4f} | Histogram: {latest.get('MACD_Hist', 0):.4f}")
+
+    st.subheader("📊 Paper Trading - Manual Entry")
+    with st.form("trade_entry_form"):
+        trade_signal = st.selectbox("Signal", ["BUY", "SELL", "HOLD"])
+        trade_entry = st.number_input("Entry Price", value=float(entry_price), step=0.01)
+        trade_qty = st.number_input("Quantity", value=1, step=1)
+        trade_sl = st.number_input("Stop Loss", value=float(stop_loss), step=0.01)
+        trade_t1 = st.number_input("Target 1", value=float(target1), step=0.01)
+        trade_t2 = st.number_input("Target 2", value=float(target2), step=0.01)
+        trade_t3 = st.number_input("Target 3", value=float(target3), step=0.01)
+        trade_trailing_sl = st.number_input("Trailing Stop Loss", value=float(trailing_sl), step=0.01)
+        trade_notes = st.text_input("Notes", value="")
+
+        if st.form_submit_button("📝 Log Paper Trade"):
+            if add_trade_to_journal(
+                symbol_name, timeframe, trade_signal, trade_entry, trade_qty,
+                trade_sl, trade_t1, trade_t2, trade_t3, trade_trailing_sl, confidence, trade_notes, "PAPER"
+            ):
+                st.success("✅ Paper Trade logged successfully!")
+                st.rerun()
+
     st.subheader("📈 Daily Summary")
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Trades", summary["total"])
@@ -920,7 +949,7 @@ def main():
     else:
         st.info("No trades yet")
 
-    st.subheader("📊 Paper Trading")
+    st.subheader("💰 Paper Trading Account")
     state = load_paper_state()
     col1, col2, col3 = st.columns(3)
     col1.metric("💰 Balance", f"₹{state.loc[0, 'Balance']:.2f}")
