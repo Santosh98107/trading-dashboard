@@ -19,14 +19,14 @@ SESSION_SUMMARY_FILE = "daily_summary.csv"
 
 def init_users():
 
-if not os.path.exists(USERS_FILE):
+    if not os.path.exists(USERS_FILE):
 
-    pd.DataFrame([
+        pd.DataFrame([
         {
-            "username": "admin",
-            "password": "admin123"
-        }
-    ]).to_csv(USERS_FILE, index=False)
+                "username": "admin",
+                "password": "admin123"
+            }
+        ]).to_csv(USERS_FILE, index=False)
 
 else:
 
