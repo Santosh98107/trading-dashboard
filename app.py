@@ -62,28 +62,20 @@ def login_panel():
         username = st.sidebar.text_input("Username")
         password = st.sidebar.text_input("Password", type="password")
 
-        if st.sidebar.button("Login"):
-            try:
-                users = pd.read_csv(USERS_FILE)
-                st.write(users)
-st.write("Username =", repr(username))
-st.write("Password =", repr(password))
-valid = (
-    users["username"].astype(str).str.strip().eq(username.strip())
-    &
-    users["password"].astype(str).str.strip().eq(password.strip())
-).any()
-                if valid:
-                    st.session_state.logged_in = True
-                    st.session_state.username = username
-                    st.sidebar.success("Login successful")
-                    st.rerun()
-                else:
-                    st.sidebar.error("Invalid credentials")
-            except Exception as e:
-                st.sidebar.error(f"Login error: {e}")
-        st.stop()
+if st.sidebar.button("Login"):
 
+            if username.strip() == "admin" and password.strip() == "admin123":
+
+                st.session_state.logged_in = True
+                st.session_state.username = username
+
+                st.sidebar.success("Login successful")
+
+                st.rerun()
+
+            else:
+
+                st.sidebar.error("Invalid credentials")
     st.sidebar.success(f"Logged in as: {st.session_state.username}")
     if st.sidebar.button("Logout"):
         st.session_state.logged_in = False
