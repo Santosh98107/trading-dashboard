@@ -445,7 +445,7 @@ def add_indicators(df):
     
     
     
-df["Hammer"] = (
+    df["Hammer"] = (
         (lower_shadow > candle_body * 2)
         & (upper_shadow < candle_body)
     )
