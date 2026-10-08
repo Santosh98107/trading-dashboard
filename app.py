@@ -16,13 +16,39 @@ SIGNAL_STATE_FILE = "last_signal_state.txt"
 PAPER_STATE_FILE = "paper_trade_state.csv"
 USERS_FILE = "users.csv"
 SESSION_SUMMARY_FILE = "daily_summary.csv"
-
-
 def init_users():
-    if not os.path.exists(USERS_FILE):
-        pd.DataFrame([
-            {"username": "Admin", "password": "Admin121"}
-        ]).to_csv(USERS_FILE, index=False)
+default_users = pd.DataFrame([
+    {
+        "username": "admin",
+        "password": "admin123"
+    }
+])
+
+if not os.path.exists(USERS_FILE):
+    default_users.to_csv(USERS_FILE, index=False)
+
+else:
+    try:
+        users = pd.read_csv(USERS_FILE, dtype=str).fillna("")
+
+        if "username" not in users.columns:
+            raise Exception()
+
+        if "password" not in users.columns:
+            raise Exception()
+
+        users["username"] = users["username"].astype(str).str.strip()
+        users["password"] = users["password"].astype(str).str.strip()
+
+        if users.empty:
+            raise Exception()
+
+        if not ((users["username"] == "admin") & (users["password"] == "admin123")).any():
+            users = pd.concat([users, default_users], ignore_index=True)
+            users.to_csv(USERS_FILE, index=False)
+
+    except Exception:
+        default_users.to_csv(USERS_FILE, index=False)
 
 
 def login_panel():
