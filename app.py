@@ -449,7 +449,7 @@ def add_indicators(df):
     (lower_shadow > candle_body * 2)
     & (upper_shadow < candle_body)
     )
-    df["ShootingStar"] = (
+df["ShootingStar"] = (
     (upper_shadow > candle_body * 2)
     & (lower_shadow < candle_body)
     )
