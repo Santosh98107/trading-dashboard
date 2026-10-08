@@ -25,7 +25,7 @@ A Streamlit-based trading dashboard for market tracking, technical analysis, can
 ## Default Login
 
 - Username: admin
-- Password: admin123
+- Password: admin121
 
 ## Requirements
 
