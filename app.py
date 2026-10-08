@@ -21,7 +21,7 @@ SESSION_SUMMARY_FILE = "daily_summary.csv"
 def init_users():
     if not os.path.exists(USERS_FILE):
         pd.DataFrame([
-            {"username": "admin", "password": "admin123"}
+            {"username": "admin", "password": "admin121"}
         ]).to_csv(USERS_FILE, index=False)
 
 
