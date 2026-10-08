@@ -1062,7 +1062,17 @@ else:
 latest = data.iloc[-1]
 
 patterns = []
+if latest["InvertedHammer"]:
+    patterns.append("🟢 Inverted Hammer")
 
+if latest["HangingMan"]:
+    patterns.append("🔴 Hanging Man")
+
+if latest["DragonflyDoji"]:
+    patterns.append("🟢 Dragonfly Doji")
+
+if latest["GravestoneDoji"]:
+    patterns.append("🔴 Gravestone Doji")
 if latest["Hammer"]:
     patterns.append("🟢 Hammer")
 
