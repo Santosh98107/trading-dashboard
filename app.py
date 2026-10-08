@@ -1,146 +1,28 @@
 import os
-import hashlib
-from datetime import datetime, timedelta
-from pathlib import Path
+from datetime import datetime, time
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import requests
 import streamlit as st
-import streamlit.components.v1 as components
 import yfinance as yf
+from streamlit_autorefresh import st_autorefresh
 
-st.set_page_config(page_title="Elite Trading Dashboard Ultimate+", layout="wide")
+st.set_page_config(page_title="Elite Trading Dashboard Ultimate", layout="wide")
 
-# ===== BASE PATHS =====
-BASE_DIR = Path(__file__).resolve().parent
-
-# ===== FILE PATHS =====
-JOURNAL_FILE = BASE_DIR / "trade_journal.csv"
-SIGNAL_STATE_FILE = BASE_DIR / "last_signal_state.txt"
-PAPER_STATE_FILE = BASE_DIR / "paper_trade_state.csv"
-USERS_FILE = BASE_DIR / "users.csv"
-SESSION_SUMMARY_FILE = BASE_DIR / "daily_summary.csv"
-AUTH_STATE_FILE = BASE_DIR / "auth_state.txt"
-WATCHLIST_FILE = BASE_DIR / "watchlist.csv"
-BACKTEST_FILE = BASE_DIR / "backtest_results.csv"
-BACKTEST_HISTORY_FILE = BASE_DIR / "backtest_history.csv"
-
-# ===== STOCK DICTIONARIES =====
-TOP_10_INDIAN_COMPANIES = {
-    "RELIANCE": "RELIANCE.NS",
-    "TCS": "TCS.NS",
-    "INFY": "INFY.NS",
-    "HINDUNILVR": "HINDUNILVR.NS",
-    "ITC": "ITC.NS",
-    "LT": "LT.NS",
-    "BHARTIARTL": "BHARTIARTL.NS",
-    "ASIANPAINT": "ASIANPAINT.NS",
-    "MARUTI": "MARUTI.NS",
-    "TITAN": "TITAN.NS"
-}
-
-BANKING_STOCKS = {
-    "HDFCBANK": "HDFCBANK.NS",
-    "ICICIBANK": "ICICIBANK.NS",
-    "SBIN": "SBIN.NS",
-    "AXISBANK": "AXISBANK.NS",
-    "KOTAKBANK": "KOTAKBANK.NS",
-    "BANKBARODA": "BANKBARODA.NS",
-    "PNB": "PNB.NS",
-    "INDUSINDBK": "INDUSINDBK.NS"
-}
-
-INDEX_STOCKS = {
-    "NIFTY": "^NSEI",
-    "BANKNIFTY": "^NSEBANK"
-}
-
-FOREX_PAIRS = {
-    "USD/INR": "USDINR=X"
-}
-
-MARKET_GROUPS = {
-    "Top 10 Indian Companies": TOP_10_INDIAN_COMPANIES,
-    "Banking Stocks": BANKING_STOCKS,
-    "Indices": INDEX_STOCKS,
-    "Forex": FOREX_PAIRS,
-}
-
-stocks = {**INDEX_STOCKS, **TOP_10_INDIAN_COMPANIES, **BANKING_STOCKS, **FOREX_PAIRS}
-
-# ===== AUTHENTICATION =====
-DEFAULT_USERNAME = "admin"
-DEFAULT_PASSWORD = "admin123"
-
-
-def hash_password(password: str) -> str:
-    return hashlib.sha256(password.encode("utf-8")).hexdigest()
-
-
-def load_users():
-    try:
-        users = pd.read_csv(USERS_FILE)
-        if "username" not in users.columns or "password" not in users.columns:
-            raise ValueError("Missing username/password columns")
-        users["username"] = users["username"].astype(str).str.strip()
-        users["password"] = users["password"].astype(str).str.strip()
-        return users
-    except Exception:
-        return pd.DataFrame(columns=["username", "password"])
+JOURNAL_FILE = "trade_journal.csv"
+SIGNAL_STATE_FILE = "last_signal_state.txt"
+PAPER_STATE_FILE = "paper_trade_state.csv"
+USERS_FILE = "users.csv"
+SESSION_SUMMARY_FILE = "daily_summary.csv"
 
 
 def init_users():
-    default_user = pd.DataFrame([
-        {"username": DEFAULT_USERNAME, "password": hash_password(DEFAULT_PASSWORD)}
-    ])
-
-    if not USERS_FILE.exists():
-        default_user.to_csv(USERS_FILE, index=False)
-        return
-
-    try:
-        users = load_users()
-        admin_exists = ((users["username"] == DEFAULT_USERNAME) & (users["password"] == hash_password(DEFAULT_PASSWORD))).any()
-        if users.empty or not admin_exists:
-            merged = pd.concat([users, default_user], ignore_index=True)
-            merged = merged.drop_duplicates(subset=["username"], keep="last")
-            merged.to_csv(USERS_FILE, index=False)
-    except Exception:
-        default_user.to_csv(USERS_FILE, index=False)
-
-
-def read_server_session():
-    try:
-        if AUTH_STATE_FILE.exists():
-            value = AUTH_STATE_FILE.read_text(encoding="utf-8").strip()
-            if value:
-                return value
-    except Exception:
-        pass
-    return ""
-
-
-def write_server_session(username: str):
-    try:
-        AUTH_STATE_FILE.write_text(str(username).strip(), encoding="utf-8")
-    except Exception:
-        pass
-
-
-def clear_server_session():
-    try:
-        if AUTH_STATE_FILE.exists():
-            AUTH_STATE_FILE.unlink()
-    except Exception:
-        pass
-
-
-def is_valid_login(username: str, password: str) -> bool:
-    users = load_users()
-    entered_hash = hash_password(password)
-    return bool(((users["username"] == str(username).strip()) & (users["password"] == entered_hash)).any())
+    if not os.path.exists(USERS_FILE):
+        pd.DataFrame([
+            {"username": "admin", "password": "admin123"}
+        ]).to_csv(USERS_FILE, index=False)
 
 
 def login_panel():
@@ -148,32 +30,27 @@ def login_panel():
 
     if "logged_in" not in st.session_state:
         st.session_state.logged_in = False
+
     if "username" not in st.session_state:
         st.session_state.username = ""
 
-    saved_user = read_server_session()
-    if not st.session_state.logged_in and saved_user and saved_user == DEFAULT_USERNAME:
-        st.session_state.logged_in = True
-        st.session_state.username = saved_user
-
     if not st.session_state.logged_in:
         st.sidebar.subheader("🔐 Login")
-        username = str(st.sidebar.text_input("Username", value="")).strip()
+        username = st.sidebar.text_input("Username")
         password = st.sidebar.text_input("Password", type="password")
 
         if st.sidebar.button("Login"):
             try:
-                if is_valid_login(username, password):
+                users = pd.read_csv(USERS_FILE)
+                valid = ((users["username"] == username) & (users["password"] == password)).any()
+                if valid:
                     st.session_state.logged_in = True
                     st.session_state.username = username
-                    write_server_session(username)
                     st.sidebar.success("Login successful")
                     st.rerun()
                 else:
-                    clear_server_session()
                     st.sidebar.error("Invalid credentials")
             except Exception as e:
-                clear_server_session()
                 st.sidebar.error(f"Login error: {e}")
         st.stop()
 
@@ -181,64 +58,33 @@ def login_panel():
     if st.sidebar.button("Logout"):
         st.session_state.logged_in = False
         st.session_state.username = ""
-        clear_server_session()
         st.rerun()
 
-# ===== FILE INITIALIZATION =====
+
 def init_journal():
-    if not JOURNAL_FILE.exists():
+    if not os.path.exists(JOURNAL_FILE):
         cols = [
-            "DateTime", "Symbol", "Timeframe", "Signal", "EntryPrice", "ExitPrice", "Quantity",
-            "StopLoss", "Target1", "Target2", "Target3", "TrailingStop", "Status", "PnL", "PnLPercent",
-            "ExitReason", "PartialExit", "Notes", "TradeMode", "Confidence"
+            "DateTime", "Symbol", "Timeframe", "Signal", "EntryPrice",
+            "ExitPrice", "Quantity", "StopLoss", "Target1", "Target2",
+            "TrailingStop", "Status", "PnL", "PnLPercent", "Notes"
         ]
         pd.DataFrame(columns=cols).to_csv(JOURNAL_FILE, index=False)
 
 
 def init_paper_state():
-    if not PAPER_STATE_FILE.exists():
-        pd.DataFrame([{"Balance": 100000.0, "UsedMargin": 0.0, "OpenPositions": 0}]).to_csv(PAPER_STATE_FILE, index=False)
+    if not os.path.exists(PAPER_STATE_FILE):
+        pd.DataFrame([{
+            "Balance": 100000.0,
+            "UsedMargin": 0.0,
+            "OpenPositions": 0
+        }]).to_csv(PAPER_STATE_FILE, index=False)
 
 
 def init_daily_summary():
-    if not SESSION_SUMMARY_FILE.exists():
-        pd.DataFrame(columns=["Date", "TotalTrades", "Wins", "Losses", "RealizedPnL", "WinRate"]).to_csv(SESSION_SUMMARY_FILE, index=False)
-
-
-def init_watchlist():
-    if not WATCHLIST_FILE.exists():
-        pd.DataFrame(columns=["symbol", "name"]).to_csv(WATCHLIST_FILE, index=False)
-
-
-def init_backtest():
-    if not BACKTEST_FILE.exists():
-        pd.DataFrame(columns=["Signal", "WinRate", "LossRate", "AvgProfit", "MaxDrawdown"]).to_csv(BACKTEST_FILE, index=False)
-
-
-def init_backtest_history():
-    if not BACKTEST_HISTORY_FILE.exists():
-        cols = ["Symbol", "Timeframe", "Signal", "Period", "TotalTrades", "Wins", "Losses", "WinRate", "LossRate", "AvgProfit", "MaxDrawdown", "Timestamp"]
-        pd.DataFrame(columns=cols).to_csv(BACKTEST_HISTORY_FILE, index=False)
-
-
-def load_watchlist():
-    init_watchlist()
-    try:
-        return pd.read_csv(WATCHLIST_FILE)
-    except Exception:
-        return pd.DataFrame(columns=["symbol", "name"])
-
-
-def save_watchlist(df):
-    df.to_csv(WATCHLIST_FILE, index=False)
-
-
-def load_backtest_results():
-    init_backtest()
-    try:
-        return pd.read_csv(BACKTEST_FILE)
-    except Exception:
-        return pd.DataFrame(columns=["Signal", "WinRate", "LossRate", "AvgProfit", "MaxDrawdown"])
+    if not os.path.exists(SESSION_SUMMARY_FILE):
+        pd.DataFrame(columns=[
+            "Date", "TotalTrades", "Wins", "Losses", "RealizedPnL", "WinRate"
+        ]).to_csv(SESSION_SUMMARY_FILE, index=False)
 
 
 def load_journal():
@@ -258,8 +104,8 @@ def load_paper_state():
 def save_paper_state(df):
     df.to_csv(PAPER_STATE_FILE, index=False)
 
-# ===== JOURNAL OPERATIONS =====
-def add_trade_to_journal(symbol, timeframe, signal, entry_price, quantity, stop_loss, target1, target2, target3, trailing_stop, confidence, notes="", trade_mode="AUTO"):
+
+def add_trade_to_journal(symbol, timeframe, signal, entry_price, quantity, stop_loss, target1, target2, trailing_stop, notes=""):
     journal = load_journal()
     new_row = {
         "DateTime": datetime.now().strftime("%d-%m-%Y %H:%M:%S"),
@@ -272,23 +118,17 @@ def add_trade_to_journal(symbol, timeframe, signal, entry_price, quantity, stop_
         "StopLoss": stop_loss,
         "Target1": target1,
         "Target2": target2,
-        "Target3": target3,
         "TrailingStop": trailing_stop,
         "Status": "OPEN",
         "PnL": np.nan,
         "PnLPercent": np.nan,
-        "ExitReason": "",
-        "PartialExit": "No",
-        "Notes": notes,
-        "TradeMode": trade_mode,
-        "Confidence": confidence
+        "Notes": notes
     }
     journal = pd.concat([journal, pd.DataFrame([new_row])], ignore_index=True)
     save_journal(journal)
-    return True
 
 
-def close_trade_in_journal(index_id, exit_price, exit_reason="Manual", partial_exit="No"):
+def close_trade_in_journal(index_id, exit_price):
     journal = load_journal()
     if index_id in journal.index:
         row = journal.loc[index_id]
@@ -298,84 +138,148 @@ def close_trade_in_journal(index_id, exit_price, exit_reason="Manual", partial_e
 
         if "BUY" in signal or "CALL" in signal:
             pnl = (exit_price - entry) * qty
-            pnl_pct = ((exit_price - entry) / entry) * 100 if entry != 0 else 0
+            pnl_pct = ((exit_price - entry) / entry) * 100
         else:
             pnl = (entry - exit_price) * qty
-            pnl_pct = ((entry - exit_price) / entry) * 100 if entry != 0 else 0
+            pnl_pct = ((entry - exit_price) / entry) * 100
 
         journal.at[index_id, "ExitPrice"] = exit_price
         journal.at[index_id, "Status"] = "CLOSED"
         journal.at[index_id, "PnL"] = round(pnl, 2)
         journal.at[index_id, "PnLPercent"] = round(pnl_pct, 2)
-        journal.at[index_id, "ExitReason"] = exit_reason
-        journal.at[index_id, "PartialExit"] = partial_exit
         save_journal(journal)
+
+
+def update_daily_summary():
+    init_daily_summary()
+    journal = load_journal()
+    closed = journal[journal["Status"] == "CLOSED"].copy()
+
+    if closed.empty:
+        return
+
+    closed["DateOnly"] = pd.to_datetime(
+        closed["DateTime"],
+        format="%d-%m-%Y %H:%M:%S",
+        errors="coerce"
+    ).dt.date
+
+    today = datetime.now().date()
+    day_df = closed[closed["DateOnly"] == today]
+
+    if day_df.empty:
+        return
+
+    total = len(day_df)
+    wins = (pd.to_numeric(day_df["PnL"], errors="coerce").fillna(0) > 0).sum()
+    losses = total - wins
+    pnl = pd.to_numeric(day_df["PnL"], errors="coerce").fillna(0).sum()
+    win_rate = (wins / total * 100) if total > 0 else 0
+
+    summary = pd.read_csv(SESSION_SUMMARY_FILE)
+    summary = summary[summary["Date"] != str(today)]
+
+    new_row = {
+        "Date": str(today),
+        "TotalTrades": total,
+        "Wins": wins,
+        "Losses": losses,
+        "RealizedPnL": round(pnl, 2),
+        "WinRate": round(win_rate, 2)
+    }
+
+    summary = pd.concat([summary, pd.DataFrame([new_row])], ignore_index=True)
+    summary.to_csv(SESSION_SUMMARY_FILE, index=False)
+
+
+def paper_trade_entry(price, quantity):
+    state = load_paper_state()
+    bal = float(state.loc[0, "Balance"])
+    used = float(state.loc[0, "UsedMargin"])
+    cost = price * quantity
+
+    if bal >= cost:
+        state.loc[0, "Balance"] = bal - cost
+        state.loc[0, "UsedMargin"] = used + cost
+        state.loc[0, "OpenPositions"] = int(state.loc[0, "OpenPositions"]) + 1
+        save_paper_state(state)
         return True
     return False
 
-# ===== DATA FETCHING =====
+
+def paper_trade_exit(entry_price, exit_price, quantity, signal):
+    state = load_paper_state()
+    bal = float(state.loc[0, "Balance"])
+    used = float(state.loc[0, "UsedMargin"])
+    invested = entry_price * quantity
+
+    if "BUY" in signal.upper() or "CALL" in signal.upper():
+        pnl = (exit_price - entry_price) * quantity
+    else:
+        pnl = (entry_price - exit_price) * quantity
+
+    state.loc[0, "Balance"] = bal + invested + pnl
+    state.loc[0, "UsedMargin"] = max(0.0, used - invested)
+    state.loc[0, "OpenPositions"] = max(0, int(state.loc[0, "OpenPositions"]) - 1)
+    save_paper_state(state)
+    return pnl
+
+
 def fetch_data(ticker, interval, period):
-    try:
-        df = yf.download(ticker, interval=interval, period=period, progress=False, auto_adjust=False)
-        if df.empty:
-            return df
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        needed = ["Open", "High", "Low", "Close", "Volume"]
-        missing = [c for c in needed if c not in df.columns]
-        if missing:
-            return pd.DataFrame()
-        df = df[needed].dropna().copy()
-        df["Volume"] = df["Volume"].fillna(1).replace(0, 1)
+    df = yf.download(
+        ticker,
+        interval=interval,
+        period=period,
+        progress=False,
+        auto_adjust=False
+    )
+
+    if df.empty:
         return df
-    except Exception:
+
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+
+    needed = ["Open", "High", "Low", "Close", "Volume"]
+    missing = [c for c in needed if c not in df.columns]
+    if missing:
         return pd.DataFrame()
 
+    df = df[needed].dropna().copy()
+ 
+    df["Volume"] = df["Volume"].fillna(1)
+    df["Volume"] = df["Volume"].replace(0, 1)
+ 
+    return df
 
-@st.cache_data(ttl=300)
-def fetch_data_cached(ticker, interval, period):
-    return fetch_data(ticker, interval, period)
+
+def resample_to_10m(df):
+    df = df.copy()
+    df.index = pd.to_datetime(df.index)
+    return df.resample("10min").agg({
+        "Open": "first",
+        "High": "max",
+        "Low": "min",
+        "Close": "last",
+        "Volume": "sum"
+    }).dropna()
 
 
-def fetch_pcr_data(symbol="NIFTY"):
-    try:
-        symbol_url = symbol.upper()
-        url = f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol_url}"
-        headers = {
-            "User-Agent": "Mozilla/5.0",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Referer": "https://www.nseindia.com/"
-        }
-        resp = requests.get(url, headers=headers, timeout=12)
-        if resp.status_code != 200:
-            return None
-        payload = resp.json()
-        records = payload.get("records", {}).get("data", [])
-        if not records:
-            return None
-        total_calls_oi = 0
-        total_puts_oi = 0
-        for item in records:
-            ce = item.get("CE") or {}
-            pe = item.get("PE") or {}
-            total_calls_oi += float(ce.get("openInterest", 0) or 0)
-            total_puts_oi += float(pe.get("openInterest", 0) or 0)
-        if total_calls_oi == 0:
-            return None
-        return round(total_puts_oi / total_calls_oi, 2)
-    except Exception:
-        return None
-
-# ===== TECHNICAL INDICATORS =====
 def compute_rsi(series, window=14):
     delta = series.diff()
+ 
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
+ 
     avg_gain = gain.rolling(window=window).mean()
     avg_loss = loss.rolling(window=window).mean()
+ 
     rs = avg_gain / avg_loss.replace(0, np.nan)
+ 
     rsi = 100 - (100 / (1 + rs))
+ 
     return rsi.fillna(50)
+    
 
 
 def compute_stochastic(df, k_window=14, d_window=3):
@@ -390,667 +294,1043 @@ def compute_adx(df, period=14):
     high = df["High"]
     low = df["Low"]
     close = df["Close"]
-    plus_dm_raw = high.diff()
-    minus_dm_raw = -low.diff()
-    plus_dm = np.where((plus_dm_raw > minus_dm_raw) & (plus_dm_raw > 0), plus_dm_raw, 0.0)
-    minus_dm = np.where((minus_dm_raw > plus_dm_raw) & (minus_dm_raw > 0), minus_dm_raw, 0.0)
+
+    plus_dm = high.diff()
+    minus_dm = -low.diff()
+
+    plus_dm = np.where((plus_dm > minus_dm) & (plus_dm > 0), plus_dm, 0.0)
+    minus_dm = np.where((minus_dm > plus_dm) & (minus_dm > 0), minus_dm, 0.0)
+
     tr1 = high - low
     tr2 = (high - close.shift(1)).abs()
     tr3 = (low - close.shift(1)).abs()
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
     atr = tr.rolling(period).mean().replace(0, 1e-10)
     plus_di = 100 * (pd.Series(plus_dm, index=df.index).rolling(period).mean() / atr)
     minus_di = 100 * (pd.Series(minus_dm, index=df.index).rolling(period).mean() / atr)
+
     dx = ((plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, 1e-10)) * 100
     adx = dx.rolling(period).mean()
+
     return adx, plus_di, minus_di
-
-# ===== CANDLESTICK PATTERNS =====
-def add_candlestick_patterns(df):
-    df = df.copy()
-    o = df["Open"]
-    h = df["High"]
-    l = df["Low"]
-    c = df["Close"]
-    body = (c - o).abs()
-    rng = (h - l).replace(0, 1e-10)
-    upper = h - pd.concat([o, c], axis=1).max(axis=1)
-    lower = pd.concat([o, c], axis=1).min(axis=1) - l
-    prev_o = o.shift(1)
-    prev_c = c.shift(1)
-    prev_h = h.shift(1)
-    prev_l = l.shift(1)
-    prev_body = body.shift(1)
-
-    # Doji patterns
-    df["Doji"] = body <= rng * 0.1
-    df["LongLeggedDoji"] = df["Doji"] & (upper > body * 2) & (lower > body * 2)
-    df["DragonflyDoji"] = df["Doji"] & (lower > body * 2) & (upper <= body)
-    df["GravestoneDoji"] = df["Doji"] & (upper > body * 2) & (lower <= body)
-
-    # Hammer patterns
-    df["Hammer"] = (lower >= body * 2) & (upper <= body)
-    df["HangingMan"] = df["Hammer"] & (c < o)
-    df["InvertedHammer"] = (upper >= body * 2) & (lower <= body)
-    df["ShootingStar"] = df["InvertedHammer"] & (c < o)
-
-    # Marubozu patterns
-    df["BullishMarubozu"] = (c > o) & (upper <= body * 0.1) & (lower <= body * 0.1)
-    df["BearishMarubozu"] = (c < o) & (upper <= body * 0.1) & (lower <= body * 0.1)
-
-    # Engulfing patterns
-    df["BullishEngulfing"] = (prev_c < prev_o) & (c > o) & (o <= prev_c) & (c >= prev_o)
-    df["BearishEngulfing"] = (prev_c > prev_o) & (c < o) & (o >= prev_c) & (c <= prev_o)
-
-    # Harami patterns
-    df["BullishHarami"] = (prev_c < prev_o) & (c > o) & (o > prev_c) & (c < prev_o)
-    df["BearishHarami"] = (prev_c > prev_o) & (c < o) & (o < prev_c) & (c > prev_o)
-
-    # Piercing & Dark Cloud
-    df["PiercingPattern"] = (prev_c < prev_o) & (c > o) & (o < prev_l) & (c > (prev_o + prev_c) / 2) & (c < prev_o)
-    df["DarkCloudCover"] = (prev_c > prev_o) & (c < o) & (o > prev_h) & (c < (prev_o + prev_c) / 2) & (c > prev_o)
-
-    # Spinning Top
-    df["SpinningTop"] = (body / rng < 0.3) & (upper > body) & (lower > body)
-
-    # Inside/Outside bars
-    df["InsideBar"] = (h < prev_h) & (l > prev_l)
-    df["OutsideBar"] = (h > prev_h) & (l < prev_l)
-
-    # Kicker patterns
-    df["BullishKicker"] = (prev_c < prev_o) & (c > o) & (o > prev_o)
-    df["BearishKicker"] = (prev_c > prev_o) & (c < o) & (o < prev_o)
-
-    # Morning Star & Evening Star
-    df["MorningStar"] = (prev_c.shift(1) < prev_o.shift(1)) & (prev_body < prev_body.rolling(5).mean()) & (c > o) & (c > ((prev_o.shift(1) + prev_c.shift(1)) / 2))
-    df["EveningStar"] = (prev_c.shift(1) > prev_o.shift(1)) & (prev_body < prev_body.rolling(5).mean()) & (c < o) & (c < ((prev_o.shift(1) + prev_c.shift(1)) / 2))
-
-    # Three White Soldiers & Three Black Crows
-    df["ThreeWhiteSoldiers"] = (c.shift(2) > o.shift(2)) & (c.shift(1) > o.shift(1)) & (c > o) & (c.shift(1) > c.shift(2)) & (c > c.shift(1))
-    df["ThreeBlackCrows"] = (c.shift(2) < o.shift(2)) & (c.shift(1) < o.shift(1)) & (c < o) & (c.shift(1) < c.shift(2)) & (c < c.shift(1))
-
-    return df
-
-
-def compute_heikin_ashi(df):
-    df = df.copy()
-    df["HA_Close"] = (df["Open"] + df["High"] + df["Low"] + df["Close"]) / 4
-    df["HA_Open"] = (df["Open"].shift(1) + df["Close"].shift(1)) / 2
-    df["HA_Open"] = df["HA_Open"].fillna(df["Open"])
-    df["HA_High"] = df[["High", "HA_Open", "HA_Close"]].max(axis=1)
-    df["HA_Low"] = df[["Low", "HA_Open", "HA_Close"]].min(axis=1)
-    return df
 
 
 def add_indicators(df):
     df = df.copy()
 
-    # Moving averages
-    df["EMA5"] = df["Close"].ewm(span=5, adjust=False).mean()
     df["EMA20"] = df["Close"].ewm(span=20, adjust=False).mean()
     df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
 
-    # VWAP
     vol_cum = df["Volume"].cumsum()
-    df["VWAP"] = ((df["Close"] * df["Volume"]).cumsum() / vol_cum.replace(0, 1))
-    df["VWAP"] = df["VWAP"].replace([np.inf, -np.inf], np.nan).fillna(df["Close"])
+ 
+    df["VWAP"] = (
+    (df["Close"] * df["Volume"]).cumsum()
+    / vol_cum.replace(0, 1)
+     )
+ 
+    df["VWAP"] = df["VWAP"].replace([np.inf, -np.inf], np.nan)
+    df["VWAP"] = df["VWAP"].fillna(df["Close"])
+    
 
-    # RSI
-    df["RSI"] = compute_rsi(df["Close"], 14).replace([np.inf, -np.inf], np.nan).fillna(50).clip(lower=1, upper=99)
+    df["RSI"] = compute_rsi(df["Close"], 14)
 
-    # MACD
+    df["RSI"] = df["RSI"].replace([np.inf, -np.inf], np.nan)
+    df["RSI"] = df["RSI"].fillna(50)
+    df["RSI"] = df["RSI"].clip(lower=1, upper=99)
+
     ema12 = df["Close"].ewm(span=12, adjust=False).mean()
     ema26 = df["Close"].ewm(span=26, adjust=False).mean()
     df["MACD"] = ema12 - ema26
     df["SignalLine"] = df["MACD"].ewm(span=9, adjust=False).mean()
     df["MACD_Hist"] = df["MACD"] - df["SignalLine"]
 
-    # ATR
     high_low = df["High"] - df["Low"]
     high_close = (df["High"] - df["Close"].shift(1)).abs()
     low_close = (df["Low"] - df["Close"].shift(1)).abs()
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     df["ATR"] = tr.rolling(14).mean()
 
-    # Bollinger Bands
     df["SMA20"] = df["Close"].rolling(20).mean()
     std20 = df["Close"].rolling(20).std()
     df["BB_Upper"] = df["SMA20"] + 2 * std20
     df["BB_Lower"] = df["SMA20"] - 2 * std20
 
-    # Volume analysis
     df["Volume_MA20"] = df["Volume"].rolling(20).mean()
     df["Volume_Spike"] = df["Volume"] > (1.5 * df["Volume_MA20"])
-    df["RVOL"] = df["Volume"] / df["Volume_MA20"].replace(0, np.nan)
 
-    # Pivot analysis
     df["PivotHigh"] = df["High"].rolling(20).max()
     df["PivotLow"] = df["Low"].rolling(20).min()
-    df["Breakout"] = (df["Close"] > df["PivotHigh"].shift(1)) & (df["Volume_Spike"])
-    df["Breakdown"] = (df["Close"] < df["PivotLow"].shift(1)) & (df["Volume_Spike"])
-    df["RetestBull"] = (df["Close"] > df["PivotHigh"].shift(1)) & (df["Low"] <= df["PivotHigh"].shift(1))
-    df["RetestBear"] = (df["Close"] < df["PivotLow"].shift(1)) & (df["High"] >= df["PivotLow"].shift(1))
+    df["Breakout"] = df["Close"] > df["PivotHigh"].shift(1)
+    df["Breakdown"] = df["Close"] < df["PivotLow"].shift(1)
 
-    # Trend levels
-    df["TrendSupport"] = df["Low"].rolling(20).min()
-    df["TrendResistance"] = df["High"].rolling(20).max()
-
-    # Stochastic
     k, d = compute_stochastic(df)
+ 
     df["StochK"] = k.rolling(3).mean()
     df["StochD"] = d.rolling(3).mean()
-
-    # ADX
     df["ADX"], df["PlusDI"], df["MinusDI"] = compute_adx(df)
 
-    # Candlestick patterns
-    df = add_candlestick_patterns(df)
+    candle_body = (df["Close"] - df["Open"]).abs()
+    candle_range = (df["High"] - df["Low"]).replace(0, 1e-10)
+    
+    upper_shadow = df["High"] - df[["Open", "Close"]].max(axis=1)
+    lower_shadow = df[["Open", "Close"]].min(axis=1) - df["Low"]    
+    df["BullishMarubozu"] = (
+    (df["Close"] > df["Open"])
+    & (upper_shadow < candle_body * 0.1)
+    & (lower_shadow < candle_body * 0.1)
+    )
+    
+        
+        
+    
+    
+    df["BearishMarubozu"] = (
+        (df["Close"] < df["Open"])
+        & (upper_shadow < candle_body * 0.1)
+        & (lower_shadow < candle_body * 0.1)
+    )
+    df["BullishEngulfing"] = (
+    (df["Close"] > df["Open"])
+    & (df["Close"].shift(1) < df["Open"].shift(1))
+    & (df["Open"] <= df["Close"].shift(1))
+    & (df["Close"] >= df["Open"].shift(1))
+    )
+
+    df["BearishEngulfing"] = (
+    (df["Close"] < df["Open"])
+    & (df["Close"].shift(1) > df["Open"].shift(1))
+    & (df["Open"] >= df["Close"].shift(1))
+    & (df["Close"] <= df["Open"].shift(1))
+    )
+    df["Doji"] = candle_body <= (candle_range * 0.1)
+    
+    
+    
+    df["Hammer"] = (
+    (lower_shadow > candle_body * 2)
+    & (upper_shadow < candle_body)
+    )
+    df["ShootingStar"] = (
+    (upper_shadow > candle_body * 2)
+    & (lower_shadow < candle_body)
+    )
+
+    df["BodyStrength"] = candle_body / candle_range
+    df["BuyMarker"] = np.where(
+        (df["EMA20"] > df["EMA50"]) & (df["EMA20"].shift(1) <= df["EMA50"].shift(1)),
+        df["Low"] * 0.995,
+        np.nan
+    )
+
+    df["SellMarker"] = np.where(
+        (df["EMA20"] < df["EMA50"]) & (df["EMA20"].shift(1) >= df["EMA50"].shift(1)),
+        df["High"] * 1.005,
+        np.nan
+    )
 
     return df
 
-# ===== PATTERN DETECTION =====
-def get_detected_patterns(latest):
-    pattern_map = {
-        "Doji": "🟡 Doji",
-        "LongLeggedDoji": "🟡 Long-Legged Doji",
-        "DragonflyDoji": "🟢 Dragonfly Doji",
-        "GravestoneDoji": "🔴 Gravestone Doji",
-        "Hammer": "🟢 Hammer",
-        "HangingMan": "🔴 Hanging Man",
-        "InvertedHammer": "🟢 Inverted Hammer",
-        "ShootingStar": "🔴 Shooting Star",
-        "BullishMarubozu": "🟢 Bullish Marubozu",
-        "BearishMarubozu": "🔴 Bearish Marubozu",
-        "BullishEngulfing": "🟢 Bullish Engulfing",
-        "BearishEngulfing": "🔴 Bearish Engulfing",
-        "BullishHarami": "🟢 Bullish Harami",
-        "BearishHarami": "🔴 Bearish Harami",
-        "PiercingPattern": "🟢 Piercing Pattern",
-        "DarkCloudCover": "🔴 Dark Cloud Cover",
-        "SpinningTop": "🟡 Spinning Top",
-        "InsideBar": "🟡 Inside Bar",
-        "OutsideBar": "🟡 Outside Bar",
-        "BullishKicker": "🟢 Bullish Kicker",
-        "BearishKicker": "🔴 Bearish Kicker",
-        "MorningStar": "🟢 Morning Star",
-        "EveningStar": "🔴 Evening Star",
-        "ThreeWhiteSoldiers": "🟢 Three White Soldiers",
-        "ThreeBlackCrows": "🔴 Three Black Crows",
-        "RetestBull": "🚀 Bullish Retest",
-        "RetestBear": "🔻 Bearish Retest"
-    }
-    found = []
-    for key, label in pattern_map.items():
-        if bool(latest.get(key, False)):
-            found.append(label)
-    return found
+
+def get_higher_timeframe(tf):
+    if tf == "1m":
+        return "5m", "30d"
+    if tf == "5m":
+        return "15m", "30d"
+    if tf == "10m":
+        return "30m", "60d"
+    if tf == "15m":
+        return "30m", "60d"
+    if tf == "30m":
+        return "60m", "90d"
+    if tf == "1h":
+        return "1d", "1y"
+    return "1d", "1y"
 
 
-def detect_trend_pattern(df):
-    if df.empty or len(df) < 20:
-        return "Trend not enough data"
+def session_filter(df, tf):
+    if tf == "1d":
+        return {"valid": True, "message": "Daily timeframe - session filter skipped"}
 
-    close = df["Close"].iloc[-1]
-    ema20 = df["EMA20"].iloc[-1]
-    ema50 = df["EMA50"].iloc[-1]
+    try:
+        last_ts = pd.to_datetime(df.index[-1])
+        current_t = last_ts.time()
 
-    if pd.notna(close) and pd.notna(ema20) and pd.notna(ema50):
-        if close > ema20 > ema50:
-            return "Bullish Uptrend ✅"
-        if close < ema20 < ema50:
-            return "Bearish Downtrend ❌"
-        return "Sideways / Consolidation ➖"
-    return "Trend not enough data"
-
-
-def detect_market_bias(df):
-    """Detect overall market bias: Bullish, Bearish, or Neutral"""
-    if df.empty or len(df) < 50:
-        return "Neutral"
-    
-    close = df["Close"].iloc[-1]
-    ema20 = df["EMA20"].iloc[-1]
-    ema50 = df["EMA50"].iloc[-1]
-    rsi = df["RSI"].iloc[-1]
-    adx = df["ADX"].iloc[-1]
-    
-    bullish_count = 0
-    bearish_count = 0
-    
-    if close > ema20 > ema50:
-        bullish_count += 2
-    elif close < ema20 < ema50:
-        bearish_count += 2
-    
-    if rsi > 60:
-        bullish_count += 1
-    elif rsi < 40:
-        bearish_count += 1
-    
-    if adx > 30:
-        if close > ema20:
-            bullish_count += 1
-        else:
-            bearish_count += 1
-    
-    if bullish_count > bearish_count:
-        return "📈 Bullish"
-    elif bearish_count > bullish_count:
-        return "📉 Bearish"
-    else:
-        return "↔️ Neutral"
+        if current_t < time(9, 20):
+            return {"valid": False, "message": "Avoid first few minutes after market open"}
+        if time(12, 15) <= current_t <= time(13, 15):
+            return {"valid": False, "message": "Lunch/session low momentum zone"}
+        return {"valid": True, "message": "Session timing looks okay"}
+    except Exception:
+        return {"valid": True, "message": "Session filter unavailable"}
 
 
-def get_signal_strength(confidence):
-    """Convert confidence to signal strength"""
-    if confidence >= 80:
-        return "💪 STRONGLY BUY" if confidence >= 80 else "💪 STRONGLY SELL"
-    elif confidence >= 60:
-        return "📈 BUY" if confidence >= 60 else "📉 SELL"
-    elif confidence >= 40:
-        return "⚠️ WEAK BUY" if confidence >= 40 else "⚠️ WEAK SELL"
-    else:
-        return "❓ HOLD"
+def calculate_win_chance(bullish, bearish, adx, volume_spike, breakout, breakdown, htf_bias, sideways, rr_ratio, backtest_win_rate):
+    score = 50
+    score += (bullish - bearish) * 4
 
-
-def get_trade_signal_with_confidence(df):
-    """Returns signal, confidence (0-100), entry_price, stop_loss, target1, target2, target3, trailing_sl"""
-    if df.empty or len(df) < 20:
-        return "HOLD", 0, None, None, None, None, None, None
-
-    latest = df.iloc[-1]
-    rsi = latest.get("RSI", 50)
-    macd = latest.get("MACD", 0)
-    signal_line = latest.get("SignalLine", 0)
-    close = latest.get("Close", 0)
-    ema5 = latest.get("EMA5", close)
-    ema20 = latest.get("EMA20", close)
-    ema50 = latest.get("EMA50", close)
-    bb_upper = latest.get("BB_Upper", close)
-    bb_lower = latest.get("BB_Lower", close)
-    atr = latest.get("ATR", close * 0.02)
-    adx = latest.get("ADX", 0)
-
-    score = 0
-    buy_signals = 0
-
-    if close > ema5:
-        buy_signals += 1
-    if close > ema20:
-        buy_signals += 1
-    if close > ema50:
-        buy_signals += 1
-    if 50 < rsi < 70:
-        buy_signals += 1
-    if macd > signal_line and macd > 0:
-        buy_signals += 1
-    if close < bb_upper and close > bb_lower:
-        buy_signals += 1
     if adx > 25:
-        buy_signals += 1
+        score += 8
+    elif adx < 18:
+        score -= 10
 
-    confidence = (buy_signals / 7) * 100
+    if volume_spike:
+        score += 5
+    if breakout:
+        score += 6
+    if breakdown:
+        score += 6
+    if htf_bias in ["bullish", "bearish"]:
+        score += 5
+    if sideways:
+        score -= 12
 
-    entry_price = close
-    stop_loss = close - (atr * 1.5)
-    target1 = close + (atr * 1.5)
-    target2 = close + (atr * 2.5)
-    target3 = close + (atr * 3.5)
-    trailing_sl = atr * 0.75
+    if rr_ratio is not None:
+        if rr_ratio >= 2:
+            score += 6
+        elif rr_ratio < 1.2:
+            score -= 8
 
-    if buy_signals >= 5:
-        return "BUY", int(confidence), entry_price, stop_loss, target1, target2, target3, trailing_sl
-    elif buy_signals <= 1:
-        return "SELL", int(confidence), entry_price, close + (atr * 1.5), close - (atr * 1.5), close - (atr * 2.5), close - (atr * 3.5), atr * 0.75
+    if backtest_win_rate >= 60:
+        score += 8
+    elif backtest_win_rate < 45:
+        score -= 8
+
+    return int(max(5, min(score, 95)))
+
+
+def suggest_option_strike(symbol, spot_price, signal_type):
+    if symbol == "NIFTY":
+        step = 50
+    elif symbol == "BANKNIFTY":
+        step = 100
     else:
-        return "HOLD", int(confidence), entry_price, stop_loss, target1, target2, target3, trailing_sl
+        step = 10
 
+    atm = round(spot_price / step) * step
 
-def backtest_signal_performance(journal_df, period="all"):
-    """Calculate backtest statistics for signals with optional period filter"""
-    if journal_df.empty:
-        return {"BUY": {"win_rate": 0, "loss_rate": 0}, "SELL": {"win_rate": 0, "loss_rate": 0}, "HOLD": {"win_rate": 0, "loss_rate": 0}}
+    if signal_type == "buy":
+        return {
+            "type": "CALL",
+            "atm": atm,
+            "otm": atm + step,
+            "text": f"Suggested CALL strikes: ATM {atm} CE, OTM {atm + step} CE"
+        }
+    elif signal_type == "sell":
+        return {
+            "type": "PUT",
+            "atm": atm,
+            "otm": atm - step,
+            "text": f"Suggested PUT strikes: ATM {atm} PE, OTM {atm - step} PE"
+        }
 
-    # Filter by period if needed
-    if period != "all":
-        days_back = {"1m": 30, "3m": 90, "1y": 365, "5y": 1825}.get(period, 365)
-        cutoff_date = datetime.now() - timedelta(days=days_back)
-        journal_df = journal_df[pd.to_datetime(journal_df["DateTime"]).dt.date >= cutoff_date.date()]
-
-    closed_trades = journal_df[journal_df["Status"] == "CLOSED"]
-    if closed_trades.empty:
-        return {"BUY": {"win_rate": 0, "loss_rate": 0}, "SELL": {"win_rate": 0, "loss_rate": 0}, "HOLD": {"win_rate": 0, "loss_rate": 0}}
-
-    results = {}
-    for signal_type in ["BUY", "SELL", "HOLD"]:
-        signal_trades = closed_trades[closed_trades["Signal"] == signal_type]
-        if not signal_trades.empty:
-            pnl = pd.to_numeric(signal_trades["PnL"], errors="coerce").fillna(0)
-            wins = (pnl > 0).sum()
-            losses = (pnl < 0).sum()
-            total = len(signal_trades)
-            win_rate = (wins / total * 100) if total > 0 else 0
-            loss_rate = (losses / total * 100) if total > 0 else 0
-            results[signal_type] = {"win_rate": round(win_rate, 1), "loss_rate": round(loss_rate, 1), "total": total}
-        else:
-            results[signal_type] = {"win_rate": 0, "loss_rate": 0, "total": 0}
-
-    return results
-
-
-def get_watchlist_symbols():
-    df = load_watchlist()
-    if df.empty:
-        return []
-    return df["name"].astype(str).tolist()
-
-
-def add_symbol_to_watchlist(symbol_name, symbol_value):
-    df = load_watchlist()
-    if df.empty:
-        df = pd.DataFrame(columns=["symbol", "name"])
-    if symbol_name not in df["name"].astype(str).tolist():
-        new_row = pd.DataFrame([{"symbol": symbol_value, "name": symbol_name}])
-        df = pd.concat([df, new_row], ignore_index=True)
-        save_watchlist(df)
-
-
-def get_today_summary():
-    journal = load_journal()
-    if journal.empty:
-        return {"total": 0, "wins": 0, "losses": 0, "pnl": 0.0, "win_rate": 0.0}
-
-    today = datetime.now().strftime("%d-%m-%Y")
-    day_df = journal[journal["DateTime"].astype(str).str.contains(today, na=False)]
-    if day_df.empty:
-        return {"total": 0, "wins": 0, "losses": 0, "pnl": 0.0, "win_rate": 0.0}
-
-    pnl_series = pd.to_numeric(day_df["PnL"], errors="coerce").fillna(0)
-    wins = int((pnl_series > 0).sum())
-    losses = int((pnl_series < 0).sum())
-    total = len(day_df)
-    pnl = float(pnl_series.sum())
-    win_rate = (wins / total) * 100 if total else 0.0
-    return {"total": total, "wins": wins, "losses": losses, "pnl": pnl, "win_rate": win_rate}
-
-# ===== MAIN APP =====
-def main():
-    login_panel()
-
-    st.title("🚀 Elite Trading Dashboard Ultimate+")
-    st.subheader("Professional Trading & Analysis Terminal")
-
-    st.sidebar.header("⚙️ Settings")
-    market_group = st.sidebar.selectbox("📊 Market Group", list(MARKET_GROUPS.keys()), index=0)
-    symbol_name = st.sidebar.selectbox("📈 Select Asset", list(MARKET_GROUPS[market_group].keys()), index=0)
-    symbol = MARKET_GROUPS[market_group][symbol_name]
-
-    timeframe_options = ["1m", "2m", "3m", "5m", "6m", "12m", "15m", "30m", "1h", "2h", "4h", "1d"]
-    timeframe = st.sidebar.selectbox("⏱️ Timeframe", timeframe_options, index=8)
-
-    period_map = {
-        "1m": "5d", "2m": "5d", "3m": "5d", "5m": "60d", "6m": "60d", "12m": "90d", 
-        "15m": "90d", "30m": "120d", "1h": "180d", "2h": "1y", "4h": "1y", "1d": "5y"
+    return {
+        "type": "NONE",
+        "atm": None,
+        "otm": None,
+        "text": "No option strike suggestion"
     }
-    period = period_map.get(timeframe, "90d")
-    actual_interval = {"3m": "2m", "6m": "5m", "12m": "10m"}.get(timeframe, timeframe)
 
-    if st.sidebar.button("🔄 Refresh Data"):
-        st.cache_data.clear()
-        st.rerun()
 
-    auto_refresh = st.sidebar.checkbox("Auto Refresh", value=False)
-    refresh_seconds = st.sidebar.slider("Refresh Every (sec)", min_value=15, max_value=180, value=60, step=5)
-    if auto_refresh:
-        components.html(
-            f"""
-            <script>
-                setTimeout(function(){{ window.location.reload(); }}, {refresh_seconds * 1000});
-            </script>
-            """,
-            height=0,
-            scrolling=False,
+def send_telegram_alert(token, chat_id, message):
+    try:
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+ 
+        payload = {
+            "chat_id": chat_id,
+            "text": message
+        }
+ 
+        response = requests.post(
+            url,
+            data=payload,
+            timeout=10
         )
+ 
+        return response.status_code == 200
+ 
+    except Exception:
+        return False
+    try:
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        payload = {"chat_id": chat_id, "text": message}
+        response = requests.post(url, data=payload, timeout=10)
+        return response.status_code == 200
+    except Exception:
+        return False
 
-    st.sidebar.subheader("📋 Watchlist")
-    if st.sidebar.button("Add to Watchlist"):
-        add_symbol_to_watchlist(symbol_name, symbol)
-        st.sidebar.success(f"Added {symbol_name} to watchlist")
+
+def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50):
+    latest = df.iloc[-1]
+    prev = df.iloc[-2]
+
+    close_price = float(latest["Close"])
+    ema20 = float(latest["EMA20"])
+    ema50 = float(latest["EMA50"])
+    vwap = float(latest["VWAP"])
+    rsi = float(latest["RSI"])
+    macd = float(latest["MACD"])
+    macd_signal = float(latest["SignalLine"])
+    atr = float(latest["ATR"])
+    stoch_k = float(latest["StochK"])
+    stoch_d = float(latest["StochD"])
+    adx = float(latest["ADX"])
+    support = float(latest["PivotLow"])
+    resistance = float(latest["PivotHigh"])
+    volume_spike = bool(latest["Volume_Spike"])
+    breakout = bool(latest["Breakout"])
+    breakdown = bool(latest["Breakdown"])
+    body_strength = float(latest["BodyStrength"])
+    hammer = bool(latest.get("Hammer", False))
+    shooting_star = bool(latest.get("ShootingStar", False))
+    bull_maru = bool(latest.get("BullishMarubozu", False))
+    bear_maru = bool(latest.get("BearishMarubozu", False))
+    doji = bool(latest.get("Doji", False))
+    bull_engulf = bool(latest.get("BullishEngulfing", False))
+    bear_engulf = bool(latest.get("BearishEngulfing", False))
+    retest_bull = bool(latest.get("RetestBull", False))
+    retest_bear = bool(latest.get("RetestBear", False))
+    plus_di = float(latest["PlusDI"])
+    minus_di = float(latest["MinusDI"])
+
+    bullish = 0
+    bearish = 0
+    reasons = []
+
+    if ema20 > ema50:
+        bullish += 1
+        reasons.append("EMA20 > EMA50 bullish trend")
+    else:
+        bearish += 1
+        reasons.append("EMA20 < EMA50 bearish trend")
+
+    if close_price > ema20:
+        bullish += 1
+        reasons.append("Price above EMA20")
+    else:
+        bearish += 1
+        reasons.append("Price below EMA20")
+
+    if close_price > vwap:
+        bullish += 1
+        reasons.append("Price above VWAP")
+    else:
+        bearish += 1
+        reasons.append("Price below VWAP")
+
+    if rsi > 60:
+        bullish += 1
+        reasons.append("RSI bullish strength")
+    elif rsi < 40:
+        bearish += 1
+        reasons.append("RSI bearish weakness")
+    else:
+        reasons.append("RSI neutral")
+
+    if macd > macd_signal:
+        bullish += 1
+        reasons.append("MACD above signal")
+    else:
+        bearish += 1
+        reasons.append("MACD below signal")
+
+    if adx > 20:
+        reasons.append("ADX trend strength okay")
+        if plus_di > minus_di:
+            bullish += 1
+        else:
+            bearish += 1
+    else:
+        reasons.append("ADX low / sideways risk")
+
+    if stoch_k > stoch_d and stoch_k < 80:
+        bullish += 1
+        reasons.append("Stochastic bullish crossover")
+    elif stoch_k < stoch_d and stoch_k > 20:
+        bearish += 1
+        reasons.append("Stochastic bearish crossover")
+
+    if prev["EMA20"] <= prev["EMA50"] and latest["EMA20"] > latest["EMA50"]:
+        bullish += 2
+        reasons.append("Fresh bullish EMA crossover")
+
+    if prev["EMA20"] >= prev["EMA50"] and latest["EMA20"] < latest["EMA50"]:
+        bearish += 2
+        reasons.append("Fresh bearish EMA crossover")
+
+    if breakout:
+        bullish += 2
+        reasons.append("Resistance breakout")
+
+    if breakdown:
+        bearish += 2
+        reasons.append("Support breakdown")
+    if hammer:
+        bullish += 2
+        reasons.append("Hammer pattern detected")
+
+    if bull_maru:
+        bullish += 2
+        reasons.append("Bullish Marubozu detected")
+    
+    if shooting_star:
+        bearish += 2
+        reasons.append("Shooting Star detected")
+    
+    if bear_maru:
+        bearish += 2
+        reasons.append("Bearish Marubozu detected")
+    
+    if doji:
+        reasons.append("Doji pattern (market indecision)")   
+    if bull_engulf:
+        bullish += 3
+        reasons.append("Bullish Engulfing detected")
+
+    if bear_engulf:
+        bearish += 3
+        reasons.append("Bearish Engulfing detected")
+    if bull_engulf and volume_spike:
+        bullish += 2
+        reasons.append("Bullish Engulfing with Volume Confirmation")
+
+    if bear_engulf and volume_spike:
+        bearish += 2
+        reasons.append("Bearish Engulfing with Volume Confirmation")
+    if volume_spike:
+        reasons.append("Volume spike present")
+        if close_price > ema20:
+            bullish += 1
+        else:
+            bearish += 1
+
+    if body_strength > 0.6:
+        reasons.append("Strong candle body")
+        if close_price > ema20:
+            bullish += 1
+        else:
+            bearish += 1
+    else:
+        reasons.append("Weak candle body")
+
+    if htf_bias == "bullish":
+        bullish += 2
+        reasons.append("Higher timeframe bullish confirmation")
+    elif htf_bias == "bearish":
+        bearish += 2
+        reasons.append("Higher timeframe bearish confirmation")
+
+    sideways = bool(adx < 18 and abs(ema20 - ema50) / close_price < 0.003)
+    session_info = session_filter(df, timeframe_label)
+
+    signal_text = "NO TRADE"
+    signal_type = "neutral"
+    strength = "Low"
+    stop_loss = None
+    partial_exit = None
+    target1 = None
+    target2 = None
+    trailing_stop = None
+    rr_ratio = None
+
+    if atr and atr > 0:
+        rr_ratio = 2.0
+
+    if not sideways and session_info["valid"]:
+        if bullish >= 7 and rsi > 55 and macd > macd_signal and adx > 20:
+            signal_text = "STRONG BUY"
+            signal_type = "buy"
+            strength = "High"
+            stop_loss = close_price - atr
+            partial_exit = close_price + (0.8 * atr)
+            target1 = close_price + atr
+            target2 = close_price + (2 * atr)
+            trailing_stop = close_price - (0.5 * atr)
+
+        elif bearish >= 7 and rsi < 45 and macd < macd_signal and adx > 20:
+            signal_text = "STRONG SELL"
+            signal_type = "sell"
+            strength = "High"
+            stop_loss = close_price + atr
+            partial_exit = close_price - (0.8 * atr)
+            target1 = close_price - atr
+            target2 = close_price - (2 * atr)
+            trailing_stop = close_price + (0.5 * atr)
+
+        elif bullish > bearish and bullish >= 5:
+            signal_text = "BUY BIAS"
+            signal_type = "buy"
+            strength = "Medium"
+            stop_loss = close_price - atr
+            partial_exit = close_price + (0.7 * atr)
+            target1 = close_price + atr
+            trailing_stop = close_price - (0.4 * atr)
+
+        elif bearish > bullish and bearish >= 5:
+            signal_text = "SELL BIAS"
+            signal_type = "sell"
+            strength = "Medium"
+            stop_loss = close_price + atr
+            partial_exit = close_price - (0.7 * atr)
+            target1 = close_price - atr
+            trailing_stop = close_price + (0.4 * atr)
+
+    confidence = int((max(bullish, bearish) / 18) * 100)
+    confidence = min(confidence, 100)
+
+    win_chance = calculate_win_chance(
+        bullish, bearish, adx, volume_spike, breakout, breakdown,
+        htf_bias, sideways, rr_ratio, backtest_win_rate
+    )
+
+    return {
+        "close_price": close_price,
+        "ema20": ema20,
+        "ema50": ema50,
+        "vwap": vwap,
+        "rsi": rsi,
+        "macd": macd,
+        "macd_signal": macd_signal,
+        "atr": atr,
+        "stoch_k": stoch_k,
+        "stoch_d": stoch_d,
+        "adx": adx,
+        "support": support,
+        "resistance": resistance,
+        "volume_spike": volume_spike,
+        "breakout": breakout,
+        "breakdown": breakdown,
+        "body_strength": body_strength,
+        "sideways": sideways,
+        "signal_text": signal_text,
+        "signal_type": signal_type,
+        "strength": strength,
+        "confidence": confidence,
+        "win_chance": win_chance,
+        "stop_loss": stop_loss,
+        "partial_exit": partial_exit,
+        "target1": target1,
+        "target2": target2,
+        "trailing_stop": trailing_stop,
+        "rr_ratio": rr_ratio,
+        "reasons": reasons,
+        "bullish_score": bullish,
+        "bearish_score": bearish,
+        "session_message": session_info["message"]
+    }
+
+
+def simple_backtest(df):
+    results = []
+    df = df.copy().dropna()
+    
+    
+    
+    st.write(df.columns.tolist())
+    for i in range(30, len(df) - 3):
+        sub = df.iloc[:i + 1]
+        if len(sub) < 30:
+            continue
+
+        analysis = analyze_signal(sub, htf_bias=None, timeframe_label="1d", backtest_win_rate=50)
+        future = df.iloc[i + 1:i + 4]
+
+        if future.empty:
+            continue
+
+        future_high = float(future["High"].max())
+        future_low = float(future["Low"].min())
+
+        if analysis["signal_type"] == "buy" and analysis["stop_loss"] and analysis["target1"]:
+            if future_high >= analysis["target1"]:
+                results.append(1)
+            elif future_low <= analysis["stop_loss"]:
+                results.append(0)
+
+        elif analysis["signal_type"] == "sell" and analysis["stop_loss"] and analysis["target1"]:
+            if future_low <= analysis["target1"]:
+                results.append(1)
+            elif future_high >= analysis["stop_loss"]:
+                results.append(0)
+
+    total = len(results)
+    wins = sum(results) if total > 0 else 0
+    losses = total - wins
+    win_rate = (wins / total * 100) if total > 0 else 0
+    return wins, losses, total, win_rate
+
+
+login_panel()
+init_journal()
+init_paper_state()
+init_daily_summary()
+
+stocks = {
+    "NIFTY": "^NSEI",
+    "BANKNIFTY": "^NSEBANK",
+    "RELIANCE": "RELIANCE.NS",
+    "TCS": "TCS.NS",
+    "INFY": "INFY.NS",
+    "HDFCBANK": "HDFCBANK.NS",
+    "SBIN": "SBIN.NS",
+    "ICICIBANK": "ICICIBANK.NS",
+    "ITC": "ITC.NS"
+}
+
+st.title("📈 Elite Trading Dashboard Ultimate")
+st.caption("Journal + Entry/Exit + Paper Trading + Auto Telegram + Option Suggestion + Daily Summary")
+
+selected = st.selectbox("Select Stock / Index", list(stocks.keys()))
+timeframe = st.selectbox("Select Time Frame", ["1m", "5m", "10m", "15m", "30m", "1h", "1d"])
+auto_refresh = st.checkbox("Enable Auto Refresh", value=True)
+refresh_seconds = st.selectbox("Refresh Every (seconds)", [10, 20, 30, 60], index=2)
+
+with st.expander("Telegram Alert Settings"):
+    telegram_enabled = st.checkbox("Enable Telegram Alerts", value=False)
+    telegram_bot_token = st.text_input("Telegram Bot Token", type="password")
+    telegram_chat_id = st.text_input("Telegram Chat ID")
+    auto_send_telegram = st.checkbox("Auto-send on New Signal", value=False)
+
+if auto_refresh:
+    st_autorefresh(interval=refresh_seconds * 1000, key="ultimate_refresh")
+
+if timeframe == "1m":
+    yf_interval = "1m"
+    yf_period = "7d"
+elif timeframe == "5m":
+    yf_interval = "5m"
+    yf_period = "30d"
+elif timeframe == "10m":
+    yf_interval = "5m"
+    yf_period = "30d"
+elif timeframe == "15m":
+    yf_interval = "15m"
+    yf_period = "30d"
+elif timeframe == "30m":
+    yf_interval = "30m"
+    yf_period = "60d"
+elif timeframe == "1h":
+    yf_interval = "60m"
+    yf_period = "90d"
+else:
+    yf_interval = "1d"
+    yf_period = "1y"
+
+ticker = stocks[selected]
+data = fetch_data(ticker, yf_interval, yf_period)
+
+ 
+
+ 
+if data.empty:
+    st.error("No data found")
+    st.stop()
+if timeframe == "10m":
+    data = resample_to_10m(data)
+
+data = add_indicators(data)
+
+
+
+ 
+# Only drop rows where critical indicators are missing
+required_cols = [
+    "EMA20",
+    "EMA50",
+    "RSI",
+    "MACD",
+    "SignalLine",
+    "ATR"
+]
+ 
+ # data = data.dropna(subset=required_cols).copy()
+ 
+data = data.bfill()
+data = data.ffill()
+ 
+
+ 
+if len(data) < 30:
+    st.warning(f"Only {len(data)} rows available after indicator calculation.")
+    st.stop()
+
+htf_interval, htf_period = get_higher_timeframe(timeframe)
+htf_data = fetch_data(ticker, htf_interval, htf_period)
+
+if not htf_data.empty:
+    htf_data = add_indicators(htf_data).dropna().copy()
+    if len(htf_data) > 20:
+        htf_latest = htf_data.iloc[-1]
+        htf_bias = "bullish" if htf_latest["EMA20"] > htf_latest["EMA50"] else "bearish"
+    else:
+        htf_bias = None
+else:
+    htf_bias = None
+
+wins, losses, total_trades, backtest_win_rate = simple_backtest(data)
+analysis = analyze_signal(
+    data,
+    htf_bias=htf_bias,
+    timeframe_label=timeframe,
+    backtest_win_rate=backtest_win_rate
+)
+mtf_confirmation = "➖ Neutral"
+
+if analysis["signal_type"] == "buy" and htf_bias == "bullish":
+    mtf_confirmation = "✅ Bullish Alignment"
+
+elif analysis["signal_type"] == "sell" and htf_bias == "bearish":
+    mtf_confirmation = "✅ Bearish Alignment"
+
+elif analysis["signal_type"] in ["buy", "sell"]:
+    mtf_confirmation = "⚠️ Timeframe Conflict"
+quality_score = (
+    analysis["win_chance"] +
+    analysis["confidence"]
+) / 2
+
+if quality_score >= 85:
+    signal_quality = "🔥 Excellent"
+elif quality_score >= 70:
+    signal_quality = "✅ Strong"
+elif quality_score >= 55:
+    signal_quality = "⚠️ Moderate"
+else:
+    signal_quality = "❌ Weak"
+latest = data.iloc[-1]
+
+patterns = []
+
+if latest["Hammer"]:
+    patterns.append("🟢 Hammer")
+
+if latest["ShootingStar"]:
+    patterns.append("🔴 Shooting Star")
+
+if latest["BullishMarubozu"]:
+    patterns.append("🟢 Bullish Marubozu")
+
+if latest["BearishMarubozu"]:
+    patterns.append("🔴 Bearish Marubozu")
+
+if latest["Doji"]:
+    patterns.append("🟡 Doji")
+if latest["BullishEngulfing"]:
+    patterns.append("🟢 Bullish Engulfing")
+
+if latest["BearishEngulfing"]:
+    patterns.append("🔴 Bearish Engulfing")
+if bool(latest.get("RetestBull", False)):
+    patterns.append("🚀 Bullish Retest")
+
+if bool(latest.get("RetestBear", False)):
+    patterns.append("🔻 Bearish Retest")
+option_suggestion = suggest_option_strike(selected, analysis["close_price"], analysis["signal_type"])
+
+alert_text = (
+    f"{selected} | {timeframe} | {analysis['signal_text']} | "
+    f"Strength: {analysis['strength']} | Confidence: {analysis['confidence']}% | "
+    f"Win Chance: {analysis['win_chance']}% | Price: {round(analysis['close_price'], 2)} | "
+    f"{option_suggestion['text']}"
+)
+
+current_signal_key = f"{selected}|{timeframe}|{analysis['signal_text']}|{round(analysis['close_price'], 2)}"
+
+last_signal_key = ""
+if os.path.exists(SIGNAL_STATE_FILE):
+    with open(SIGNAL_STATE_FILE, "r") as f:
+        last_signal_key = f.read().strip()
+
+if telegram_enabled and telegram_bot_token and telegram_chat_id:
+    if st.button("Send Telegram Alert Now"):
+        sent = send_telegram_alert(telegram_bot_token, telegram_chat_id, alert_text)
+        if sent:
+            st.success("Telegram alert sent successfully.")
+        else:
+            st.error("Failed to send Telegram alert.")
+
+    if auto_send_telegram and current_signal_key != last_signal_key and analysis["signal_type"] != "neutral":
+        sent = send_telegram_alert(telegram_bot_token, telegram_chat_id, alert_text)
+        if sent:
+            with open(SIGNAL_STATE_FILE, "w") as f:
+                f.write(current_signal_key)
+
+st.subheader("🚨 Live Signal Analytics")
+st.subheader("🕯 Candlestick Patterns")
+
+if patterns:
+    st.success(" | ".join(patterns))
+else:
+    st.info("No major candlestick pattern detected")
+if analysis["signal_type"] == "buy":
+    st.success(alert_text)
+elif analysis["signal_type"] == "sell":
+    st.error(alert_text)
+else:
+    st.warning(alert_text)
+
+m1, m2, m3, m4, m5, m6, m7 = st.columns(7)
+
+with m1:
+    st.metric("Current Price", round(analysis["close_price"], 2))
+    st.metric("VWAP", round(analysis["vwap"], 2))
+
+with m2:
+    st.metric("EMA20", round(analysis["ema20"], 2))
+    st.metric("EMA50", round(analysis["ema50"], 2))
+
+with m3:
+    st.metric("RSI", round(analysis["rsi"], 2))
+    st.metric("ATR", round(analysis["atr"], 2))
+
+with m4:
+    st.metric("MACD", round(analysis["macd"], 2))
+    st.metric("ADX", round(analysis["adx"], 2))
+
+with m5:
+    st.metric("Win Chance %", analysis["win_chance"])
+    st.metric("Confidence %", analysis["confidence"])
+
+with m6:
+    st.metric("Bullish Score", analysis["bullish_score"])
+    st.metric("Bearish Score", analysis["bearish_score"])
+with m7:
+    st.metric("Signal Quality", signal_quality)
+
+a1, a2, a3, a4, a5,a6 = st.columns(6)
+
+with a1:
+    st.metric("Support", round(analysis["support"], 2))
+with a2:
+    st.metric("Resistance", round(analysis["resistance"], 2))
+with a3:
+    st.metric("Backtest Wins", wins)
+with a4:
+    st.metric("Backtest Losses", losses)
+with a5:
+    st.metric("Backtest Win Rate", f"{backtest_win_rate:.1f}%")
+with a6:
+    st.metric("MTF Status", mtf_confirmation)
+st.subheader("🎯 Option CALL/PUT Suggestion")
+if option_suggestion["type"] == "CALL":
+    st.success(option_suggestion["text"])
+elif option_suggestion["type"] == "PUT":
+    st.error(option_suggestion["text"])
+else:
+    st.warning(option_suggestion["text"])
+
+if analysis["stop_loss"] is not None:
+    t1, t2, t3, t4, t5 = st.columns(5)
+    with t1:
+        st.metric("Stop Loss", round(analysis["stop_loss"], 2))
+    with t2:
+        st.metric("Partial Exit", round(analysis["partial_exit"], 2) if analysis["partial_exit"] else "-")
+    with t3:
+        st.metric("Target 1", round(analysis["target1"], 2) if analysis["target1"] else "-")
+    with t4:
+        st.metric("Target 2", round(analysis["target2"], 2) if analysis["target2"] else "-")
+    with t5:
+        st.metric("Trailing Stop", round(analysis["trailing_stop"], 2) if analysis["trailing_stop"] else "-")
+
+with st.expander("Why this signal?"):
+    for reason in analysis["reasons"]:
+        st.write("-", reason)
+
+st.subheader("💼 Paper Trading")
+paper_state = load_paper_state()
+
+p1, p2, p3 = st.columns(3)
+with p1:
+    st.metric("Paper Balance", round(float(paper_state.loc[0, "Balance"]), 2))
+with p2:
+    st.metric("Used Margin", round(float(paper_state.loc[0, "UsedMargin"]), 2))
+with p3:
+    st.metric("Open Positions", int(paper_state.loc[0, "OpenPositions"]))
+
+paper_qty = st.number_input("Paper Trade Quantity", min_value=1, value=1, step=1)
+
+if st.button("Take Paper Trade"):
+    if analysis["signal_type"] in ["buy", "sell"]:
+        success = paper_trade_entry(analysis["close_price"], paper_qty)
+        if success:
+            add_trade_to_journal(
+                symbol=selected,
+                timeframe=timeframe,
+                signal=analysis["signal_text"],
+                entry_price=analysis["close_price"],
+                quantity=paper_qty,
+                stop_loss=analysis["stop_loss"],
+                target1=analysis["target1"],
+                target2=analysis["target2"],
+                trailing_stop=analysis["trailing_stop"],
+                notes="Paper Trade"
+            )
+            st.success("Paper trade entered and journal updated.")
+            st.rerun()
+        else:
+            st.error("Insufficient paper balance.")
+    else:
+        st.warning("No valid signal for paper trade.")
+
+st.subheader("Candlestick Chart")
+fig = go.Figure()
+
+fig.add_trace(go.Candlestick(
+    x=data.index,
+    open=data["Open"],
+    high=data["High"],
+    low=data["Low"],
+    close=data["Close"],
+    name="Candles"
+))
+
+fig.add_trace(go.Scatter(x=data.index, y=data["EMA20"], mode="lines", name="EMA20", line=dict(color="orange", width=1.5)))
+fig.add_trace(go.Scatter(x=data.index, y=data["EMA50"], mode="lines", name="EMA50", line=dict(color="blue", width=1.5)))
+fig.add_trace(go.Scatter(x=data.index, y=data["VWAP"], mode="lines", name="VWAP", line=dict(color="purple", width=1.3, dash="dot")))
+fig.add_trace(go.Scatter(x=data.index, y=data["BB_Upper"], mode="lines", name="BB Upper", line=dict(color="gray", width=1, dash="dash")))
+fig.add_trace(go.Scatter(x=data.index, y=data["BB_Lower"], mode="lines", name="BB Lower", line=dict(color="gray", width=1, dash="dash")))
+
+fig.add_trace(go.Scatter(
+    x=data.index,
+    y=data["BuyMarker"],
+    mode="markers",
+    name="Buy Signal",
+    marker=dict(symbol="triangle-up", color="green", size=12)
+))
+
+fig.add_trace(go.Scatter(
+    x=data.index,
+    y=data["SellMarker"],
+    mode="markers",
+    name="Sell Signal",
+    marker=dict(symbol="triangle-down", color="red", size=12)
+))
+
+fig.add_hline(y=analysis["support"], line_dash="dot", line_color="green", annotation_text="Support")
+fig.add_hline(y=analysis["resistance"], line_dash="dot", line_color="red", annotation_text="Resistance")
+
+fig.update_layout(
+    height=700,
+    xaxis_rangeslider_visible=False,
+    template="plotly_dark",
+    title=f"{selected} Candlestick Chart ({timeframe})"
+)
+st.plotly_chart(fig, use_container_width=True)
+
+st.subheader("MACD Chart")
+macd_fig = go.Figure()
+macd_fig.add_trace(go.Scatter(x=data.index, y=data["MACD"], mode="lines", name="MACD", line=dict(color="cyan")))
+macd_fig.add_trace(go.Scatter(x=data.index, y=data["SignalLine"], mode="lines", name="Signal", line=dict(color="orange")))
+macd_fig.add_trace(go.Bar(x=data.index, y=data["MACD_Hist"], name="Histogram"))
+macd_fig.update_layout(height=300, template="plotly_dark", title="MACD")
+st.plotly_chart(macd_fig, use_container_width=True)
+
+st.subheader("RSI / Stochastic / ADX Chart")
+multi_fig = go.Figure()
+multi_fig.add_trace(go.Scatter(x=data.index, y=data["RSI"], mode="lines", name="RSI", line=dict(color="yellow")))
+multi_fig.add_trace(go.Scatter(x=data.index, y=data["StochK"], mode="lines", name="Stoch K", line=dict(color="lime")))
+multi_fig.add_trace(go.Scatter(x=data.index, y=data["StochD"], mode="lines", name="Stoch D", line=dict(color="red")))
+multi_fig.add_trace(go.Scatter(x=data.index, y=data["ADX"], mode="lines", name="ADX", line=dict(color="white")))
+multi_fig.update_layout(height=350, template="plotly_dark", title="Momentum + Trend Strength")
+st.plotly_chart(multi_fig, use_container_width=True)
+
+st.subheader("📝 Trade Journal")
+
+col_j1, col_j2 = st.columns(2)
+with col_j1:
+    qty = st.number_input("Manual Journal Quantity", min_value=1, value=1, step=1, key="journal_qty")
+    note_text = st.text_input("Trade Notes", value="", key="journal_note")
+    if st.button("Add Current Signal to Journal"):
+        if analysis["signal_type"] in ["buy", "sell"]:
+            add_trade_to_journal(
+                symbol=selected,
+                timeframe=timeframe,
+                signal=analysis["signal_text"],
+                entry_price=analysis["close_price"],
+                quantity=qty,
+                stop_loss=analysis["stop_loss"],
+                target1=analysis["target1"],
+                target2=analysis["target2"],
+                trailing_stop=analysis["trailing_stop"],
+                notes=note_text
+            )
+            st.success("Trade added to journal.")
+            st.rerun()
+        else:
+            st.warning("No valid trade signal to add.")
+
+journal_df = load_journal()
+st.dataframe(journal_df, use_container_width=True)
+
+st.subheader("📌 Entry / Exit History")
+
+open_trades = journal_df[journal_df["Status"] == "OPEN"]
+
+if not open_trades.empty:
+    st.write("Open Trades")
+    st.dataframe(open_trades, use_container_width=True)
+
+    open_indices = open_trades.index.tolist()
+    selected_trade_index = st.selectbox("Select Open Trade Row to Exit", open_indices)
+
+    exit_price_input = st.number_input("Exit Price", min_value=0.0, value=float(analysis["close_price"]), step=0.1)
+
+    if st.button("Close Selected Trade"):
+        row = journal_df.loc[selected_trade_index]
+        pnl = paper_trade_exit(
+            entry_price=float(row["EntryPrice"]),
+            exit_price=exit_price_input,
+            quantity=float(row["Quantity"]),
+            signal=str(row["Signal"])
+        )
+        close_trade_in_journal(selected_trade_index, exit_price_input)
+        update_daily_summary()
+        st.success(f"Trade closed. Paper PnL: {round(pnl, 2)}")
         st.rerun()
+else:
+    st.info("No open trades available.")
 
-    df = fetch_data_cached(symbol, actual_interval, period)
-    if df.empty:
-        st.error("❌ Could not fetch data. Try again later.")
-        return
+closed_trades = journal_df[journal_df["Status"] == "CLOSED"]
+if not closed_trades.empty:
+    st.write("Closed Trades")
+    st.dataframe(closed_trades, use_container_width=True)
 
-    df = add_indicators(df)
-    latest = df.iloc[-1].to_dict()
-    trend_state = detect_trend_pattern(df)
-    market_bias = detect_market_bias(df)
-    signal, confidence, entry_price, stop_loss, target1, target2, target3, trailing_sl = get_trade_signal_with_confidence(df)
-    signal_strength = get_signal_strength(confidence)
+    total_pnl = pd.to_numeric(closed_trades["PnL"], errors="coerce").fillna(0).sum()
+    avg_pnl_pct = pd.to_numeric(closed_trades["PnLPercent"], errors="coerce").fillna(0).mean()
 
-    pcr_value = None
-    if market_group in ["Indices", "Top 10 Indian Companies", "Banking Stocks", "Forex"]:
-        pcr_value = fetch_pcr_data("NIFTY")
+    p1, p2 = st.columns(2)
+    with p1:
+        st.metric("Total Realized PnL", round(total_pnl, 2))
+    with p2:
+        st.metric("Average PnL %", round(avg_pnl_pct, 2))
 
-    # Load backtest results - for 5 years
-    journal = load_journal()
-    backtest_results_all = backtest_signal_performance(journal, "all")
-    backtest_results_5y = backtest_signal_performance(journal, "5y")
+st.subheader("📊 Daily Summary Report")
+init_daily_summary()
+summary_df = pd.read_csv(SESSION_SUMMARY_FILE)
+st.dataframe(summary_df, use_container_width=True)
 
-    st.caption(f"Market: {market_group} | Asset: {symbol_name} | Symbol: {symbol}")
+st.subheader("Downloads")
 
-    summary = get_today_summary()
-    col1, col2, col3, col4, col5 = st.columns(5)
-    if "USDINR" in symbol:
-        price_label = f"₹{latest.get('Close', 0):.4f}"
-    else:
-        price_label = f"₹{latest.get('Close', 0):.2f}"
-    col1.metric("📈 Price", price_label)
-    col2.metric("📊 RSI", f"{latest.get('RSI', 50):.1f}")
-    col3.metric("🔊 Volume", f"{latest.get('Volume', 0):,.0f}")
-    col4.metric("🎯 ADX", f"{latest.get('ADX', 0):.1f}")
-    col5.metric("🧠 PCR", f"{pcr_value:.2f}" if pcr_value is not None else "N/A")
+market_csv = data.to_csv().encode("utf-8")
+st.download_button(
+    label="📥 Download Market Data CSV",
+    data=market_csv,
+    file_name=f"{selected}_{timeframe}_market_data.csv",
+    mime="text/csv"
+)
 
-    st.subheader("🚀 AUTO SIGNAL - Live Trading Setup")
-    signal_col1, signal_col2, signal_col3, signal_col4 = st.columns(4)
+journal_csv = journal_df.to_csv(index=False).encode("utf-8")
+st.download_button(
+    label="📥 Download Trade Journal CSV",
+    data=journal_csv,
+    file_name="trade_journal.csv",
+    mime="text/csv"
+)
 
-    with signal_col1:
-        if signal == "BUY":
-            st.success(f"🟢 BUY")
-        elif signal == "SELL":
-            st.error(f"🔴 SELL")
-        else:
-            st.info(f"⚪ HOLD")
-
-    with signal_col2:
-        st.metric("Confidence", f"{confidence}%")
-
-    with signal_col3:
-        st.write(f"**Signal Strength:** {signal_strength}")
-        st.write(f"**Market Bias:** {market_bias}")
-
-    with signal_col4:
-        auto_execute = st.checkbox("Auto Execute Trade", value=False, key="auto_execute")
-
-    # ===== BACKTEST PERFORMANCE DASHBOARD =====
-    st.subheader("📊 BACKTEST PERFORMANCE (5 YEARS)")
-    bt_col1, bt_col2, bt_col3 = st.columns(3)
-    
-    with bt_col1:
-        st.write("**BUY Signals**")
-        buy_stats = backtest_results_5y.get("BUY", {})
-        st.metric("Win Rate", f"{buy_stats.get('win_rate', 0):.1f}%", delta=f"Loss: {buy_stats.get('loss_rate', 0):.1f}%")
-        st.caption(f"Total Trades: {buy_stats.get('total', 0)}")
-    
-    with bt_col2:
-        st.write("**SELL Signals**")
-        sell_stats = backtest_results_5y.get("SELL", {})
-        st.metric("Win Rate", f"{sell_stats.get('win_rate', 0):.1f}%", delta=f"Loss: {sell_stats.get('loss_rate', 0):.1f}%")
-        st.caption(f"Total Trades: {sell_stats.get('total', 0)}")
-    
-    with bt_col3:
-        st.write("**HOLD Signals**")
-        hold_stats = backtest_results_5y.get("HOLD", {})
-        st.metric("Win Rate", f"{hold_stats.get('win_rate', 0):.1f}%", delta=f"Loss: {hold_stats.get('loss_rate', 0):.1f}%")
-        st.caption(f"Total Trades: {hold_stats.get('total', 0)}")
-
-    st.divider()
-
-    st.subheader("📋 Trade Setup - Entry & Exits")
-    entry_col1, entry_col2, entry_col3, entry_col4 = st.columns(4)
-
-    with entry_col1:
-        st.write(f"**Entry Price:** ₹{entry_price:.2f}")
-    with entry_col2:
-        st.write(f"**Stop Loss:** ₹{stop_loss:.2f}")
-    with entry_col3:
-        st.write(f"**Trailing SL:** ₹{trailing_sl:.2f}")
-    with entry_col4:
-        pass
-
-    target_col1, target_col2, target_col3, target_col4 = st.columns(4)
-    with target_col1:
-        st.write(f"**Target 1:** ₹{target1:.2f}")
-    with target_col2:
-        st.write(f"**Target 2:** ₹{target2:.2f}")
-    with target_col3:
-        st.write(f"**Target 3:** ₹{target3:.2f}")
-    with target_col4:
-        pass
-
-    st.subheader("💹 Live Chart with All Indicators")
-    use_heikin_ashi = st.checkbox("Show Heikin Ashi chart", value=False)
-    chart_df = compute_heikin_ashi(df) if use_heikin_ashi else df.copy()
-
-    fig = go.Figure()
-    if use_heikin_ashi:
-        fig.add_trace(go.Candlestick(
-            x=chart_df.index,
-            open=chart_df["HA_Open"],
-            high=chart_df["HA_High"],
-            low=chart_df["HA_Low"],
-            close=chart_df["HA_Close"],
-            name="Heikin Ashi"
-        ))
-    else:
-        fig.add_trace(go.Candlestick(
-            x=chart_df.index,
-            open=chart_df["Open"],
-            high=chart_df["High"],
-            low=chart_df["Low"],
-            close=chart_df["Close"],
-            name="Price"
-        ))
-
-    fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df["EMA5"], name="EMA5", line=dict(color="yellow", width=1)))
-    fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df["EMA20"], name="EMA20", line=dict(color="blue", width=2)))
-    fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df["EMA50"], name="EMA50", line=dict(color="red", width=2)))
-    fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df["VWAP"], name="VWAP", line=dict(color="green", width=2)))
-    fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df["TrendSupport"], name="Trend Support", line=dict(color="lime", dash="dot")))
-    fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df["TrendResistance"], name="Trend Resistance", line=dict(color="orange", dash="dot")))
-    fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df["BB_Upper"], name="BB Upper", line=dict(color="purple", dash="dash")))
-    fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df["BB_Lower"], name="BB Lower", line=dict(color="purple", dash="dash")))
-    fig.update_layout(title=f"{symbol_name} - {timeframe} | {market_group}", template="plotly_dark", height=600, xaxis_rangeslider_visible=False)
-    st.plotly_chart(fig, use_container_width=True)
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.subheader("📊 MACD Indicator")
-        fig_macd = go.Figure()
-        fig_macd.add_trace(go.Scatter(x=chart_df.index, y=chart_df["MACD"], name="MACD", line=dict(color="blue")))
-        fig_macd.add_trace(go.Scatter(x=chart_df.index, y=chart_df["SignalLine"], name="Signal Line", line=dict(color="red")))
-        fig_macd.add_trace(go.Bar(x=chart_df.index, y=chart_df["MACD_Hist"], name="Histogram", marker=dict(color="gray")))
-        fig_macd.update_layout(template="plotly_dark", height=400, xaxis_rangeslider_visible=False)
-        st.plotly_chart(fig_macd, use_container_width=True)
-
-    with col2:
-        st.subheader("📈 VWAP Analysis")
-        st.write(f"**Current VWAP:** ₹{latest.get('VWAP', 0):.2f}")
-        st.write(f"**Current Price:** ₹{latest.get('Close', 0):.2f}")
-        if latest.get('Close', 0) > latest.get('VWAP', 0):
-            st.success("✅ Price Above VWAP - Bullish")
-        else:
-            st.error("❌ Price Below VWAP - Bearish")
-
-    st.subheader("📊 Bollinger Bands")
-    bb_upper = latest.get("BB_Upper", 0)
-    bb_lower = latest.get("BB_Lower", 0)
-    sma20 = latest.get("SMA20", 0)
-
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("BB Upper", f"₹{bb_upper:.2f}")
-    col2.metric("SMA20", f"₹{sma20:.2f}")
-    col3.metric("BB Lower", f"₹{bb_lower:.2f}")
-    col4.metric("Bandwidth", f"₹{(bb_upper - bb_lower):.2f}")
-
-    st.subheader("🎯 Detected Patterns")
-    patterns = get_detected_patterns(latest)
-    if patterns:
-        for pattern in patterns:
-            st.success(pattern)
-    else:
-        st.info("No patterns detected")
-
-    if pcr_value is not None:
-        st.subheader("📉 Put-Call Ratio (PCR)")
-        st.metric("NIFTY PCR", f"{pcr_value:.2f}")
-        if pcr_value > 1.2:
-            st.info("PCR suggests bullish put interest; markets may be defensive.")
-        elif pcr_value < 0.8:
-            st.info("PCR suggests strong call interest; momentum may be bullish.")
-        else:
-            st.info("PCR is near neutral; trend is balanced.")
-
-    st.subheader("📌 Trend & Market Context")
-    st.success(trend_state)
-    st.write(f"- Support Zone: ₹{latest.get('TrendSupport', 0):.2f}")
-    st.write(f"- Resistance Zone: ₹{latest.get('TrendResistance', 0):.2f}")
-    st.write(f"- MACD: {latest.get('MACD', 0):.4f} | Signal: {latest.get('SignalLine', 0):.4f} | Histogram: {latest.get('MACD_Hist', 0):.4f}")
-
-    st.subheader("📊 Paper Trading - Manual Entry")
-    with st.form("trade_entry_form"):
-        trade_signal = st.selectbox("Signal", ["BUY", "SELL", "HOLD"])
-        trade_entry = st.number_input("Entry Price", value=float(entry_price), step=0.01)
-        trade_qty = st.number_input("Quantity", value=1, step=1)
-        trade_sl = st.number_input("Stop Loss", value=float(stop_loss), step=0.01)
-        trade_t1 = st.number_input("Target 1", value=float(target1), step=0.01)
-        trade_t2 = st.number_input("Target 2", value=float(target2), step=0.01)
-        trade_t3 = st.number_input("Target 3", value=float(target3), step=0.01)
-        trade_trailing_sl = st.number_input("Trailing Stop Loss", value=float(trailing_sl), step=0.01)
-        trade_notes = st.text_input("Notes", value="")
-
-        if st.form_submit_button("📝 Log Paper Trade"):
-            if add_trade_to_journal(
-                symbol_name, timeframe, trade_signal, trade_entry, trade_qty,
-                trade_sl, trade_t1, trade_t2, trade_t3, trade_trailing_sl, confidence, trade_notes, "PAPER"
-            ):
-                st.success("✅ Paper Trade logged successfully!")
-                st.rerun()
-
-    st.subheader("📈 Daily Summary")
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Trades", summary["total"])
-    col2.metric("Wins", summary["wins"])
-    col3.metric("Losses", summary["losses"])
-    col4.metric("PnL", f"₹{summary['pnl']:.2f}")
-    st.caption(f"Win Rate: {summary['win_rate']:.1f}%")
-
-    st.subheader("📓 Trade Journal")
-    if not journal.empty:
-        st.dataframe(journal.tail(10), use_container_width=True)
-    else:
-        st.info("No trades yet")
-
-    st.subheader("💰 Paper Trading Account")
-    state = load_paper_state()
-    col1, col2, col3 = st.columns(3)
-    col1.metric("💰 Balance", f"₹{state.loc[0, 'Balance']:.2f}")
-    col2.metric("💸 Used Margin", f"₹{state.loc[0, 'UsedMargin']:.2f}")
-    col3.metric("📍 Open Positions", int(state.loc[0, 'OpenPositions']))
-
-
-if __name__ == "__main__":
-    main()
+summary_csv = summary_df.to_csv(index=False).encode("utf-8")
+st.download_button(
+    label="📥 Download Daily Summary CSV",
+    data=summary_csv,
+    file_name="daily_summary.csv",
+    mime="text/csv"
+)
