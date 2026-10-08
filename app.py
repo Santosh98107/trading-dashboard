@@ -445,54 +445,59 @@ def add_indicators(df):
     
     
     
-    df["Hammer"] = (
-    (lower_shadow > candle_body * 2)
-    & (upper_shadow < candle_body)
+df["Hammer"] = (
+        (lower_shadow > candle_body * 2)
+        & (upper_shadow < candle_body)
     )
-df["ShootingStar"] = (
-    (upper_shadow > candle_body * 2)
-    & (lower_shadow < candle_body)
+
+    df["ShootingStar"] = (
+        (upper_shadow > candle_body * 2)
+        & (lower_shadow < candle_body)
     )
-# Inverted Hammer
-df["InvertedHammer"] = (
-    (upper_shadow > candle_body * 2)
-    & (lower_shadow < candle_body * 0.5)
-    & (df["Close"] > df["Open"])
-)
 
-# Hanging Man
-df["HangingMan"] = (
-    (lower_shadow > candle_body * 2)
-    & (upper_shadow < candle_body * 0.5)
-    & (df["Close"] < df["Open"])
-)
+    # Inverted Hammer
+    df["InvertedHammer"] = (
+        (upper_shadow > candle_body * 2)
+        & (lower_shadow < candle_body * 0.5)
+        & (df["Close"] > df["Open"])
+    )
 
-# Dragonfly Doji
-df["DragonflyDoji"] = (
-    (candle_body <= candle_range * 0.05)
-    & (lower_shadow > candle_body * 3)
-)
+    # Hanging Man
+    df["HangingMan"] = (
+        (lower_shadow > candle_body * 2)
+        & (upper_shadow < candle_body * 0.5)
+        & (df["Close"] < df["Open"])
+    )
 
-# Gravestone Doji
-df["GravestoneDoji"] = (
-    (candle_body <= candle_range * 0.05)
-    & (upper_shadow > candle_body * 3)
-)
-df["BodyStrength"] = candle_body / candle_range
-df["BuyMarker"] = np.where(
-        (df["EMA20"] > df["EMA50"]) & (df["EMA20"].shift(1) <= df["EMA50"].shift(1)),
+    # Dragonfly Doji
+    df["DragonflyDoji"] = (
+        (candle_body <= candle_range * 0.05)
+        & (lower_shadow > candle_body * 3)
+    )
+
+    # Gravestone Doji
+    df["GravestoneDoji"] = (
+        (candle_body <= candle_range * 0.05)
+        & (upper_shadow > candle_body * 3)
+    )
+
+    df["BodyStrength"] = candle_body / candle_range
+
+    df["BuyMarker"] = np.where(
+        (df["EMA20"] > df["EMA50"]) &
+        (df["EMA20"].shift(1) <= df["EMA50"].shift(1)),
         df["Low"] * 0.995,
         np.nan
     )
 
-df["SellMarker"] = np.where(
-        (df["EMA20"] < df["EMA50"]) & (df["EMA20"].shift(1) >= df["EMA50"].shift(1)),
+    df["SellMarker"] = np.where(
+        (df["EMA20"] < df["EMA50"]) &
+        (df["EMA20"].shift(1) >= df["EMA50"].shift(1)),
         df["High"] * 1.005,
         np.nan
     )
 
-        return df
-
+    return df
 
 def get_higher_timeframe(tf):
     if tf == "1m":
