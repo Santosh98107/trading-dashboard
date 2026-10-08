@@ -455,27 +455,23 @@ df["Hammer"] = (
         & (lower_shadow < candle_body)
     )
 
-    # Inverted Hammer
     df["InvertedHammer"] = (
         (upper_shadow > candle_body * 2)
         & (lower_shadow < candle_body * 0.5)
         & (df["Close"] > df["Open"])
     )
 
-    # Hanging Man
     df["HangingMan"] = (
         (lower_shadow > candle_body * 2)
         & (upper_shadow < candle_body * 0.5)
         & (df["Close"] < df["Open"])
     )
 
-    # Dragonfly Doji
     df["DragonflyDoji"] = (
         (candle_body <= candle_range * 0.05)
         & (lower_shadow > candle_body * 3)
     )
 
-    # Gravestone Doji
     df["GravestoneDoji"] = (
         (candle_body <= candle_range * 0.05)
         & (upper_shadow > candle_body * 3)
@@ -498,7 +494,6 @@ df["Hammer"] = (
     )
 
     return df
-
 def get_higher_timeframe(tf):
     if tf == "1m":
         return "5m", "30d"
