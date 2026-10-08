@@ -28,7 +28,7 @@ def init_users():
             }
         ]).to_csv(USERS_FILE, index=False)
 
-else:
+    else:
 
     try:
 
