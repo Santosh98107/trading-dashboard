@@ -49,7 +49,6 @@ def init_users():
             ]).to_csv(USERS_FILE, index=False)
 
 def login_panel():
-    init_users()
 
     if "logged_in" not in st.session_state:
         st.session_state.logged_in = False
@@ -58,30 +57,47 @@ def login_panel():
         st.session_state.username = ""
 
     if not st.session_state.logged_in:
+
         st.sidebar.subheader("🔐 Login")
+
         username = st.sidebar.text_input("Username")
-        password = st.sidebar.text_input("Password", type="password")
+        password = st.sidebar.text_input(
+            "Password",
+            type="password"
+        )
 
-if st.sidebar.button("Login"):
+        st.write(repr(username))
+        st.write(repr(password))
 
-            if username.strip() == "admin" and password.strip() == "admin123":
+        if st.sidebar.button("Login"):
+
+            if (
+                username.strip() == "admin"
+                and
+                password.strip() == "admin123"
+            ):
 
                 st.session_state.logged_in = True
                 st.session_state.username = username
-
-                st.sidebar.success("Login successful")
 
                 st.rerun()
 
             else:
 
                 st.sidebar.error("Invalid credentials")
-    st.sidebar.success(f"Logged in as: {st.session_state.username}")
+
+        st.stop()
+
+    st.sidebar.success(
+        f"Logged in as: {st.session_state.username}"
+    )
+
     if st.sidebar.button("Logout"):
+
         st.session_state.logged_in = False
         st.session_state.username = ""
-        st.rerun()
 
+        st.rerun()
 
 def init_journal():
     if not os.path.exists(JOURNAL_FILE):
