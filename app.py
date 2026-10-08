@@ -69,7 +69,14 @@ def login_panel():
         if st.sidebar.button("Login"):
             try:
                 users = pd.read_csv(USERS_FILE)
-                valid = ((users["username"] == username) & (users["password"] == password)).any()
+                st.write(users)
+st.write("Username =", repr(username))
+st.write("Password =", repr(password))
+valid = (
+    users["username"].astype(str).str.strip().eq(username.strip())
+    &
+    users["password"].astype(str).str.strip().eq(password.strip())
+).any()
                 if valid:
                     st.session_state.logged_in = True
                     st.session_state.username = username
