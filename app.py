@@ -19,36 +19,10 @@ SESSION_SUMMARY_FILE = "daily_summary.csv"
 
 
 def init_users():
-
     if not os.path.exists(USERS_FILE):
-
         pd.DataFrame([
-            {
-                "username": "admin",
-                "password": "admin123"
-            }
+            {"username": "admin", "password": "admin123"}
         ]).to_csv(USERS_FILE, index=False)
-
-    else:
-
-        try:
-
-            users = pd.read_csv(USERS_FILE)
-
-            if "username" not in users.columns:
-                raise Exception()
-
-            if "password" not in users.columns:
-                raise Exception()
-
-        except Exception:
-
-            pd.DataFrame([
-                {
-                    "username": "admin",
-                    "password": "admin123"
-                }
-            ]).to_csv(USERS_FILE, index=False))
 
 
 def login_panel():
