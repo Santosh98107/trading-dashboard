@@ -478,7 +478,7 @@ df["GravestoneDoji"] = (
     (candle_body <= candle_range * 0.05)
     & (upper_shadow > candle_body * 3)
 )
-    df["BodyStrength"] = candle_body / candle_range
+df["BodyStrength"] = candle_body / candle_range
     df["BuyMarker"] = np.where(
         (df["EMA20"] > df["EMA50"]) & (df["EMA20"].shift(1) <= df["EMA50"].shift(1)),
         df["Low"] * 0.995,
