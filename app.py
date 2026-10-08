@@ -491,7 +491,7 @@ df["SellMarker"] = np.where(
         np.nan
     )
 
-    return df
+return df
 
 
 def get_higher_timeframe(tf):
