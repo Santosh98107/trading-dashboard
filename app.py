@@ -1188,6 +1188,11 @@ if latest["PiercingPattern"]:
 
 if latest["DarkCloudCover"]:
     patterns.append("🔴 Dark Cloud Cover")
+if latest["TweezerBottom"]:
+    patterns.append("🟢 Tweezer Bottom")
+
+if latest["TweezerTop"]:
+    patterns.append("🔴 Tweezer Top")
 if bool(latest.get("RetestBull", False)):
     patterns.append("🚀 Bullish Retest")
 
