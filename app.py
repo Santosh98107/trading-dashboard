@@ -1109,6 +1109,11 @@ if latest["DragonflyDoji"]:
 
 if latest["GravestoneDoji"]:
     patterns.append("🔴 Gravestone Doji")
+if latest["ThreeWhiteSoldiers"]:
+    patterns.append("🟢 Three White Soldiers")
+
+if latest["ThreeBlackCrows"]:
+    patterns.append("🔴 Three Black Crows")
 if latest["Hammer"]:
     patterns.append("🟢 Hammer")
 
