@@ -441,6 +441,35 @@ def add_indicators(df):
     & (df["Open"] >= df["Close"].shift(1))
     & (df["Close"] <= df["Open"].shift(1))
     )
+    df["PiercingPattern"] = (
+        (df["Close"].shift(1) < df["Open"].shift(1))
+        &
+        (df["Close"] > df["Open"])
+        &
+        (
+            df["Close"]
+            >
+            (
+                (df["Open"].shift(1) + df["Close"].shift(1))
+                / 2
+            )
+        )
+    )
+
+    df["DarkCloudCover"] = (
+        (df["Close"].shift(1) > df["Open"].shift(1))
+        &
+        (df["Close"] < df["Open"])
+        &
+        (
+            df["Close"]
+            <
+            (
+                (df["Open"].shift(1) + df["Close"].shift(1))
+                / 2
+            )
+        )
+    )
     df["Doji"] = candle_body <= (candle_range * 0.1)
     
     
