@@ -475,6 +475,10 @@ def add_indicators(df):
         <= (df["ATR"] * 0.1)
     )
     df["Doji"] = candle_body <= (candle_range * 0.1)
+    df["TweezerTop"] = (
+        abs(df["High"] - df["High"].shift(1))
+        <= (df["ATR"] * 0.1)
+    )
     
     
     
