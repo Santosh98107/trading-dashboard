@@ -474,6 +474,27 @@ def add_indicators(df):
         abs(df["Low"] - df["Low"].shift(1))
         <= (df["ATR"] * 0.1)
     )
+    # Bullish Harami
+    df["BullishHarami"] = (
+        (df["Close"].shift(1) < df["Open"].shift(1))
+        &
+        (df["Close"] > df["Open"])
+        &
+        (df["Open"] > df["Close"].shift(1))
+        &
+        (df["Close"] < df["Open"].shift(1))
+    )
+
+    # Bearish Harami
+    df["BearishHarami"] = (
+        (df["Close"].shift(1) > df["Open"].shift(1))
+        &
+        (df["Close"] < df["Open"])
+        &
+        (df["Open"] < df["Close"].shift(1))
+        &
+        (df["Close"] > df["Open"].shift(1))
+    )
     df["Doji"] = candle_body <= (candle_range * 0.1)
     df["TweezerTop"] = (
         abs(df["High"] - df["High"].shift(1))
