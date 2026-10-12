@@ -1219,6 +1219,11 @@ if latest["TweezerBottom"]:
 
 if latest["TweezerTop"]:
     patterns.append("🔴 Tweezer Top")
+if latest["MorningStar"]:
+    patterns.append("🟢 Morning Star")
+
+if latest["EveningStar"]:
+    patterns.append("🔴 Evening Star")
 if bool(latest.get("RetestBull", False)):
     patterns.append("🚀 Bullish Retest")
 
