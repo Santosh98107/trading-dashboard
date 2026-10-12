@@ -839,8 +839,8 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
         bearish += 3
         reasons.append("Dark Cloud Cover detected")
     if bool(latest.get("TweezerBottom", False)):
-    bullish += 2
-    reasons.append("Tweezer Bottom detected")
+        bullish += 2
+        reasons.append("Tweezer Bottom detected")
 
     if bool(latest.get("TweezerTop", False)):
         bearish += 2
