@@ -1252,6 +1252,11 @@ if latest["MorningStar"]:
 
 if latest["EveningStar"]:
     patterns.append("🔴 Evening Star")
+if latest["BullishHarami"]:
+    patterns.append("🟢 Bullish Harami")
+
+if latest["BearishHarami"]:
+    patterns.append("🔴 Bearish Harami")
 if bool(latest.get("RetestBull", False)):
     patterns.append("🚀 Bullish Retest")
 
