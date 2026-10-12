@@ -823,6 +823,13 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
     if bear_engulf:
         bearish += 3
         reasons.append("Bearish Engulfing detected")
+    if bool(latest.get("PiercingPattern", False)):
+        bullish += 3
+        reasons.append("Piercing Pattern detected")
+
+    if bool(latest.get("DarkCloudCover", False)):
+        bearish += 3
+        reasons.append("Dark Cloud Cover detected")
     if bull_engulf and volume_spike:
         bullish += 2
         reasons.append("Bullish Engulfing with Volume Confirmation")
