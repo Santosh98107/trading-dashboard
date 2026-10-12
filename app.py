@@ -864,6 +864,13 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
     if bool(latest.get("TweezerTop", False)):
         bearish += 2
         reasons.append("Tweezer Top detected")
+    if bool(latest.get("MorningStar", False)):
+        bullish += 4
+        reasons.append("Morning Star detected")
+
+    if bool(latest.get("EveningStar", False)):
+        bearish += 4
+        reasons.append("Evening Star detected")
     if bull_engulf and volume_spike:
         bullish += 2
         reasons.append("Bullish Engulfing with Volume Confirmation")
