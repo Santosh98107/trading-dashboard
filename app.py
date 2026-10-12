@@ -730,7 +730,21 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
     if hammer:
         bullish += 2
         reasons.append("Hammer pattern detected")
+    if bool(latest.get("InvertedHammer", False)):
+        bullish += 2
+        reasons.append("Inverted Hammer detected")
 
+    if bool(latest.get("HangingMan", False)):
+        bearish += 2
+        reasons.append("Hanging Man detected")
+
+    if bool(latest.get("DragonflyDoji", False)):
+        bullish += 2
+        reasons.append("Dragonfly Doji detected")
+
+    if bool(latest.get("GravestoneDoji", False)):
+        bearish += 2
+        reasons.append("Gravestone Doji detected")
     if bull_maru:
         bullish += 2
         reasons.append("Bullish Marubozu detected")
