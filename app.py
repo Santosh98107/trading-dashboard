@@ -1168,6 +1168,11 @@ if latest["BullishEngulfing"]:
 
 if latest["BearishEngulfing"]:
     patterns.append("🔴 Bearish Engulfing")
+if latest["PiercingPattern"]:
+    patterns.append("🟢 Piercing Pattern")
+
+if latest["DarkCloudCover"]:
+    patterns.append("🔴 Dark Cloud Cover")
 if bool(latest.get("RetestBull", False)):
     patterns.append("🚀 Bullish Retest")
 
