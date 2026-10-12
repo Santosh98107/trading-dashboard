@@ -476,7 +476,29 @@ def add_indicators(df):
         (candle_body <= candle_range * 0.05)
         & (upper_shadow > candle_body * 3)
     )
+    df["ThreeWhiteSoldiers"] = (
+        (df["Close"] > df["Open"])
+        &
+        (df["Close"].shift(1) > df["Open"].shift(1))
+        &
+        (df["Close"].shift(2) > df["Open"].shift(2))
+        &
+        (df["Close"] > df["Close"].shift(1))
+        &
+        (df["Close"].shift(1) > df["Close"].shift(2))
+    )
 
+    df["ThreeBlackCrows"] = (
+        (df["Close"] < df["Open"])
+        &
+        (df["Close"].shift(1) < df["Open"].shift(1))
+        &
+        (df["Close"].shift(2) < df["Open"].shift(2))
+        &
+        (df["Close"] < df["Close"].shift(1))
+        &
+        (df["Close"].shift(1) < df["Close"].shift(2))
+    )
     df["BodyStrength"] = candle_body / candle_range
 
     df["BuyMarker"] = np.where(
