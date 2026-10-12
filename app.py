@@ -536,6 +536,25 @@ def add_indicators(df):
         &
         (df["Close"].shift(1) < df["Close"].shift(2))
     )
+    # Morning Star
+    df["MorningStar"] = (
+        (df["Close"].shift(2) < df["Open"].shift(2))
+        &
+        (abs(df["Close"].shift(1) - df["Open"].shift(1))
+         < candle_body.shift(1))
+        &
+        (df["Close"] > df["Open"])
+    )
+
+    # Evening Star
+    df["EveningStar"] = (
+        (df["Close"].shift(2) > df["Open"].shift(2))
+        &
+        (abs(df["Close"].shift(1) - df["Open"].shift(1))
+         < candle_body.shift(1))
+        &
+        (df["Close"] < df["Open"])
+    )
     df["BodyStrength"] = candle_body / candle_range
 
     df["BuyMarker"] = np.where(
