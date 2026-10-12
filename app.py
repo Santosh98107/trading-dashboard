@@ -778,7 +778,7 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
     if bear_maru:
         bearish += 2
         reasons.append("Bearish Marubozu detected")    
-     if bool(latest.get("ThreeWhiteSoldiers", False)):
+    if bool(latest.get("ThreeWhiteSoldiers", False)):
         bullish += 4
         reasons.append("Three White Soldiers detected")
 
