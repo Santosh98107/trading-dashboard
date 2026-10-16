@@ -965,7 +965,10 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
         bearish += 2
         reasons.append("Higher timeframe bearish confirmation")
 
-    sideways = bool(adx < 18 and abs(ema20 - ema50) / close_price < 0.003)
+    sideways = bool(
+        adx < 18
+        and trend_strength < 0.3
+    )
     session_info = session_filter(df, timeframe_label)
 
     signal_text = "NO TRADE"
