@@ -816,6 +816,13 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
     else:
         bearish += 1
         reasons.append("MACD below signal")
+    if latest["MACD_Hist"] > prev["MACD_Hist"]:
+        bullish += 1
+        reasons.append("MACD momentum increasing")
+
+    elif latest["MACD_Hist"] < prev["MACD_Hist"]:
+        bearish += 1
+        reasons.append("MACD momentum decreasing")
     if ema20_slope > 0:
         bullish += 1
         reasons.append("EMA20 rising")
