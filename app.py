@@ -747,6 +747,7 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
     distance_to_support = (
         (close_price - support) / close_price
     ) * 100
+    trend_strength = abs(ema20 - ema50) / close_price * 100
     volume_spike = bool(latest["Volume_Spike"])
     breakout = bool(latest["Breakout"])
     breakdown = bool(latest["Breakdown"])
