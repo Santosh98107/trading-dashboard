@@ -774,7 +774,13 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
     else:
         bearish += 1
         reasons.append("EMA20 < EMA50 bearish trend")
+    if close_price > ema20 > ema50:
+        bullish += 1
+        reasons.append("Perfect bullish EMA alignment")
 
+    if close_price < ema20 < ema50:
+        bearish += 1
+        reasons.append("Perfect bearish EMA alignment")
     if close_price > ema20:
         bullish += 1
         reasons.append("Price above EMA20")
