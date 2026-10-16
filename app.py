@@ -1094,7 +1094,7 @@ def simple_backtest(df):
             continue
 
         analysis = analyze_signal(sub, htf_bias=None, timeframe_label="1d", backtest_win_rate=50)
-        future = df.iloc[i + 1:i + 4]
+        future = df.iloc[i + 1:i + 10]
 
         if future.empty:
             continue
