@@ -826,7 +826,14 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
             bearish += 1
     else:
         reasons.append("ADX low / sideways risk")
+    if adx > 30:
+        if plus_di > minus_di:
+            bullish += 1
+            reasons.append("Strong bullish trend")
 
+        elif minus_di > plus_di:
+            bearish += 1
+            reasons.append("Strong bearish trend")
     if stoch_k > stoch_d and stoch_k < 80:
         bullish += 1
         reasons.append("Stochastic bullish crossover")
