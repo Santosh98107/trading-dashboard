@@ -740,6 +740,13 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
     adx = float(latest["ADX"])
     support = float(latest["PivotLow"])
     resistance = float(latest["PivotHigh"])
+    distance_to_resistance = (
+        (resistance - close_price) / close_price
+    ) * 100
+
+    distance_to_support = (
+        (close_price - support) / close_price
+    ) * 100
     volume_spike = bool(latest["Volume_Spike"])
     breakout = bool(latest["Breakout"])
     breakdown = bool(latest["Breakdown"])
