@@ -789,7 +789,13 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
         reasons.append("RSI bearish weakness")
     else:
         reasons.append("RSI neutral")
+    if rsi > float(prev["RSI"]):
+        bullish += 1
+        reasons.append("RSI momentum increasing")
 
+    elif rsi < float(prev["RSI"]):
+        bearish += 1
+        reasons.append("RSI momentum decreasing")
     if macd > macd_signal:
         bullish += 1
         reasons.append("MACD above signal")
