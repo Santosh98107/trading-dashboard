@@ -1018,7 +1018,7 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
             target2 = close_price - (2 * atr)
             trailing_stop = close_price + (0.5 * atr)
 
-        elif bullish > bearish and bullish >= 5:
+        elif bullish > bearish and bullish >= 6:
             signal_text = "BUY BIAS"
             signal_type = "buy"
             strength = "Medium"
@@ -1027,7 +1027,7 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
             target1 = close_price + atr
             trailing_stop = close_price - (0.4 * atr)
 
-        elif bearish > bullish and bearish >= 5:
+        elif bearish > bullish and bearish >= 6:
             signal_text = "SELL BIAS"
             signal_type = "sell"
             strength = "Medium"
