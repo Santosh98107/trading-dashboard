@@ -992,7 +992,13 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
     elif htf_bias == "bearish":
         bearish += 2
         reasons.append("Higher timeframe bearish confirmation")
+    if bullish > bearish and htf_bias == "bearish":
+        bullish -= 2
+        reasons.append("Higher timeframe conflict")
 
+    if bearish > bullish and htf_bias == "bullish":
+        bearish -= 2
+        reasons.append("Higher timeframe conflict")
     sideways = bool(
         adx < 18
         and trend_strength < 0.3
