@@ -796,6 +796,13 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
     else:
         bearish += 1
         reasons.append("MACD below signal")
+    if ema20_slope > 0:
+        bullish += 1
+        reasons.append("EMA20 rising")
+
+    if ema20_slope < 0:
+        bearish += 1
+        reasons.append("EMA20 falling")
 
     if adx > 20:
         reasons.append("ADX trend strength okay")
