@@ -878,11 +878,11 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
         bearish += 3
         reasons.append("High quality breakdown")
     if retest_bull:
-        bullish += 2
+        bullish += 3
         reasons.append("Bullish breakout retest confirmed")
 
     if retest_bear:
-        bearish += 2
+        bearish += 3
         reasons.append("Bearish breakdown retest confirmed")
     if hammer:
         bullish += 2
