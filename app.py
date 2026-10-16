@@ -1088,7 +1088,7 @@ def simple_backtest(df):
     
     
     
-    for i in range(30, len(df) - 3):
+    for i in range(30, len(df) - 10):
         sub = df.iloc[:i + 1]
         if len(sub) < 30:
             continue
