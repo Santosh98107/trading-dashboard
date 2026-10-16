@@ -728,6 +728,8 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
     close_price = float(latest["Close"])
     ema20 = float(latest["EMA20"])
     ema50 = float(latest["EMA50"])
+    ema20_slope = ema20 - float(prev["EMA20"])
+    ema50_slope = ema50 - float(prev["EMA50"])
     vwap = float(latest["VWAP"])
     rsi = float(latest["RSI"])
     macd = float(latest["MACD"])
