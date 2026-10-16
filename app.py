@@ -950,11 +950,11 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
             bearish += 1
     else:
         reasons.append("Weak candle body")
-    if distance_to_resistance < 0.5:
+    if bullish > bearish and distance_to_resistance < 0.5:
         bullish -= 2
         reasons.append("Too close to resistance")
 
-    if distance_to_support < 0.5:
+    if bearish > bullish and distance_to_support < 0.5:
         bearish -= 2
         reasons.append("Too close to support")
     if htf_bias == "bullish":
