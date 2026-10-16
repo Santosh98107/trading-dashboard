@@ -866,17 +866,17 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
         bullish += 2
         reasons.append("Resistance breakout")
 
-    if volume_spike and htf_bias == "bullish":
-        bullish += 3
-        reasons.append("High quality breakout")
+        if volume_spike and htf_bias == "bullish":
+            bullish += 3
+            reasons.append("High quality breakout")
 
     if breakdown:
         bearish += 2
         reasons.append("Support breakdown")
 
-    if volume_spike and htf_bias == "bearish":
-        bearish += 3
-        reasons.append("High quality breakdown")
+        if volume_spike and htf_bias == "bearish":
+            bearish += 3
+            reasons.append("High quality breakdown")
     if retest_bull:
         bullish += 3
         reasons.append("Bullish breakout retest confirmed")
