@@ -998,7 +998,7 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
         rr_ratio = 2.0
 
     if not sideways and session_info["valid"]:
-        if bullish >= 7 and rsi > 55 and macd > macd_signal and adx > 20:
+        if bullish >= 8 and rsi > 55 and macd > macd_signal and adx > 20:
             signal_text = "STRONG BUY"
             signal_type = "buy"
             strength = "High"
@@ -1008,7 +1008,7 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
             target2 = close_price + (2 * atr)
             trailing_stop = close_price - (0.5 * atr)
 
-        elif bearish >= 7 and rsi < 45 and macd < macd_signal and adx > 20:
+        elif bearish >= 8 and rsi < 45 and macd < macd_signal and adx > 20:
             signal_text = "STRONG SELL"
             signal_type = "sell"
             strength = "High"
