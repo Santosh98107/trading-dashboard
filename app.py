@@ -1343,6 +1343,8 @@ st.dataframe(
     data[["Close", "High", "Low", "Volume", "VWAP"]].tail(10),
     use_container_width=True
 )
+st.write("Volume Unique Values:")
+st.write(data["Volume"].tail(20).unique())
 mtf_table = pd.DataFrame({
     "Timeframe": ["1m", "3m", "5m", "15m"],
     "Trend": [
