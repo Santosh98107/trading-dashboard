@@ -1315,6 +1315,23 @@ mtf_table = pd.DataFrame({
         get_mtf_signal(ticker, "15m", "30d")
     ]
 })
+bull_count = 0
+bear_count = 0
+
+for sig in mtf_table["Trend"]:
+    if "Bullish" in sig:
+        bull_count += 1
+    elif "Bearish" in sig:
+        bear_count += 1
+
+if bull_count >= 3:
+    mtf_grade = "🔥 Strong Bullish Alignment"
+
+elif bear_count >= 3:
+    mtf_grade = "🔥 Strong Bearish Alignment"
+
+else:
+    mtf_grade = "⚠️ Mixed Timeframes"
 mtf_confirmation = "➖ Neutral"
 
 if analysis["signal_type"] == "buy" and htf_bias == "bullish":
