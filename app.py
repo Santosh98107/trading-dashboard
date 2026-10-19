@@ -605,7 +605,7 @@ def add_indicators(df):
     return df
     
     
-    def get_mtf_signal(ticker, tf, period):
+def get_mtf_signal(ticker, tf, period):
 
     if tf == "1m":
         data = fetch_data(ticker, "1m", "7d")
@@ -644,7 +644,7 @@ def add_indicators(df):
     return "⚪ Neutral"
     
     
-    def get_higher_timeframe(tf):
+def get_higher_timeframe(tf):
     if tf == "1m":
         return "3m", "7d"
 
