@@ -1191,6 +1191,9 @@ if auto_refresh:
 if timeframe == "1m":
     yf_interval = "1m"
     yf_period = "7d"
+elif timeframe == "3m":
+    yf_interval = "1m"
+    yf_period = "7d"
 elif timeframe == "5m":
     yf_interval = "5m"
     yf_period = "30d"
