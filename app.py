@@ -603,6 +603,26 @@ def add_indicators(df):
     )
 
     return df
+def get_mtf_signal(ticker, tf, period):
+    data = fetch_data(ticker, tf, period)
+
+    if data.empty:
+        return "⚪ N/A"
+
+    data = add_indicators(data).dropna()
+
+    if len(data) < 30:
+        return "⚪ N/A"
+
+    latest = data.iloc[-1]
+
+    if latest["EMA20"] > latest["EMA50"]:
+        return "🟢 Bullish"
+
+    elif latest["EMA20"] < latest["EMA50"]:
+        return "🔴 Bearish"
+
+    return "⚪ Neutral"
 def get_higher_timeframe(tf):
     if tf == "1m":
         return "3m", "7d"
