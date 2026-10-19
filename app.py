@@ -604,7 +604,24 @@ def add_indicators(df):
 
     return df
 def get_mtf_signal(ticker, tf, period):
-    data = fetch_data(ticker, tf, period)
+
+    if tf == "1m":
+        data = fetch_data(ticker, "1m", "7d")
+
+    elif tf == "3m":
+        data = fetch_data(ticker, "1m", "7d")
+
+        if not data.empty:
+            data = resample_to_3m(data)
+
+    elif tf == "5m":
+        data = fetch_data(ticker, "5m", "30d")
+
+    elif tf == "15m":
+        data = fetch_data(ticker, "15m", "30d")
+
+    else:
+        return "⚪ N/A"
 
     if data.empty:
         return "⚪ N/A"
@@ -623,7 +640,7 @@ def get_mtf_signal(ticker, tf, period):
         return "🔴 Bearish"
 
     return "⚪ Neutral"
-def get_higher_timeframe(tf):
+    def get_higher_timeframe(tf):
     if tf == "1m":
         return "3m", "7d"
 
