@@ -1074,8 +1074,7 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
     if atr and atr > 0:
         rr_ratio = 2.0
 
-    if not sideways and session_info["valid"]:
-    if not sideways and session_info["valid"]:
+if not sideways and session_info["valid"]:
 
     if (
         bullish >= 8
@@ -1118,6 +1117,14 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
         target1 = close_price + atr
         trailing_stop = close_price - (0.4 * atr)
 
+    elif bearish > bullish and bearish >= 6:
+        signal_text = "SELL BIAS"
+        signal_type = "sell"
+        strength = "Medium"
+        stop_loss = close_price + atr
+        partial_exit = close_price - (0.7 * atr)
+        target1 = close_price - atr
+        trailing_stop = close_price + (0.4 * atr)
     elif bearish > bullish and bearish >= 6:
         signal_text = "SELL BIAS"
         signal_type = "sell"
