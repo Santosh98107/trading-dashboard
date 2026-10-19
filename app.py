@@ -1331,6 +1331,18 @@ analysis = analyze_signal(
     timeframe_label=timeframe,
     backtest_win_rate=backtest_win_rate
 )
+# VWAP Debug
+latest = data.iloc[-1]
+
+st.subheader("VWAP Debug")
+
+st.write("Close Price:", round(float(latest["Close"]), 2))
+st.write("VWAP:", round(float(latest["VWAP"]), 2))
+
+st.dataframe(
+    data[["Close", "High", "Low", "Volume", "VWAP"]].tail(10),
+    use_container_width=True
+)
 mtf_table = pd.DataFrame({
     "Timeframe": ["1m", "3m", "5m", "15m"],
     "Trend": [
