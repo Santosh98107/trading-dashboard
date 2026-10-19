@@ -1432,6 +1432,8 @@ if telegram_enabled and telegram_bot_token and telegram_chat_id:
                 f.write(current_signal_key)
 
 st.subheader("🚨 Live Signal Analytics")
+st.subheader("📊 Multi Timeframe Alignment")
+st.dataframe(mtf_table, use_container_width=True)
 st.subheader("🕯 Candlestick Patterns")
 
 if patterns:
