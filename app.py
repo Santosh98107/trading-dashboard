@@ -626,12 +626,14 @@ def get_mtf_signal(ticker, tf, period):
         return "⚪ N/A"
 
     if data.empty:
-        return "⚪ N/A"
+        return "❌ EMPTY"
+    data = add_indicators(data)
 
-    data = add_indicators(data).dropna()
+    data = data.bfill()
+    data = data.ffill()
 
-    if len(data) < 30:
-        return "⚪ N/A"
+    if len(data) < 5:
+        return f"❌ LEN={len(data)}"
 
     latest = data.iloc[-1]
 
@@ -1073,13 +1075,14 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
         rr_ratio = 2.0
 
     if not sideways and session_info["valid"]:
-        if (
-            bullish >= 8
-            and (bullish - bearish) >= 3
-            and rsi > 55
-            and macd > macd_signal
-            and adx > 25
-        ):
+    if (
+        bullish >= 8
+        and (bullish - bearish) >= 3
+        and rsi > 55
+        and macd > macd_signal
+        and adx > 25
+        and bull_count >= 3
+    ):
             signal_text = "STRONG BUY"
             signal_type = "buy"
             strength = "High"
@@ -1089,13 +1092,14 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
             target2 = close_price + (2 * atr)
             trailing_stop = close_price - (0.5 * atr)
 
-        elif (
-            bearish >= 8
-            and (bearish - bullish) >= 3
-            and rsi < 45
-            and macd < macd_signal
-            and adx > 25
-        ):
+    if (
+        bullish >= 8
+        and (bullish - bearish) >= 3
+        and rsi > 55
+        and macd > macd_signal
+        and adx > 25
+        and bull_count >= 3
+    ):
             signal_text = "STRONG SELL"
             signal_type = "sell"
             strength = "High"
