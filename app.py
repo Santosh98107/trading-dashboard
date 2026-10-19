@@ -1313,7 +1313,9 @@ htf_interval, htf_period = get_higher_timeframe(timeframe)
 htf_data = fetch_data(ticker, htf_interval, htf_period)
 
 if not htf_data.empty:
-    htf_data = add_indicators(htf_data).dropna().copy()
+    htf_data = add_indicators(htf_data)
+    htf_data = htf_data.bfill()
+    htf_data = htf_data.ffill()
     if len(htf_data) > 20:
         htf_latest = htf_data.iloc[-1]
         htf_bias = "bullish" if htf_latest["EMA20"] > htf_latest["EMA50"] else "bearish"
