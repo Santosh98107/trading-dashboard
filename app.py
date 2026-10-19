@@ -1222,7 +1222,10 @@ data = fetch_data(ticker, yf_interval, yf_period)
 if data.empty:
     st.error("No data found")
     st.stop()
-if timeframe == "10m":
+if timeframe == "3m":
+    data = resample_to_3m(data)
+
+elif timeframe == "10m":
     data = resample_to_10m(data)
 
 data = add_indicators(data)
