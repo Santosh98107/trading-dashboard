@@ -1081,6 +1081,7 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
             and rsi > 55
             and macd > macd_signal
             and adx > 25
+            and bull_count >= 3
         ):
             signal_text = "STRONG BUY"
             signal_type = "buy"
