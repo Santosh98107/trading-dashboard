@@ -1224,7 +1224,6 @@ if data.empty:
     st.stop()
 if timeframe == "3m":
     data = resample_to_3m(data)
-
 elif timeframe == "10m":
     data = resample_to_10m(data)
 
