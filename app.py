@@ -1306,6 +1306,15 @@ analysis = analyze_signal(
     timeframe_label=timeframe,
     backtest_win_rate=backtest_win_rate
 )
+mtf_table = pd.DataFrame({
+    "Timeframe": ["1m", "3m", "5m", "15m"],
+    "Trend": [
+        get_mtf_signal(ticker, "1m", "7d"),
+        get_mtf_signal(ticker, "3m", "7d"),
+        get_mtf_signal(ticker, "5m", "30d"),
+        get_mtf_signal(ticker, "15m", "30d")
+    ]
+})
 mtf_confirmation = "➖ Neutral"
 
 if analysis["signal_type"] == "buy" and htf_bias == "bullish":
