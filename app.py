@@ -1075,7 +1075,7 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
         rr_ratio = 2.0
 
     if not sideways and session_info["valid"]:
-if not sideways and session_info["valid"]:
+    if not sideways and session_info["valid"]:
 
     if (
         bullish >= 8
