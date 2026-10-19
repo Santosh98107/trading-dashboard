@@ -603,7 +603,7 @@ def add_indicators(df):
     )
 
     return df
-def get_mtf_signal(ticker, tf, period):
+    def get_mtf_signal(ticker, tf, period):
 
     if tf == "1m":
         data = fetch_data(ticker, "1m", "7d")
