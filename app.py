@@ -301,7 +301,17 @@ def resample_to_10m(df):
         "Close": "last",
         "Volume": "sum"
     }).dropna()
+def resample_to_3m(df):
+    df = df.copy()
+    df.index = pd.to_datetime(df.index)
 
+    return df.resample("3min").agg({
+        "Open": "first",
+        "High": "max",
+        "Low": "min",
+        "Close": "last",
+        "Volume": "sum"
+    }).dropna()
 
 def compute_rsi(series, window=14):
     delta = series.diff()
