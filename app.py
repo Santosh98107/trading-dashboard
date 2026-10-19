@@ -1476,6 +1476,13 @@ if telegram_enabled and telegram_bot_token and telegram_chat_id:
 st.subheader("🚨 Live Signal Analytics")
 st.subheader("📊 Multi Timeframe Alignment")
 st.dataframe(mtf_table, use_container_width=True)
+col1, col2 = st.columns(2)
+
+with col1:
+    st.metric("Bullish TF", bull_count)
+
+with col2:
+    st.metric("Bearish TF", bear_count)
 if "Strong Bullish" in mtf_grade:
     st.success(mtf_grade)
 
