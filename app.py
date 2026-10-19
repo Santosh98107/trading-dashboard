@@ -627,9 +627,12 @@ def get_mtf_signal(ticker, tf, period):
 
     if data.empty:
         return "❌ EMPTY"
-    data = add_indicators(data).dropna()
+    data = add_indicators(data)
 
-    if len(data) < 30:
+    data = data.bfill()
+    data = data.ffill()
+
+    if len(data) < 5:
         return f"❌ LEN={len(data)}"
 
     latest = data.iloc[-1]
