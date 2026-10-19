@@ -595,6 +595,9 @@ def add_indicators(df):
     return df
 def get_higher_timeframe(tf):
     if tf == "1m":
+        return "3m", "7d"
+
+    if tf == "3m":
         return "5m", "30d"
     if tf == "5m":
         return "15m", "30d"
