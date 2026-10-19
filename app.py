@@ -1035,7 +1035,13 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
             target2 = close_price + (2 * atr)
             trailing_stop = close_price - (0.5 * atr)
 
-        elif bearish >= 8 and rsi < 45 and macd < macd_signal and adx > 25:
+        elif (
+            bearish >= 8
+            and (bearish - bullish) >= 3
+            and rsi < 45
+            and macd < macd_signal
+            and adx > 25
+        ):
             signal_text = "STRONG SELL"
             signal_type = "sell"
             strength = "High"
