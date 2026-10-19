@@ -1075,14 +1075,14 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
         rr_ratio = 2.0
 
     if not sideways and session_info["valid"]:
-        if (
-            bullish >= 8
-            and (bullish - bearish) >= 3
-            and rsi > 55
-            and macd > macd_signal
-            and adx > 25
-            and bull_count >= 3
-        ):
+    if (
+        bullish >= 8
+        and (bullish - bearish) >= 3
+        and rsi > 55
+        and macd > macd_signal
+        and adx > 25
+        and bull_count >= 3
+    ):
             signal_text = "STRONG BUY"
             signal_type = "buy"
             strength = "High"
