@@ -1451,6 +1451,14 @@ if telegram_enabled and telegram_bot_token and telegram_chat_id:
 st.subheader("🚨 Live Signal Analytics")
 st.subheader("📊 Multi Timeframe Alignment")
 st.dataframe(mtf_table, use_container_width=True)
+if "Strong Bullish" in mtf_grade:
+    st.success(mtf_grade)
+
+elif "Strong Bearish" in mtf_grade:
+    st.error(mtf_grade)
+
+else:
+    st.warning(mtf_grade)
 st.subheader("🕯 Candlestick Patterns")
 
 if patterns:
