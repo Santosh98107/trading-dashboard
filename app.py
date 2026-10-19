@@ -626,14 +626,12 @@ def get_mtf_signal(ticker, tf, period):
         return "⚪ N/A"
 
     if data.empty:
-        return "❌ EMPTY"
-    data = add_indicators(data)
+        return "⚪ N/A"
 
-    data = data.bfill()
-    data = data.ffill()
+    data = add_indicators(data).dropna()
 
-    if len(data) < 5:
-        return f"❌ LEN={len(data)}"
+    if len(data) < 30:
+        return "⚪ N/A"
 
     latest = data.iloc[-1]
 
@@ -1074,65 +1072,57 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
     if atr and atr > 0:
         rr_ratio = 2.0
 
-if not sideways and session_info["valid"]:
+    if not sideways and session_info["valid"]:
+        if (
+            bullish >= 8
+            and (bullish - bearish) >= 3
+            and rsi > 55
+            and macd > macd_signal
+            and adx > 25
+        ):
+            signal_text = "STRONG BUY"
+            signal_type = "buy"
+            strength = "High"
+            stop_loss = close_price - atr
+            partial_exit = close_price + (0.8 * atr)
+            target1 = close_price + atr
+            target2 = close_price + (2 * atr)
+            trailing_stop = close_price - (0.5 * atr)
 
-    if (
-        bullish >= 8
-        and (bullish - bearish) >= 3
-        and rsi > 55
-        and macd > macd_signal
-        and adx > 25
-    ):
-        signal_text = "STRONG BUY"
-        signal_type = "buy"
-        strength = "High"
-        stop_loss = close_price - atr
-        partial_exit = close_price + (0.8 * atr)
-        target1 = close_price + atr
-        target2 = close_price + (2 * atr)
-        trailing_stop = close_price - (0.5 * atr)
+        elif (
+            bearish >= 8
+            and (bearish - bullish) >= 3
+            and rsi < 45
+            and macd < macd_signal
+            and adx > 25
+        ):
+            signal_text = "STRONG SELL"
+            signal_type = "sell"
+            strength = "High"
+            stop_loss = close_price + atr
+            partial_exit = close_price - (0.8 * atr)
+            target1 = close_price - atr
+            target2 = close_price - (2 * atr)
+            trailing_stop = close_price + (0.5 * atr)
 
-    elif (
-        bearish >= 8
-        and (bearish - bullish) >= 3
-        and rsi < 45
-        and macd < macd_signal
-        and adx > 25
-    ):
-        signal_text = "STRONG SELL"
-        signal_type = "sell"
-        strength = "High"
-        stop_loss = close_price + atr
-        partial_exit = close_price - (0.8 * atr)
-        target1 = close_price - atr
-        target2 = close_price - (2 * atr)
-        trailing_stop = close_price + (0.5 * atr)
+        elif bullish > bearish and bullish >= 6:
+            signal_text = "BUY BIAS"
+            signal_type = "buy"
+            strength = "Medium"
+            stop_loss = close_price - atr
+            partial_exit = close_price + (0.7 * atr)
+            target1 = close_price + atr
+            trailing_stop = close_price - (0.4 * atr)
 
-    elif bullish > bearish and bullish >= 6:
-        signal_text = "BUY BIAS"
-        signal_type = "buy"
-        strength = "Medium"
-        stop_loss = close_price - atr
-        partial_exit = close_price + (0.7 * atr)
-        target1 = close_price + atr
-        trailing_stop = close_price - (0.4 * atr)
+        elif bearish > bullish and bearish >= 6:
+            signal_text = "SELL BIAS"
+            signal_type = "sell"
+            strength = "Medium"
+            stop_loss = close_price + atr
+            partial_exit = close_price - (0.7 * atr)
+            target1 = close_price - atr
+            trailing_stop = close_price + (0.4 * atr)
 
-    elif bearish > bullish and bearish >= 6:
-        signal_text = "SELL BIAS"
-        signal_type = "sell"
-        strength = "Medium"
-        stop_loss = close_price + atr
-        partial_exit = close_price - (0.7 * atr)
-        target1 = close_price - atr
-        trailing_stop = close_price + (0.4 * atr)
-    elif bearish > bullish and bearish >= 6:
-        signal_text = "SELL BIAS"
-        signal_type = "sell"
-        strength = "Medium"
-        stop_loss = close_price + atr
-        partial_exit = close_price - (0.7 * atr)
-        target1 = close_price - atr
-        trailing_stop = close_price + (0.4 * atr)
     confidence = int((max(bullish, bearish) / 15) * 100)
     confidence = min(confidence, 100)
 
@@ -1141,7 +1131,7 @@ if not sideways and session_info["valid"]:
         htf_bias, sideways, rr_ratio, backtest_win_rate
     )
 
-return {
+    return {
         "close_price": close_price,
         "ema20": ema20,
         "ema50": ema50,
