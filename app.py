@@ -603,6 +603,8 @@ def add_indicators(df):
     )
 
     return df
+    
+    
     def get_mtf_signal(ticker, tf, period):
 
     if tf == "1m":
