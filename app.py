@@ -1494,7 +1494,11 @@ elif analysis["signal_type"] == "sell":
     st.error(alert_text)
 else:
     st.warning(alert_text)
+if analysis["signal_type"] == "buy" and bear_count >= 3:
+    st.error("⚠️ BUY signal hai lekin MTF Alignment Bearish hai")
 
+if analysis["signal_type"] == "sell" and bull_count >= 3:
+    st.error("⚠️ SELL signal hai lekin MTF Alignment Bullish hai")
 m1, m2, m3, m4, m5, m6, m7 = st.columns(7)
 
 with m1:
