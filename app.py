@@ -1141,7 +1141,7 @@ if not sideways and session_info["valid"]:
         htf_bias, sideways, rr_ratio, backtest_win_rate
     )
 
-    return {
+return {
         "close_price": close_price,
         "ema20": ema20,
         "ema50": ema50,
