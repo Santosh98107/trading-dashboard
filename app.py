@@ -370,12 +370,21 @@ def add_indicators(df):
     df["EMA20"] = df["Close"].ewm(span=20, adjust=False).mean()
     df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
 
-    vol_cum = df["Volume"].cumsum()
- 
+    tp = (df["High"] + df["Low"] + df["Close"]) / 3
+    
+    df["TradeDate"] = pd.to_datetime(df.index).date
+    
     df["VWAP"] = (
-    (df["Close"] * df["Volume"]).cumsum()
-    / vol_cum.replace(0, 1)
-     )
+        (tp * df["Volume"])
+        .groupby(df["TradeDate"])
+        .cumsum()
+        /
+        df["Volume"]
+        .groupby(df["TradeDate"])
+        .cumsum()
+    )
+    
+    df.drop(columns=["TradeDate"], inplace=True)
  
     df["VWAP"] = df["VWAP"].replace([np.inf, -np.inf], np.nan)
     df["VWAP"] = df["VWAP"].fillna(df["Close"])
