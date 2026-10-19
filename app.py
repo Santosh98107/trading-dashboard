@@ -642,6 +642,8 @@ def add_indicators(df):
         return "🔴 Bearish"
 
     return "⚪ Neutral"
+    
+    
     def get_higher_timeframe(tf):
     if tf == "1m":
         return "3m", "7d"
