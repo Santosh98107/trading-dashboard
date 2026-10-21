@@ -1295,7 +1295,7 @@ if angel_enabled:
 
     if st.button("Test Angel Login"):
 
-        angel = angel_login(
+        angel, session = angel_login(
             angel_api_key,
             angel_client_code,
             angel_pin,
@@ -1305,6 +1305,8 @@ if angel_enabled:
         if angel:
             st.success("✅ Angel One Login Successful")
             st.success("✅ Angel Session Active")
+
+            st.write(session)
 if auto_refresh:
     st_autorefresh(interval=refresh_seconds * 1000, key="ultimate_refresh")
 
