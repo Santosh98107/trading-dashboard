@@ -5,4 +5,6 @@ numpy
 requests
 yfinance
 streamlit-autorefresh
+smartapi-python
+pyotp
 openpyxl
