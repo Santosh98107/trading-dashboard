@@ -1455,7 +1455,55 @@ else:
     yf_period = "1y"
 st.write("Current Data Source:", data_source)
 ticker = stocks[selected]
-data = fetch_data(ticker, yf_interval, yf_period)
+ticker = stocks[selected]
+
+if data_source == "Angel":
+
+    if candles and candles.get("data"):
+
+        data = pd.DataFrame(
+            candles["data"],
+            columns=[
+                "Datetime",
+                "Open",
+                "High",
+                "Low",
+                "Close",
+                "Volume"
+            ]
+        )
+
+        data["Datetime"] = pd.to_datetime(
+            data["Datetime"]
+        )
+
+        data = data.set_index(
+            "Datetime"
+        )
+
+        for col in [
+            "Open",
+            "High",
+            "Low",
+            "Close",
+            "Volume"
+        ]:
+            data[col] = pd.to_numeric(
+                data[col],
+                errors="coerce"
+            )
+
+    else:
+
+        data = pd.DataFrame()
+
+else:
+
+    data = fetch_data(
+        ticker,
+        yf_interval,
+        yf_period
+    )
 st.write("Rows Loaded:", len(data))
 st.write("Data Columns:", list(data.columns))
 st.write("Data Source Selected:", data_source)
