@@ -782,7 +782,7 @@ def angel_login(
         )
 
         if session:
-            return smart_api
+            return smart_api, session
 
         return None
 
@@ -792,7 +792,7 @@ def angel_login(
             f"Angel Login Failed: {e}"
         )
 
-        return None
+        return None, None
 def send_telegram_alert(token, chat_id, message):
     try:
         url = f"https://api.telegram.org/bot{token}/sendMessage"
