@@ -1334,6 +1334,14 @@ if angel_enabled:
             st.success("✅ Angel Session Active")
 
             st.write(session)
+profile = get_angel_profile(
+    angel_api_key,
+    angel_client_code,
+    angel_pin,
+    angel_totp_secret
+)
+
+st.write(profile)            
 if auto_refresh:
     st_autorefresh(interval=refresh_seconds * 1000, key="ultimate_refresh")
 
