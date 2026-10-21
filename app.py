@@ -1400,28 +1400,32 @@ if data_source == "Angel":
         angel_totp_secret,
         selected
     )
-st.subheader("Angel Candle Test")
-st.write(
-    "Angel Token:",
-    ANGEL_TOKENS.get(selected, "3045")
-)
-st.write("Selected Symbol:", selected)
-if candles and candles.get("data"):
+if data_source == "Angel":
 
-    df = pd.DataFrame(
-        candles["data"],
-        columns=[
-            "Datetime",
-            "Open",
-            "High",
-            "Low",
-            "Close",
-            "Volume"
-        ]
+    st.subheader("Angel Candle Test")
+
+    st.write(
+        "Angel Token:",
+        ANGEL_TOKENS.get(selected, "3045")
     )
 
-    st.dataframe(df.tail(10))
-            
+    st.write("Selected Symbol:", selected)
+
+    if candles and candles.get("data"):
+
+        df = pd.DataFrame(
+            candles["data"],
+            columns=[
+                "Datetime",
+                "Open",
+                "High",
+                "Low",
+                "Close",
+                "Volume"
+            ]
+        )
+
+        st.dataframe(df.tail(10))            
 # profile = get_angel_profile(
 #     angel_api_key,
 #     angel_client_code,
