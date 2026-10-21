@@ -1454,7 +1454,7 @@ else:
     yf_interval = "1d"
     yf_period = "1y"
 st.write("Current Data Source:", data_source)
-ticker = stocks[selected]
+
 ticker = stocks[selected]
 
 if data_source == "Angel":
