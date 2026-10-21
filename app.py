@@ -1303,10 +1303,8 @@ if angel_enabled:
         )
 
         if angel:
-
-            st.success(
-                "✅ Angel One Login Successful"
-            )    
+            st.success("✅ Angel One Login Successful")
+            st.success("✅ Angel Session Active")
 if auto_refresh:
     st_autorefresh(interval=refresh_seconds * 1000, key="ultimate_refresh")
 
