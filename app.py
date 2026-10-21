@@ -1352,10 +1352,10 @@ with st.expander("Telegram Alert Settings"):
     telegram_chat_id = st.text_input("Telegram Chat ID")
     auto_send_telegram = st.checkbox("Auto-send on New Signal", value=False)
 with st.expander("Angel One API Settings"):
-search_symbol = st.text_input(
-    "Search Angel Symbol",
-    value="NIFTY"
-)
+    search_symbol = st.text_input(
+        "Search Angel Symbol",
+        value="NIFTY"
+    )
     angel_enabled = st.checkbox("Enable Angel One API", value=False)
 
     angel_api_key = st.text_input("Angel API Key", type="password")
