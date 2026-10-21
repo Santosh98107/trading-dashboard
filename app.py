@@ -1378,7 +1378,21 @@ candles = get_angel_candles(
 )
 
 st.subheader("Angel Candle Test")
+if candles and candles.get("data"):
 
+    df = pd.DataFrame(
+        candles["data"],
+        columns=[
+            "Datetime",
+            "Open",
+            "High",
+            "Low",
+            "Close",
+            "Volume"
+        ]
+    )
+
+    st.dataframe(df.tail(10))
 st.write(candles)            
 profile = get_angel_profile(
     angel_api_key,
