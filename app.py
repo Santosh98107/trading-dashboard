@@ -1347,6 +1347,11 @@ st.title("📈 Elite Trading Dashboard Ultimate")
 st.caption("Journal + Entry/Exit + Paper Trading + Auto Telegram + Option Suggestion + Daily Summary")
 
 selected = st.selectbox("Select Stock / Index", list(stocks.keys()))
+data_source = st.radio(
+    "Data Source",
+    ["Yahoo", "Angel"],
+    horizontal=True
+)
 st.write("Selected Symbol:", selected)
 timeframe = st.selectbox("Select Time Frame", ["1m","3m", "5m", "10m", "15m", "30m", "1h", "1d"])
 auto_refresh = st.checkbox("Enable Auto Refresh", value=True)
