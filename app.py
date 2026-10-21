@@ -844,7 +844,7 @@ def get_angel_candles(
         from_date = to_date - timedelta(days=5)
         params = {
             "exchange": "NSE",
-            "symboltoken": "3045",
+            "symboltoken": ANGEL_TOKENS.get(symbol_name, "3045"),
             "interval": "FIVE_MINUTE",
             "fromdate": from_date.strftime("%Y-%m-%d %H:%M"),
             "todate": to_date.strftime("%Y-%m-%d %H:%M")
@@ -1378,11 +1378,14 @@ candles = get_angel_candles(
     angel_api_key,
     angel_client_code,
     angel_pin,
-    angel_totp_secret
+    angel_totp_secret,
+    selected
 )
-
 st.subheader("Angel Candle Test")
-st.write("Angel Token:", "3045")
+st.write(
+    "Angel Token:",
+    ANGEL_TOKENS.get(selected, "3045")
+)
 st.write("Selected Symbol:", selected)
 if candles and candles.get("data"):
 
