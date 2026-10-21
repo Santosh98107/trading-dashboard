@@ -1379,6 +1379,7 @@ candles = get_angel_candles(
 )
 
 st.subheader("Angel Candle Test")
+st.write("Angel Token:", "3045")
 if candles and candles.get("data"):
 
     df = pd.DataFrame(
