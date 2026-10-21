@@ -824,7 +824,8 @@ def get_angel_candles(
     api_key,
     client_code,
     pin,
-    totp_secret
+    totp_secret,
+    symbol_name
 ):
     try:
 
