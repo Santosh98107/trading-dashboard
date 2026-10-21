@@ -838,19 +838,13 @@ def get_angel_candles(
         if angel is None:
             return None
 
-    from datetime import datetime, timedelta
-    
-    to_date = datetime.now()
-    
-    from_date = to_date - timedelta(days=5)
-    
-    params = {
-        "exchange": "NSE",
-        "symboltoken": "3045",
-        "interval": "FIVE_MINUTE",
-        "fromdate": from_date.strftime("%Y-%m-%d %H:%M"),
-        "todate": to_date.strftime("%Y-%m-%d %H:%M")
-    }
+        params = {
+            "exchange": "NSE",
+            "symboltoken": "3045",
+            "interval": "FIVE_MINUTE",
+            "fromdate": "2026-10-20 09:15",
+            "todate": "2026-10-20 15:30"
+        }
 
         candles = angel.getCandleData(params)
 
