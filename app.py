@@ -759,7 +759,40 @@ def suggest_option_strike(symbol, spot_price, signal_type):
         "text": "No option strike suggestion"
     }
 
+def angel_login(
+    api_key,
+    client_code,
+    pin,
+    totp_secret
+):
+    try:
 
+        smart_api = SmartConnect(
+            api_key=api_key
+        )
+
+        totp = pyotp.TOTP(
+            totp_secret
+        ).now()
+
+        session = smart_api.generateSession(
+            client_code,
+            pin,
+            totp
+        )
+
+        if session:
+            return smart_api
+
+        return None
+
+    except Exception as e:
+
+        st.error(
+            f"Angel Login Failed: {e}"
+        )
+
+        return None
 def send_telegram_alert(token, chat_id, message):
     try:
         url = f"https://api.telegram.org/bot{token}/sendMessage"
