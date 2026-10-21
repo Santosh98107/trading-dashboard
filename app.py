@@ -1336,7 +1336,12 @@ stocks = {
     "ITC": "ITC.NS"
 }
 ANGEL_TOKENS = {
-    "SBIN": "3045"
+    "SBIN": "3045",
+    "RELIANCE": "2885",
+    "INFY": "1594",
+    "TCS": "28973",
+    "NIFTY": "99926000",
+    "BANKNIFTY": "26009"
 }
 st.title("📈 Elite Trading Dashboard Ultimate")
 st.caption("Journal + Entry/Exit + Paper Trading + Auto Telegram + Option Suggestion + Daily Summary")
