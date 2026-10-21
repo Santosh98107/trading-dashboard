@@ -784,7 +784,7 @@ def angel_login(
         if session:
             return smart_api, session
 
-        return None
+        return None, None
 
     except Exception as e:
 
