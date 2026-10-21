@@ -1333,7 +1333,9 @@ stocks = {
     "ICICIBANK": "ICICIBANK.NS",
     "ITC": "ITC.NS"
 }
-
+ANGEL_TOKENS = {
+    "SBIN": "3045"
+}
 st.title("📈 Elite Trading Dashboard Ultimate")
 st.caption("Journal + Entry/Exit + Paper Trading + Auto Telegram + Option Suggestion + Daily Summary")
 
