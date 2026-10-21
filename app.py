@@ -1393,7 +1393,7 @@ if candles and candles.get("data"):
     )
 
     st.dataframe(df.tail(10))
-st.write(candles)            
+            
 profile = get_angel_profile(
     angel_api_key,
     angel_client_code,
