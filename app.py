@@ -793,6 +793,33 @@ def angel_login(
         )
 
         return None, None
+def get_angel_profile(
+    api_key,
+    client_code,
+    pin,
+    totp_secret
+):
+    try:
+
+        angel, session = angel_login(
+            api_key,
+            client_code,
+            pin,
+            totp_secret
+        )
+
+        if angel is None:
+            return None
+
+        profile = angel.getProfile(
+            session["data"]["refreshToken"]
+        )
+
+        return profile
+
+    except Exception as e:
+
+        return str(e)        
 def send_telegram_alert(token, chat_id, message):
     try:
         url = f"https://api.telegram.org/bot{token}/sendMessage"
