@@ -1545,7 +1545,17 @@ if len(data) < 30:
     st.stop()
 
 htf_interval, htf_period = get_higher_timeframe(timeframe)
-htf_data = fetch_data(ticker, htf_interval, htf_period)
+if data_source == "Angel":
+
+    htf_data = data.copy()
+
+else:
+
+    htf_data = fetch_data(
+        ticker,
+        htf_interval,
+        htf_period
+    )
 
 if not htf_data.empty:
     htf_data = add_indicators(htf_data)
