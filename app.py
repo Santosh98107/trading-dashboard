@@ -1249,7 +1249,13 @@ with st.expander("Telegram Alert Settings"):
     telegram_bot_token = st.text_input("Telegram Bot Token", type="password")
     telegram_chat_id = st.text_input("Telegram Chat ID")
     auto_send_telegram = st.checkbox("Auto-send on New Signal", value=False)
+with st.expander("Angel One API Settings"):
+    angel_enabled = st.checkbox("Enable Angel One API", value=False)
 
+    angel_api_key = st.text_input("Angel API Key", type="password")
+    angel_client_code = st.text_input("Angel Client Code")
+    angel_pin = st.text_input("Angel PIN", type="password")
+    angel_totp_secret = st.text_input("Angel TOTP Secret", type="password")
 if auto_refresh:
     st_autorefresh(interval=refresh_seconds * 1000, key="ultimate_refresh")
 
