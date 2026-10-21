@@ -1450,23 +1450,7 @@ else:
     yf_period = "1y"
 
 ticker = stocks[selected]
-if angel_enabled:
-
-    data = fetch_angel_data(
-        angel_api_key,
-        angel_client_code,
-        angel_pin,
-        angel_totp_secret,
-        selected
-    )
-
-else:
-
-    data = fetch_data(
-        ticker,
-        yf_interval,
-        yf_period
-    )
+data = fetch_data(ticker, yf_interval, yf_period)
 
  
 
