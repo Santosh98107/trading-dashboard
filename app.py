@@ -1389,13 +1389,17 @@ if angel_enabled:
             st.success("✅ Angel Session Active")
 
             st.write(session)
-candles = get_angel_candles(
-    angel_api_key,
-    angel_client_code,
-    angel_pin,
-    angel_totp_secret,
-    selected
-)
+candles = None
+
+if data_source == "Angel":
+
+    candles = get_angel_candles(
+        angel_api_key,
+        angel_client_code,
+        angel_pin,
+        angel_totp_secret,
+        selected
+    )
 st.subheader("Angel Candle Test")
 st.write(
     "Angel Token:",
