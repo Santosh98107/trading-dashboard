@@ -66,8 +66,8 @@ def login_panel():
             type="password"
         )
 
-        st.write(repr(username))
-        st.write(repr(password))
+        
+        
 
         if st.sidebar.button("Login"):
 
