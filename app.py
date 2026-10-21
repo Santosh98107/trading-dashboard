@@ -1456,9 +1456,11 @@ else:
 st.write("Current Data Source:", data_source)
 ticker = stocks[selected]
 data = fetch_data(ticker, yf_interval, yf_period)
-
+st.write("Rows Loaded:", len(data))
+st.write("Data Columns:", list(data.columns))
+st.write("Data Source Selected:", data_source)
  
-
+st.dataframe(data.tail())
  
 if data.empty:
     st.error("No data found")
