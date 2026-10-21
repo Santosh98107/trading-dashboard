@@ -819,6 +819,39 @@ def get_angel_profile(
 
     except Exception as e:
 
+        return str(e)
+def get_angel_candles(
+    api_key,
+    client_code,
+    pin,
+    totp_secret
+):
+    try:
+
+        angel, session = angel_login(
+            api_key,
+            client_code,
+            pin,
+            totp_secret
+        )
+
+        if angel is None:
+            return None
+
+        params = {
+            "exchange": "NSE",
+            "symboltoken": "3045",
+            "interval": "FIVE_MINUTE",
+            "fromdate": "2026-10-20 09:15",
+            "todate": "2026-10-20 15:30"
+        }
+
+        candles = angel.getCandleData(params)
+
+        return candles
+
+    except Exception as e:
+
         return str(e)        
 def send_telegram_alert(token, chat_id, message):
     try:
