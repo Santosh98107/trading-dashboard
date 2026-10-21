@@ -7,6 +7,8 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 import yfinance as yf
+from SmartApi import SmartConnect
+import pyotp
 from streamlit_autorefresh import st_autorefresh
 
 st.set_page_config(page_title="Elite Trading Dashboard Ultimate", layout="wide")
