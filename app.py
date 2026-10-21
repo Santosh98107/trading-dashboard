@@ -1453,7 +1453,7 @@ elif timeframe == "1h":
 else:
     yf_interval = "1d"
     yf_period = "1y"
-
+st.write("Current Data Source:", data_source)
 ticker = stocks[selected]
 data = fetch_data(ticker, yf_interval, yf_period)
 
