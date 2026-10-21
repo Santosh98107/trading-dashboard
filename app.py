@@ -1291,6 +1291,22 @@ with st.expander("Angel One API Settings"):
     angel_client_code = st.text_input("Angel Client Code")
     angel_pin = st.text_input("Angel PIN", type="password")
     angel_totp_secret = st.text_input("Angel TOTP Secret", type="password")
+if angel_enabled:
+
+    if st.button("Test Angel Login"):
+
+        angel = angel_login(
+            angel_api_key,
+            angel_client_code,
+            angel_pin,
+            angel_totp_secret
+        )
+
+        if angel:
+
+            st.success(
+                "✅ Angel One Login Successful"
+            )    
 if auto_refresh:
     st_autorefresh(interval=refresh_seconds * 1000, key="ultimate_refresh")
 
