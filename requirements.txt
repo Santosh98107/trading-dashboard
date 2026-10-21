@@ -7,5 +7,5 @@ yfinance
 streamlit-autorefresh
 smartapi-python
 pyotp
-logzero
 openpyxl
+logzero
