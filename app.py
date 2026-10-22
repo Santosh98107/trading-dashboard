@@ -618,18 +618,6 @@ def add_indicators(df):
     
 def get_mtf_signal(ticker, tf, period):
 
-    if data_source == "Angel":
-
-        if "live_angel_data" in st.session_state:
-
-            data = st.session_state["live_angel_data"].copy()
-
-        else:
-
-            return "⚪ N/A"
-
-    else:
-
     if tf == "1m":
         data = fetch_data(ticker, "1m", "7d")
 
