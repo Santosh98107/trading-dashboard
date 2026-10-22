@@ -1400,6 +1400,8 @@ if data_source == "Angel":
         angel_totp_secret,
         selected
     )
+    st.write("Raw Angel Response:")
+    st.write(candles)    
 if data_source == "Angel":
 
     st.subheader("Angel Candle Test")
@@ -1411,7 +1413,7 @@ if data_source == "Angel":
 
     st.write("Selected Symbol:", selected)
 
-    if candles and candles.get("data"):
+    if isinstance(candles, dict) and candles.get("data"):
 
         df = pd.DataFrame(
             candles["data"],
@@ -1467,7 +1469,7 @@ ticker = stocks[selected]
 
 if data_source == "Angel":
 
-    if candles and candles.get("data"):
+    if isinstance(candles, dict) and candles.get("data"):
 
         data = pd.DataFrame(
             candles["data"],
