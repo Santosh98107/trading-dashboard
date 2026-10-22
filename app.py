@@ -668,6 +668,10 @@ def get_mtf_signal(ticker, tf, period):
     )
     data = data.bfill()
     data = data.ffill()
+    st.write(
+        f"MTF {tf} Columns:",
+        list(data.columns)
+    )
     if len(data) < 5:
         return "⚪ N/A"
     st.write(
