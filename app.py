@@ -787,8 +787,11 @@ def angel_login(
         )
 
         if session:
+        
+            st.session_state["angel_api"] = smart_api
+            st.session_state["angel_session"] = session
+        
             return smart_api, session
-
         return None, None
 
     except Exception as e:
