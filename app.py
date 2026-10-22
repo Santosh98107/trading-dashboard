@@ -276,54 +276,7 @@ def fetch_data(ticker, interval, period):
 
     if df.empty:
         return df
-def get_market_intelligence():
 
-    market = {}
-
-    symbols = {
-        "S&P500": "^GSPC",
-        "NASDAQ": "^IXIC",
-        "NIKKEI": "^N225",
-        "HANGSENG": "^HSI",
-        "BRENT": "BZ=F",
-        "USDINR": "INR=X",
-        "INDIAVIX": "^INDIAVIX"
-    }
-
-    for name, symbol in symbols.items():
-
-        try:
-
-            df = yf.download(
-                symbol,
-                period="5d",
-                interval="1d",
-                progress=False
-            )
-
-            if len(df) >= 2:
-
-                last_close = float(df["Close"].iloc[-1])
-                prev_close = float(df["Close"].iloc[-2])
-
-                change_pct = (
-                    (last_close - prev_close)
-                    / prev_close
-                ) * 100
-
-                market[name] = {
-                    "price": round(last_close, 2),
-                    "change": round(change_pct, 2)
-                }
-
-        except Exception:
-
-            market[name] = {
-                "price": 0,
-                "change": 0
-            }
-
-    return market
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
 
