@@ -627,24 +627,26 @@ def get_mtf_signal(ticker, tf, period):
             "MTF Rows:",
             len(data)
         )
-    if data_source != "Angel" and tf == "1m":
-        data = fetch_data(ticker, "1m", "7d")
-
-    elif data_source != "Angel" and tf == "3m":
-        data = fetch_data(ticker, "1m", "7d")
-
-        if not data.empty:
-            data = resample_to_3m(data)
-
-    elif data_source != "Angel" and tf == "5m":
-        data = fetch_data(ticker, "5m", "30d")
-
-    elif data_source != "Angel" and tf == "15m":
-        data = fetch_data(ticker, "15m", "30d")
-
-    else:
-        return "⚪ N/A"
-    if data_source == "Angel":
+    if data_source != "Angel":
+    
+        if tf == "1m":
+            data = fetch_data(ticker, "1m", "7d")
+    
+        elif tf == "3m":
+            data = fetch_data(ticker, "1m", "7d")
+    
+            if not data.empty:
+                data = resample_to_3m(data)
+    
+        elif tf == "5m":
+            data = fetch_data(ticker, "5m", "30d")
+    
+        elif tf == "15m":
+            data = fetch_data(ticker, "15m", "30d")
+    
+        else:
+            return "⚪ N/A"
+        if data_source == "Angel":
 
         if tf == "3m":
             data = resample_to_3m(data)
