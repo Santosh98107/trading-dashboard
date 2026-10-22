@@ -1401,7 +1401,8 @@ if angel_enabled:
 
             st.write(session)
 candles = None
-
+if "last_good_candles" not in st.session_state:
+    st.session_state["last_good_candles"] = None
 if data_source == "Angel":
 
     candles = get_angel_candles(
