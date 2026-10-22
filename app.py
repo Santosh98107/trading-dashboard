@@ -826,8 +826,11 @@ def get_angel_profile(
         return profile
 
     except Exception as e:
-
-        return str(e)
+    
+        return {
+            "status": False,
+            "message": str(e)
+        }
 def get_angel_candles(
     api_key,
     client_code,
