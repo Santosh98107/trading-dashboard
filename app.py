@@ -681,10 +681,10 @@ def get_mtf_signal(ticker, tf, period):
         
     
 
-    st.write(
-        f"MTF {tf} EMA50:",
-        data.iloc[-1]["EMA50"]
-    )
+    
+        
+        
+    
     latest = data.iloc[-1]
 
     if latest["EMA20"] > latest["EMA50"]:
