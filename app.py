@@ -1693,10 +1693,9 @@ st.write(data["Volume"].tail(20).unique())
 st.write("First Row Time :", data.index[0])
 st.write("Last Row Time :", data.index[-1])
 st.session_state["live_angel_data"] = data.copy()
-st.write(
-    "Saved Angel Rows:",
-    len(st.session_state["live_angel_data"])
-)
+
+    
+    
 mtf_table = pd.DataFrame({
     "Timeframe": ["1m", "3m", "5m", "15m"],
     "Trend": [
