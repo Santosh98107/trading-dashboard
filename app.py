@@ -1516,9 +1516,48 @@ if data_source == "Angel":
             )
 
     else:
-
-        data = pd.DataFrame()
-
+    
+        candles = st.session_state["last_good_candles"]
+    
+        if isinstance(candles, dict) and candles.get("data"):
+    
+            data = pd.DataFrame(
+                candles["data"],
+                columns=[
+                    "Datetime",
+                    "Open",
+                    "High",
+                    "Low",
+                    "Close",
+                    "Volume"
+                ]
+            )
+    
+            data["Datetime"] = pd.to_datetime(
+                data["Datetime"]
+            )
+    
+            data = data.set_index("Datetime")
+    
+            for col in [
+                "Open",
+                "High",
+                "Low",
+                "Close",
+                "Volume"
+            ]:
+                data[col] = pd.to_numeric(
+                    data[col],
+                    errors="coerce"
+                )
+    
+            st.warning(
+                "Using last successful Angel data."
+            )
+    
+        else:
+    
+            data = pd.DataFrame()
 else:
 
     data = fetch_data(
