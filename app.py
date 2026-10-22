@@ -875,7 +875,8 @@ def get_angel_candles(
     client_code,
     pin,
     totp_secret,
-    symbol_name
+    symbol_name,
+    interval="FIVE_MINUTE"
 ):
     try:
 
@@ -896,7 +897,7 @@ def get_angel_candles(
         params = {
             "exchange": "NSE",
             "symboltoken": ANGEL_TOKENS.get(symbol_name, "3045"),
-            "interval": "FIVE_MINUTE",
+            "interval": interval,
             "fromdate": from_date.strftime("%Y-%m-%d %H:%M"),
             "todate": to_date.strftime("%Y-%m-%d %H:%M")
         }
