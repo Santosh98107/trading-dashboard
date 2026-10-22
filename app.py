@@ -635,7 +635,20 @@ def get_mtf_signal(ticker, tf, period):
 
     else:
         return "⚪ N/A"
+    if data_source == "Angel":
 
+        if tf == "3m":
+            data = resample_to_3m(data)
+
+        elif tf == "15m":
+
+            data = data.resample("15min").agg({
+                "Open": "first",
+                "High": "max",
+                "Low": "min",
+                "Close": "last",
+                "Volume": "sum"
+            }).dropna()
     if data.empty:
         return "⚪ N/A"
 
