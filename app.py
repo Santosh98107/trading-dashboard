@@ -276,7 +276,7 @@ def fetch_data(ticker, interval, period):
 
     if df.empty:
         return df
-    def get_market_intelligence():
+def get_market_intelligence():
 
     market = {}
 
