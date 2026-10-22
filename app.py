@@ -912,7 +912,7 @@ def get_angel_candles(
         from datetime import timedelta
 
         to_date = datetime.now()
-        from_date = to_date - timedelta(days=5)
+        from_date = to_date - timedelta(days=30)
         # st.write("Using Token:", ANGEL_TOKENS.get(symbol_name, "3045"))
         params = {
             "exchange": "NSE",
