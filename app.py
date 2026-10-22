@@ -623,10 +623,10 @@ def get_mtf_signal(ticker, tf, period):
             return "⚪ N/A"
 
         data = st.session_state["live_angel_data"].copy()
-        st.write(
-            "MTF Rows:",
-            len(data)
-        )
+        
+            
+            
+        
     if data_source != "Angel":
     
         if tf == "1m":
