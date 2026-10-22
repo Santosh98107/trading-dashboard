@@ -623,19 +623,19 @@ def get_mtf_signal(ticker, tf, period):
             return "⚪ N/A"
 
         data = st.session_state["live_angel_data"].copy()
-    if tf == "1m":
+    if data_source != "Angel" and tf == "1m":
         data = fetch_data(ticker, "1m", "7d")
 
-    elif tf == "3m":
+    elif data_source != "Angel" and tf == "3m":
         data = fetch_data(ticker, "1m", "7d")
 
         if not data.empty:
             data = resample_to_3m(data)
 
-    elif tf == "5m":
+    elif data_source != "Angel" and tf == "5m":
         data = fetch_data(ticker, "5m", "30d")
 
-    elif tf == "15m":
+    elif data_source != "Angel" and tf == "15m":
         data = fetch_data(ticker, "15m", "30d")
 
     else:
