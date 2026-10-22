@@ -676,10 +676,10 @@ def get_mtf_signal(ticker, tf, period):
     
     if len(data) < 5:
         return "⚪ N/A"
-    st.write(
-        f"MTF {tf} EMA20:",
-        data.iloc[-1]["EMA20"]
-    )
+    
+        
+        
+    
 
     st.write(
         f"MTF {tf} EMA50:",
