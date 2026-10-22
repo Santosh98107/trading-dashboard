@@ -1408,8 +1408,8 @@ if data_source == "Angel":
         angel_totp_secret,
         selected
     )
-    st.write("Raw Angel Response:")
-    st.write(candles)    
+    
+        
 if data_source == "Angel":
 
     st.subheader("Angel Candle Test")
