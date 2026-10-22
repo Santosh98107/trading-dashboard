@@ -651,18 +651,38 @@ def get_mtf_signal(ticker, tf, period):
         if tf == "3m":
             data = resample_to_3m(data)
 
-        elif tf == "15m":
-
-            data = data.resample("15min").agg({
-                "Open": "first",
-                "High": "max",
-                "Low": "min",
-                "Close": "last",
-                "Volume": "sum"
-            }).dropna()
-    if data.empty:
-        return "⚪ N/A"
-
+    elif tf == "15m":
+    
+        candles_15m = get_angel_candles(
+            angel_api_key,
+            angel_client_code,
+            angel_pin,
+            angel_totp_secret,
+            selected,
+            "FIFTEEN_MINUTE"
+        )
+    
+        if isinstance(candles_15m, dict) and candles_15m.get("data"):
+    
+            data = pd.DataFrame(
+                candles_15m["data"],
+                columns=[
+                    "Datetime",
+                    "Open",
+                    "High",
+                    "Low",
+                    "Close",
+                    "Volume"
+                ]
+            )
+    
+            data["Datetime"] = pd.to_datetime(data["Datetime"])
+    
+            data = data.set_index("Datetime")
+    
+        else:
+    
+            return "⚪ N/A"
     data = add_indicators(data)
     
         
