@@ -766,7 +766,12 @@ def angel_login(
     totp_secret
 ):
     try:
+        if "angel_api" in st.session_state:
 
+            return (
+                st.session_state["angel_api"],
+                st.session_state["angel_session"]
+            )
         smart_api = SmartConnect(
             api_key=api_key
         )
