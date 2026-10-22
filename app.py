@@ -670,7 +670,15 @@ def get_mtf_signal(ticker, tf, period):
     data = data.ffill()
     if len(data) < 5:
         return "⚪ N/A"
+    st.write(
+        f"MTF {tf} EMA20:",
+        data.iloc[-1]["EMA20"]
+    )
 
+    st.write(
+        f"MTF {tf} EMA50:",
+        data.iloc[-1]["EMA50"]
+    )
     latest = data.iloc[-1]
 
     if latest["EMA20"] > latest["EMA50"]:
