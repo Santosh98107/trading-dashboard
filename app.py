@@ -1620,7 +1620,7 @@ if data_source == "Angel":
         st.write(candles)
     
         data = pd.DataFrame()
-else:
+
 
     data = fetch_data(
         ticker,
