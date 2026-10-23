@@ -1324,7 +1324,11 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
         bullish, bearish, adx, volume_spike, breakout, breakdown,
         htf_bias, sideways, rr_ratio, backtest_win_rate
     )
+    if bear_maru:
+        win_chance = max(5, win_chance - 10)
 
+    if bull_maru:
+        win_chance = min(95, win_chance + 10)
     return {
         "close_price": close_price,
         "ema20": ema20,
