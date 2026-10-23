@@ -1579,10 +1579,7 @@ if data_source == "Angel":
     else:
     
         candles = st.session_state["last_good_candles"]
-        st.write(
-            "Last Good Symbol:",
-            st.session_state.get("last_good_symbol")
-        )
+    
         if isinstance(candles, dict) and candles.get("data"):
     
             data = pd.DataFrame(
