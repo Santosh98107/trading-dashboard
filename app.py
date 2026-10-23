@@ -423,15 +423,19 @@ def add_indicators(df):
     df["Breakout"] = df["Close"] > df["PivotHigh"].shift(1)
     df["Breakdown"] = df["Close"] < df["PivotLow"].shift(1)
     df["RetestBull"] = (
-        (df["Close"] > df["PivotHigh"].shift(1))
+        df["Breakout"].shift(1)
         &
         (df["Low"] <= df["PivotHigh"].shift(1))
+        &
+        (df["Close"] > df["PivotHigh"].shift(1))
     )
-
+    
     df["RetestBear"] = (
-        (df["Close"] < df["PivotLow"].shift(1))
+        df["Breakdown"].shift(1)
         &
         (df["High"] >= df["PivotLow"].shift(1))
+        &
+        (df["Close"] < df["PivotLow"].shift(1))
     )
     k, d = compute_stochastic(df)
  
