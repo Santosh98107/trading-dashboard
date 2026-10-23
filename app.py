@@ -923,7 +923,8 @@ def get_angel_candles(
         }
 
         candles = angel.getCandleData(params)
-
+        st.write("Candle Params:", params)
+        st.write("Candle Response:", candles)
         return candles
 
     except Exception as e:
