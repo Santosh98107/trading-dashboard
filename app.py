@@ -922,7 +922,7 @@ def get_angel_candles(
             "fromdate": from_date.strftime("%Y-%m-%d %H:%M"),
             "todate": to_date.strftime("%Y-%m-%d %H:%M")
         }
-        
+        st.write(params)
         candles = angel.getCandleData(params)
         
         
