@@ -1713,6 +1713,7 @@ st.write("Volume Unique Values:")
 st.write(data["Volume"].tail(20).unique())
 st.write("First Row Time :", data.index[0])
 st.write("Last Row Time :", data.index[-1])
+st.write("Today:", datetime.now())
 st.session_state["live_angel_data"] = data.copy()
 
     
