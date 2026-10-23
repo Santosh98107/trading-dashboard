@@ -755,7 +755,11 @@ def session_filter(df, tf):
 def calculate_win_chance(bullish, bearish, adx, volume_spike, breakout, breakdown, htf_bias, sideways, rr_ratio, backtest_win_rate):
     score = 50
     score += (bullish - bearish) * 4
+    if bear_maru:
+        score -= 10
 
+    if bull_maru:
+        score += 10
     if adx > 25:
         score += 8
     elif adx < 18:
@@ -1142,16 +1146,18 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
         bearish += 2
         reasons.append("Gravestone Doji detected")
     if bull_maru:
-        bullish += 2
-        reasons.append("Bullish Marubozu detected")
+        bullish += 4
+        bearish = max(0, bearish - 2)
+        reasons.append("Strong Bullish Marubozu detected")
     
     if shooting_star:
         bearish += 2
         reasons.append("Shooting Star detected")
     
     if bear_maru:
-        bearish += 2
-        reasons.append("Bearish Marubozu detected")    
+        bearish += 4
+        bullish = max(0, bullish - 2)
+        reasons.append("Strong Bearish Marubozu detected")    
     if bool(latest.get("ThreeWhiteSoldiers", False)):
         bullish += 4
         reasons.append("Three White Soldiers detected")
