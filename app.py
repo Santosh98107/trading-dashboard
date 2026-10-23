@@ -720,7 +720,9 @@ def get_mtf_signal(ticker, tf, period):
         
     
     latest = data.iloc[-1]
-
+    st.write(
+        f"TF={tf} | EMA20={round(float(latest['EMA20']),2)} | EMA50={round(float(latest['EMA50']),2)}"
+    )
     if latest["EMA20"] > latest["EMA50"]:
         return "🟢 Bullish"
 
