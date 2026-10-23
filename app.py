@@ -696,7 +696,8 @@ def get_mtf_signal(ticker, tf, period):
             data["Datetime"] = pd.to_datetime(data["Datetime"])
     
             data = data.set_index("Datetime")
-    
+            st.write("15m Data Loaded")
+            st.dataframe(data.tail())
         else:
     
             return "⚪ N/A"
