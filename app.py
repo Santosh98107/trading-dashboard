@@ -922,7 +922,7 @@ def get_angel_candles(
         }
         
         candles = angel.getCandleData(params)
-        st.write("API Response:", candles)
+        
         
         return candles
 
