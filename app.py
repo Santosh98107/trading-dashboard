@@ -908,9 +908,10 @@ def get_angel_candles(
 
         if angel is None:
             return None
-        from datetime import timedelta
+        from datetime import timezone, timedelta
 
-        to_date = datetime.now()
+        ist = timezone(timedelta(hours=5, minutes=30))
+        to_date = datetime.now(ist)
         from_date = to_date - timedelta(days=5)
         st.write("From:", from_date)
         st.write("To:", to_date)
