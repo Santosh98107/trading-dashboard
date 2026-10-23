@@ -1615,12 +1615,10 @@ if data_source == "Angel":
                 "Using last successful Angel data."
             )
     
+        else:
+    
+            data = pd.DataFrame()
 else:
-    st.error("Angel API Response")
-    st.write(candles)
-
-    data = pd.DataFrame()
-    else:
 
     data = fetch_data(
         ticker,
