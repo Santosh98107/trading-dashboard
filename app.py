@@ -677,7 +677,10 @@ def get_mtf_signal(ticker, tf, period):
         )
     
         if isinstance(candles_15m, dict) and candles_15m.get("data"):
-    
+        st.write(
+            "15m Rows:",
+            len(candles_15m["data"])
+        )
             data = pd.DataFrame(
                 candles_15m["data"],
                 columns=[
