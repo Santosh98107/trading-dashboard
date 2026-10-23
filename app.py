@@ -1484,7 +1484,8 @@ if data_source == "Angel":
     )
 
     st.write("Selected Symbol:", selected)
-
+    st.write("Candles Type:", type(candles))
+    st.write("Has Data:", candles.get("data") is not None if isinstance(candles, dict) else False)
     if isinstance(candles, dict) and candles.get("data"):
         st.session_state["last_good_candles"] = candles
         df = pd.DataFrame(
