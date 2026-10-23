@@ -1313,9 +1313,14 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
             target1 = close_price - atr
             trailing_stop = close_price + (0.4 * atr)
 
+    score_gap = abs(bullish - bearish)
+    
     confidence = min(
         100,
-        50 + score_gap * 5
+        max(
+            40,
+            int((max(bullish, bearish) / 15) * 100)
+        )
     )
     win_chance = calculate_win_chance(
         bullish, bearish, adx, volume_spike, breakout, breakdown,
