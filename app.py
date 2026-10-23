@@ -843,7 +843,7 @@ def angel_login(
             pin,
             totp
         )
-        st.write("Session Response:", session)
+        
         if session:
         
             st.session_state["angel_api"] = smart_api
