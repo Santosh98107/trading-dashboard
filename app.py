@@ -920,9 +920,9 @@ def get_angel_candles(
             "fromdate": from_date.strftime("%Y-%m-%d %H:%M"),
             "todate": to_date.strftime("%Y-%m-%d %H:%M")
         }
-
-        candles = angel.getCandleData(params)
         
+        candles = angel.getCandleData(params)
+        st.write("API Response:", candles)
         
         return candles
 
