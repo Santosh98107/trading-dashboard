@@ -1578,7 +1578,8 @@ if data_source == "Angel":
     else:
     
         candles = st.session_state["last_good_candles"]
-    
+        st.write("Fallback Triggered")
+        st.write(candles)
         if isinstance(candles, dict) and candles.get("data"):
     
             data = pd.DataFrame(
