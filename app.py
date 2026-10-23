@@ -1487,7 +1487,6 @@ if data_source == "Angel":
 
     if isinstance(candles, dict) and candles.get("data"):
         st.session_state["last_good_candles"] = candles
-        st.session_state["last_good_symbol"] = selected
         df = pd.DataFrame(
             candles["data"],
             columns=[
