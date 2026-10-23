@@ -1486,7 +1486,11 @@ if data_source == "Angel":
     st.write("Selected Symbol:", selected)
     
     
-    if isinstance(candles, dict) and candles.get("data"):
+    if (
+        isinstance(candles, dict)
+        and candles.get("status") == True
+        and len(candles.get("data", [])) > 0
+    ):
         st.session_state["last_good_candles"] = candles
         df = pd.DataFrame(
             candles["data"],
