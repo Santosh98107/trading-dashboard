@@ -755,11 +755,7 @@ def session_filter(df, tf):
 def calculate_win_chance(bullish, bearish, adx, volume_spike, breakout, breakdown, htf_bias, sideways, rr_ratio, backtest_win_rate):
     score = 50
     score += (bullish - bearish) * 4
-    if bear_maru:
-        score -= 10
-
-    if bull_maru:
-        score += 10
+    
     if adx > 25:
         score += 8
     elif adx < 18:
