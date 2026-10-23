@@ -1613,7 +1613,7 @@ if data_source == "Angel":
                     data[col],
                     errors="coerce"
                 )
-    
+            st.error(f"Fallback Activated. Candles={type(candles)}")
             st.warning(
                 "Using last successful Angel data."
             )
