@@ -977,7 +977,55 @@ def send_telegram_alert(token, chat_id, message):
     except Exception:
         return False
 
+def get_pcr():
 
+    try:
+
+        url = "https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY"
+
+        headers = {
+            "User-Agent": "Mozilla/5.0"
+        }
+
+        session = requests.Session()
+
+        session.get(
+            "https://www.nseindia.com",
+            headers=headers
+        )
+
+        resp = session.get(
+            url,
+            headers=headers,
+            timeout=10
+        )
+
+        data = resp.json()
+
+        total_ce = 0
+        total_pe = 0
+
+        for item in data["records"]["data"]:
+
+            if "CE" in item:
+                total_ce += item["CE"].get(
+                    "openInterest",
+                    0
+                )
+
+            if "PE" in item:
+                total_pe += item["PE"].get(
+                    "openInterest",
+                    0
+                )
+
+        if total_ce == 0:
+            return None
+
+        return round(total_pe / total_ce, 2)
+
+    except:
+        return None
 def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50):
     latest = df.iloc[-1]
     prev = df.iloc[-2]
