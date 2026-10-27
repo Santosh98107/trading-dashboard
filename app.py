@@ -1039,20 +1039,20 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
     else:
         bearish += 1
         reasons.append("Price below EMA20")
-valid_vwap = (
-    data_source != "Angel"
-    or
-    latest["Volume"] > 0
-)
-
-if valid_vwap:
-
-    if close_price > vwap:
-        bullish += 1
-        reasons.append("Price above VWAP")
-    else:
-        bearish += 1
-        reasons.append("Price below VWAP")
+    valid_vwap = (
+        data_source != "Angel"
+        or
+        latest["Volume"] > 0
+    )
+    
+    if valid_vwap:
+    
+        if close_price > vwap:
+            bullish += 1
+            reasons.append("Price above VWAP")
+        else:
+            bearish += 1
+            reasons.append("Price below VWAP")
     if rsi > 60:
         bullish += 1
         reasons.append("RSI bullish strength")
