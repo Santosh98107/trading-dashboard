@@ -1509,6 +1509,7 @@ elif timeframe == "15m":
         angel_pin,
         angel_totp_secret,
         selected
+        angel_interval
     )
     
         
