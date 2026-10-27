@@ -676,7 +676,7 @@ def get_mtf_signal(ticker, tf, period):
                 selected,
                 "FIFTEEN_MINUTE"
             )
-    
+            st.write(candles_15m)
             if isinstance(candles_15m, dict) and candles_15m.get("data"):
                 st.success(
                     f"15M Rows={len(candles_15m['data'])}"
