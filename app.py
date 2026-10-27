@@ -661,46 +661,39 @@ def get_mtf_signal(ticker, tf, period):
         else:
             return "⚪ N/A"
     if data_source == "Angel":
-
+    
         if tf == "3m":
             data = resample_to_3m(data)
-
-    elif tf == "15m":
     
-        candles_15m = get_angel_candles(
-            angel_api_key,
-            angel_client_code,
-            angel_pin,
-            angel_totp_secret,
-            selected,
-            "FIFTEEN_MINUTE"
-        )
+        elif tf == "15m":
     
-        if isinstance(candles_15m, dict) and candles_15m.get("data"):
-            st.write(
-                "15m Rows:",
-                len(candles_15m["data"])
-            )
-            data = pd.DataFrame(
-                candles_15m["data"],
-                columns=[
-                    "Datetime",
-                    "Open",
-                    "High",
-                    "Low",
-                    "Close",
-                    "Volume"
-                ]
+            candles_15m = get_angel_candles(
+                angel_api_key,
+                angel_client_code,
+                angel_pin,
+                angel_totp_secret,
+                selected,
+                "FIFTEEN_MINUTE"
             )
     
-            data["Datetime"] = pd.to_datetime(data["Datetime"])
+            if isinstance(candles_15m, dict) and candles_15m.get("data"):
+                data = pd.DataFrame(
+                    candles_15m["data"],
+                    columns=[
+                        "Datetime",
+                        "Open",
+                        "High",
+                        "Low",
+                        "Close",
+                        "Volume"
+                    ]
+                )
     
-            data = data.set_index("Datetime")
-            st.write("15m Data Loaded")
-            st.dataframe(data.tail())
-        else:
+                data["Datetime"] = pd.to_datetime(data["Datetime"])
+                data = data.set_index("Datetime")
     
-            return "⚪ N/A"
+            else:
+                return "⚪ N/A"
     data = add_indicators(data)
     
         
