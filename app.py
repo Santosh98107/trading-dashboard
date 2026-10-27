@@ -1839,7 +1839,13 @@ latest = data.iloc[-1]
 st.subheader("VWAP Debug")
 
 st.write("Close Price:", round(float(latest["Close"]), 2))
-st.write("VWAP:", round(float(latest["VWAP"]), 2))
+if pd.notna(latest["VWAP"]):
+    st.write(
+        "VWAP:",
+        round(float(latest["VWAP"]), 2)
+    )
+else:
+    st.write("VWAP: N/A")
 st.write("Latest Volume =", latest["Volume"])
 st.dataframe(
     data[["Close", "High", "Low", "Volume", "VWAP"]].tail(10),
