@@ -1046,11 +1046,7 @@ if data_source != "Angel" or latest["Volume"] > 0:
     else:
         bearish += 1
         reasons.append("Price below VWAP")
-        bullish += 1
-        reasons.append("Price above VWAP")
-    else:
-        bearish += 1
-        reasons.append("Price below VWAP")
+
 
     if rsi > 60:
         bullish += 1
