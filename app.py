@@ -389,7 +389,9 @@ def add_indicators(df):
     df.drop(columns=["TradeDate"], inplace=True)
  
     df["VWAP"] = df["VWAP"].replace([np.inf, -np.inf], np.nan)
-    df["VWAP"] = df["VWAP"].fillna(df["Close"])
+    
+    if df["Volume"].sum() <= 0:
+        df["VWAP"] = np.nan
     
 
     df["RSI"] = compute_rsi(df["Close"], 14)
