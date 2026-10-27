@@ -1721,6 +1721,7 @@ if len(data) < 30:
 htf_interval, htf_period = get_higher_timeframe(timeframe)
 if data_source == "Angel":
     st.error("ENTERED ANGEL HTF BLOCK")
+    st.error(f"htf_interval=[{htf_interval}]")
     if htf_interval == "3m":
 
         htf_data = resample_to_3m(
