@@ -1715,7 +1715,7 @@ if data_source == "Angel":
         htf_data = st.session_state["live_angel_data"].copy()
 
     elif htf_interval == "5m":
-
+        st.error("REAL 5M FETCH EXECUTED")
         candles_htf = get_angel_candles(
             angel_api_key,
             angel_client_code,
