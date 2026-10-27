@@ -940,7 +940,8 @@ def get_angel_candles(
         }
         st.write(params)
         candles = angel.getCandleData(params)
-        
+        st.write("RAW ANGEL DATA")
+        st.write(candles)
         
         return candles
 
