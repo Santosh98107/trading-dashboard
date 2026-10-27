@@ -1714,7 +1714,7 @@ if data_source == "Angel":
 
         htf_data = st.session_state["live_angel_data"].copy()
 
-    elif htf_interval == "15m":
+    elif htf_interval == "5m":
 
         candles_htf = get_angel_candles(
             angel_api_key,
