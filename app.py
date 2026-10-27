@@ -1704,10 +1704,67 @@ if len(data) < 30:
 htf_interval, htf_period = get_higher_timeframe(timeframe)
 if data_source == "Angel":
 
-    htf_data = data.copy()
-    st.error(
-        f"Angel HTF Running | Main TF={timeframe} | HTF TF={htf_interval}"
-    )
+    if htf_interval == "3m":
+
+        htf_data = resample_to_3m(
+            st.session_state["live_angel_data"].copy()
+        )
+
+    elif htf_interval == "5m":
+
+        htf_data = st.session_state["live_angel_data"].copy()
+
+    elif htf_interval == "15m":
+
+        candles_htf = get_angel_candles(
+            angel_api_key,
+            angel_client_code,
+            angel_pin,
+            angel_totp_secret,
+            selected,
+            "FIFTEEN_MINUTE"
+        )
+
+        if isinstance(candles_htf, dict) and candles_htf.get("data"):
+
+            htf_data = pd.DataFrame(
+                candles_htf["data"],
+                columns=[
+                    "Datetime",
+                    "Open",
+                    "High",
+                    "Low",
+                    "Close",
+                    "Volume"
+                ]
+            )
+
+            htf_data["Datetime"] = pd.to_datetime(
+                htf_data["Datetime"]
+            )
+
+            htf_data = htf_data.set_index(
+                "Datetime"
+            )
+
+            for col in [
+                "Open",
+                "High",
+                "Low",
+                "Close",
+                "Volume"
+            ]:
+                htf_data[col] = pd.to_numeric(
+                    htf_data[col],
+                    errors="coerce"
+                )
+
+        else:
+            htf_data = pd.DataFrame()
+
+    else:
+        htf_data = data.copy()
+
 else:
 
     htf_data = fetch_data(
