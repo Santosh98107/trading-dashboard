@@ -1705,9 +1705,6 @@ htf_interval, htf_period = get_higher_timeframe(timeframe)
 if data_source == "Angel":
 
     htf_data = data.copy()
-st.write(
-    f"Current TF={timeframe} | HTF={htf_interval}"
-)    
     st.error(
         f"Angel HTF Running | Main TF={timeframe} | HTF TF={htf_interval}"
     )
