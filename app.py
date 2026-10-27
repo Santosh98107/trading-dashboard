@@ -1074,7 +1074,21 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
     bullish = 0
     bearish = 0
     reasons = []
+    pcr = get_pcr()
 
+    if pcr is not None:
+    
+        if pcr > 1.2:
+            bullish += 1
+            reasons.append(
+                f"PCR Bullish ({pcr})"
+            )
+    
+        elif pcr < 0.8:
+            bearish += 1
+            reasons.append(
+                f"PCR Bearish ({pcr})"
+            )
     if ema20 > ema50:
         bullish += 1
         reasons.append("EMA20 > EMA50 bullish trend")
