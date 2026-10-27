@@ -1841,7 +1841,7 @@ st.subheader("VWAP Debug")
 
 st.write("Close Price:", round(float(latest["Close"]), 2))
 st.write("VWAP:", round(float(latest["VWAP"]), 2))
-
+st.write("Latest Volume =", latest["Volume"])
 st.dataframe(
     data[["Close", "High", "Low", "Volume", "VWAP"]].tail(10),
     use_container_width=True
