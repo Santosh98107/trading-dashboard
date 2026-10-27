@@ -1779,6 +1779,14 @@ st.write("Main Data Rows :", len(data))
 
 if not htf_data.empty:
     st.write("HTF Data Rows :", len(htf_data))
+
+st.write("Main First Time :", data.index[0])
+st.write("Main Last Time :", data.index[-1])
+
+if not htf_data.empty:
+    st.write("HTF First Time :", htf_data.index[0])
+    st.write("HTF Last Time :", htf_data.index[-1])
+
 if not htf_data.empty:
     htf_data = add_indicators(htf_data)
     htf_data = htf_data.bfill()
