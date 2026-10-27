@@ -1493,7 +1493,7 @@ candles = None
 if "last_good_candles" not in st.session_state:
     st.session_state["last_good_candles"] = None
 if data_source == "Angel":
-angel_interval = "FIVE_MINUTE"
+    angel_interval = "FIVE_MINUTE"
 
 if timeframe == "1m":
     angel_interval = "ONE_MINUTE"
