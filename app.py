@@ -1793,13 +1793,13 @@ else:
 
 
 
-if not htf_data.empty:
+
     
 
 
 
 
-if not htf_data.empty:
+
    
   
 
