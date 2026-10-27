@@ -667,7 +667,7 @@ def get_mtf_signal(ticker, tf, period):
             data = resample_to_3m(data)
     
         elif tf == "15m":
-            st.error("15M MTF CALLED")
+            
             candles_15m = get_angel_candles(
                 angel_api_key,
                 angel_client_code,
@@ -676,7 +676,7 @@ def get_mtf_signal(ticker, tf, period):
                 selected,
                 "FIFTEEN_MINUTE"
             )
-            st.write(candles_15m)
+           
             if isinstance(candles_15m, dict) and candles_15m.get("data"):
                 st.success(
                     f"15M Rows={len(candles_15m['data'])}"
