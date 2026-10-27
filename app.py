@@ -1705,7 +1705,9 @@ htf_interval, htf_period = get_higher_timeframe(timeframe)
 if data_source == "Angel":
 
     htf_data = data.copy()
-
+st.error(
+    f"Angel HTF Running | Main TF={timeframe} | HTF TF={htf_interval}"
+)
 else:
 
     htf_data = fetch_data(
