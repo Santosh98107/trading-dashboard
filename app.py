@@ -1511,7 +1511,7 @@ elif timeframe == "15m":
         selected
         angel_interval
     )
-st.error(f"Angel Interval Used = {angel_interval}")    
+    st.error(f"Angel Interval Used = {angel_interval}")    
         
 if data_source == "Angel":
 
