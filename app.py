@@ -1713,7 +1713,10 @@ else:
         htf_interval,
         htf_period
     )
+st.write("Main Data Rows :", len(data))
 
+if not htf_data.empty:
+    st.write("HTF Data Rows :", len(htf_data))
 if not htf_data.empty:
     htf_data = add_indicators(htf_data)
     htf_data = htf_data.bfill()
