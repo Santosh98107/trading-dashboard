@@ -661,7 +661,7 @@ def get_mtf_signal(ticker, tf, period):
         else:
             return "⚪ N/A"
     if data_source == "Angel":
-    
+        st.error(f"HTF Interval Raw = [{htf_interval}]")
         if tf == "3m":
             data = resample_to_3m(data)
     
