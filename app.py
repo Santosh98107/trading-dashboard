@@ -659,6 +659,7 @@ def get_mtf_signal(ticker, tf, period):
             data = fetch_data(ticker, "15m", "30d")
     
         else:
+            st.error("15M FETCH FAILED")
             return "⚪ N/A"
     if data_source == "Angel":
         st.error(f"HTF Interval Raw = [{htf_interval}]")
