@@ -1508,7 +1508,7 @@ elif timeframe == "15m":
         angel_client_code,
         angel_pin,
         angel_totp_secret,
-        selected
+        selected,
         angel_interval
     )
     st.error(f"Angel Interval Used = {angel_interval}")    
