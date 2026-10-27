@@ -1881,6 +1881,7 @@ analysis = analyze_signal(
     timeframe_label=timeframe,
     backtest_win_rate=backtest_win_rate
 )
+pcr = get_pcr()
 # VWAP Debug
 latest = data.iloc[-1]
 
