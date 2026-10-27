@@ -1720,7 +1720,7 @@ if len(data) < 30:
 
 htf_interval, htf_period = get_higher_timeframe(timeframe)
 if data_source == "Angel":
-
+    st.error("ENTERED ANGEL HTF BLOCK")
     if htf_interval == "3m":
 
         htf_data = resample_to_3m(
@@ -1732,7 +1732,7 @@ if data_source == "Angel":
         htf_data = st.session_state["live_angel_data"].copy()
 
     elif htf_interval == "5m":
-        st.error("HTF 5M BRANCH HIT")
+        st.error("ENTERED 5M BRANCH")
         candles_htf = get_angel_candles(
             angel_api_key,
             angel_client_code,
