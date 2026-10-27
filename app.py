@@ -1728,9 +1728,9 @@ if data_source == "Angel":
             st.session_state["live_angel_data"].copy()
         )
 
-    elif htf_interval == "5m":
+   
 
-        htf_data = st.session_state["live_angel_data"].copy()
+      
 
     elif htf_interval == "5m":
         st.error("ENTERED 5M BRANCH")
