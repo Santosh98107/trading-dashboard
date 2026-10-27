@@ -1720,8 +1720,8 @@ if len(data) < 30:
 
 htf_interval, htf_period = get_higher_timeframe(timeframe)
 if data_source == "Angel":
-    st.error("ENTERED ANGEL HTF BLOCK")
-    st.error(f"htf_interval=[{htf_interval}]")
+    
+   
     if htf_interval == "3m":
 
         htf_data = resample_to_3m(
@@ -1733,7 +1733,7 @@ if data_source == "Angel":
       
 
     elif htf_interval == "5m":
-        st.error("ENTERED 5M BRANCH")
+        
         candles_htf = get_angel_candles(
             angel_api_key,
             angel_client_code,
@@ -1790,18 +1790,18 @@ else:
         htf_interval,
         htf_period
     )
-st.error("SANTOSH TEST 123")
-st.write("Main Data Rows :", len(data))
+
+
 
 if not htf_data.empty:
-    st.write("HTF Data Rows :", len(htf_data))
+    
 
-st.write("Main First Time :", data.index[0])
-st.write("Main Last Time :", data.index[-1])
+
+
 
 if not htf_data.empty:
-    st.write("HTF First Time :", htf_data.index[0])
-    st.write("HTF Last Time :", htf_data.index[-1])
+   
+  
 
 if not htf_data.empty:
     htf_data = add_indicators(htf_data)
