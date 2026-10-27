@@ -1772,9 +1772,7 @@ else:
         htf_interval,
         htf_period
     )
-st.write(
-    f"Current TF={timeframe} | HTF={htf_interval}"
-)
+st.error("SANTOSH TEST 123")
 st.write("Main Data Rows :", len(data))
 
 if not htf_data.empty:
