@@ -1797,10 +1797,15 @@ if data_source == "Angel":
    
     if htf_interval == "3m":
 
-        htf_data = resample_to_3m(
-            st.session_state["live_angel_data"].copy()
-        )
+if "live_angel_data" in st.session_state:
 
+    htf_data = resample_to_3m(
+        st.session_state["live_angel_data"].copy()
+    )
+
+else:
+
+    htf_data = data.copy()
    
 
       
