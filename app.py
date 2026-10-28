@@ -1897,6 +1897,8 @@ analysis = analyze_signal(
     backtest_win_rate=backtest_win_rate
 )
 pcr = get_pcr()
+
+st.write("PCR Debug =", pcr)
 # VWAP Debug
 latest = data.iloc[-1]
 
