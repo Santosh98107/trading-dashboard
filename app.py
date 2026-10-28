@@ -1463,7 +1463,7 @@ def simple_backtest(df):
     
     
     
-    st.write("Backtest DF Rows =", len(df))
+    
     for i in range(30, len(df) - 10):
         sub = df.iloc[:i + 1]
         if len(sub) < 30:
@@ -1895,23 +1895,12 @@ else:
     htf_bias = None
 
 wins, losses, total_trades, backtest_win_rate = simple_backtest(data)
-st.write("Backtest Debug")
-st.write("Rows =", len(data))
-st.write("Wins =", wins)
-st.write("Losses =", losses)
-st.write("Total Trades =", total_trades)
-st.write("Win Rate =", backtest_win_rate)
 analysis = analyze_signal(
     data,
     htf_bias=htf_bias,
     timeframe_label=timeframe,
     backtest_win_rate=backtest_win_rate
 )
-if i % 50 == 0:
-    st.write(
-        "Signal:",
-        analysis["signal_type"]
-    )
 pcr = get_pcr()
 
 st.write("PCR Debug =", pcr)
