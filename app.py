@@ -940,7 +940,7 @@ def get_angel_candles(
             "fromdate": from_date.strftime("%Y-%m-%d %H:%M"),
             "todate": to_date.strftime("%Y-%m-%d %H:%M")
         }
-        st.write(params)
+        
         candles = angel.getCandleData(params)
         
         
@@ -1766,8 +1766,7 @@ else:
         yf_interval,
         yf_period
     )
-st.write("Rows Loaded:", len(data))
-st.write("Data Columns:", list(data.columns))
+
 st.write("Data Source Selected:", data_source)
  
 st.dataframe(data.tail())
@@ -1913,11 +1912,11 @@ analysis = analyze_signal(
 )
 pcr = get_pcr()
 
-st.write("PCR Debug =", pcr)
+
 # VWAP Debug
 latest = data.iloc[-1]
 
-st.subheader("VWAP Debug")
+
 
 st.write("Close Price:", round(float(latest["Close"]), 2))
 if pd.notna(latest["VWAP"]):
@@ -1932,7 +1931,7 @@ st.dataframe(
     data[["Close", "High", "Low", "Volume", "VWAP"]].tail(10),
     use_container_width=True
 )
-st.write("Volume Unique Values:")
+
 st.write(data["Volume"].tail(20).unique())
 st.write("First Row Time :", data.index[0])
 st.write("Last Row Time :", data.index[-1])
