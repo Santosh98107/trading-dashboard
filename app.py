@@ -2132,6 +2132,13 @@ with m6:
     st.metric("Bearish Score", analysis["bearish_score"])
 with m7:
     st.metric("Signal Quality", signal_quality)
+
+with m8:
+
+    if pcr is not None:
+        st.metric("PCR", pcr)
+    else:
+        st.metric("PCR", "N/A")
 if pcr is not None:
     st.metric("PCR", pcr)
 a1, a2, a3, a4, a5,a6 = st.columns(6)
