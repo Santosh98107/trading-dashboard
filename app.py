@@ -940,7 +940,7 @@ def get_angel_candles(
             "fromdate": from_date.strftime("%Y-%m-%d %H:%M"),
             "todate": to_date.strftime("%Y-%m-%d %H:%M")
         }
-        
+        st.write(params)
         candles = angel.getCandleData(params)
         
         
@@ -1001,7 +1001,7 @@ def get_pcr():
         )
 
         data = resp.json()
-        
+        st.write("PCR Status Code =", resp.status_code)
         total_ce = 0
         total_pe = 0
 
@@ -1024,10 +1024,13 @@ def get_pcr():
 
         return round(total_pe / total_ce, 2)
 
-     except:
-        return None
+    except Exception as e:
+    
+        st.error(
+            f"PCR Error = {e}"
+        )
 
-   
+    return None
 def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50):
     latest = df.iloc[-1]
     prev = df.iloc[-2]
@@ -1456,18 +1459,8 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
 
 def simple_backtest(df):
     results = []
-    df = df.copy()
-
-    required_cols = [
-        "EMA20",
-        "EMA50",
-        "RSI",
-        "MACD",
-        "SignalLine",
-        "ATR"
-    ]
+    df = df.copy().dropna()
     
-    df = df.dropna(subset=required_cols)    
     
     
     
@@ -1763,7 +1756,8 @@ else:
         yf_interval,
         yf_period
     )
-
+st.write("Rows Loaded:", len(data))
+st.write("Data Columns:", list(data.columns))
 st.write("Data Source Selected:", data_source)
  
 st.dataframe(data.tail())
@@ -1909,11 +1903,11 @@ analysis = analyze_signal(
 )
 pcr = get_pcr()
 
-
+st.write("PCR Debug =", pcr)
 # VWAP Debug
 latest = data.iloc[-1]
 
-
+st.subheader("VWAP Debug")
 
 st.write("Close Price:", round(float(latest["Close"]), 2))
 if pd.notna(latest["VWAP"]):
@@ -1928,7 +1922,7 @@ st.dataframe(
     data[["Close", "High", "Low", "Volume", "VWAP"]].tail(10),
     use_container_width=True
 )
-
+st.write("Volume Unique Values:")
 st.write(data["Volume"].tail(20).unique())
 st.write("First Row Time :", data.index[0])
 st.write("Last Row Time :", data.index[-1])
@@ -2150,7 +2144,8 @@ with m8:
         st.metric("PCR", pcr)
     else:
         st.metric("PCR", "N/A")
-
+if pcr is not None:
+    st.metric("PCR", pcr)
 a1, a2, a3, a4, a5,a6 = st.columns(6)
 
 with a1:
