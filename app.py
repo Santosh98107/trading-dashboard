@@ -1794,21 +1794,21 @@ if len(data) < 30:
 htf_interval, htf_period = get_higher_timeframe(timeframe)
 if data_source == "Angel":
     
-   
-if htf_interval == "3m":
-    if "live_angel_data" in st.session_state:
-        htf_data = resample_to_3m(
-            st.session_state["live_angel_data"].copy()
-        )
-else:
-
-    htf_data = data.copy()
-   
-
-      
-
+       
+    if htf_interval == "3m":
+    
+        if "live_angel_data" in st.session_state:
+    
+            htf_data = resample_to_3m(
+                st.session_state["live_angel_data"].copy()
+            )
+    
+        else:
+    
+            htf_data = data.copy()
+    
     elif htf_interval == "5m":
-        
+    
         candles_htf = get_angel_candles(
             angel_api_key,
             angel_client_code,
@@ -1817,7 +1817,6 @@ else:
             selected,
             "FIFTEEN_MINUTE"
         )
-
         if isinstance(candles_htf, dict) and candles_htf.get("data"):
 
             htf_data = pd.DataFrame(
