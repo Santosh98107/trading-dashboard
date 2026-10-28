@@ -1024,11 +1024,11 @@ def get_pcr():
 
         return round(total_pe / total_ce, 2)
 
-except Exception as e:
-
-    st.error(
-        f"PCR Error = {e}"
-    )
+    except Exception as e:
+    
+        st.error(
+            f"PCR Error = {e}"
+        )
 
     return None
 def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50):
