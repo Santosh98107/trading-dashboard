@@ -664,7 +664,7 @@ def get_mtf_signal(ticker, tf, period):
             st.error("15M FETCH FAILED")
             return "⚪ N/A"
     if data_source == "Angel":
-        st.error(f"HTF Interval Raw = [{htf_interval}]")
+        
         if tf == "3m":
             data = resample_to_3m(data)
     
@@ -930,8 +930,8 @@ def get_angel_candles(
         ist = timezone(timedelta(hours=5, minutes=30))
         to_date = datetime.now(ist)
         from_date = to_date - timedelta(days=5)
-        st.write("From:", from_date)
-        st.write("To:", to_date)
+        
+        
         # st.write("Using Token:", ANGEL_TOKENS.get(symbol_name, "3045"))
         params = {
             "exchange": "NSE",
