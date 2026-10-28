@@ -999,7 +999,12 @@ def get_pcr():
             headers=headers,
             timeout=10
         )
+        st.write("PCR Status =", resp.status_code)
 
+        st.write(
+            "PCR Response First 200 Chars =",
+            resp.text[:200]
+        )
         data = resp.json()
         st.write("PCR Status Code =", resp.status_code)
         total_ce = 0
