@@ -2105,7 +2105,7 @@ if analysis["signal_type"] == "buy" and bear_count >= 3:
 
 if analysis["signal_type"] == "sell" and bull_count >= 3:
     st.error("⚠️ SELL signal hai lekin MTF Alignment Bullish hai")
-m1, m2, m3, m4, m5, m6, m7 = st.columns(7)
+m1, m2, m3, m4, m5, m6, m7, m8 = st.columns(8)
 
 with m1:
     st.metric("Current Price", round(analysis["close_price"], 2))
