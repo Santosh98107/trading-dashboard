@@ -1001,7 +1001,7 @@ def get_pcr():
         )
 
         data = resp.json()
-
+        st.write("PCR Status Code =", resp.status_code)
         total_ce = 0
         total_pe = 0
 
