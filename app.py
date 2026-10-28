@@ -1024,8 +1024,8 @@ def get_pcr():
 
         return round(total_pe / total_ce, 2)
 
-         except:
-            return None
+     except:
+        return None
 
    
 def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50):
