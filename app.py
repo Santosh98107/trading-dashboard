@@ -2153,8 +2153,7 @@ with m8:
         st.metric("PCR", pcr)
     else:
         st.metric("PCR", "N/A")
-if pcr is not None:
-    st.metric("PCR", pcr)
+
 a1, a2, a3, a4, a5,a6 = st.columns(6)
 
 with a1:
