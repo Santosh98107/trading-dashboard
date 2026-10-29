@@ -1487,7 +1487,7 @@ def simple_backtest(df):
             backtest_win_rate=50
         )
         
-        if analysis["signal_type"] != "neutral":
+    
             
                 
                 
@@ -1499,8 +1499,8 @@ def simple_backtest(df):
 
         future_high = float(future["High"].max())
         future_low = float(future["Low"].min())
-        if analysis["signal_type"] in ["buy", "sell"]:
-            pass
+        
+            
             
                 
                 
