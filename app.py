@@ -1509,9 +1509,17 @@ def simple_backtest(df):
         if analysis["signal_type"] == "buy" and analysis["stop_loss"] and analysis["target1"]:
             if future_high >= analysis["target1"]:
                 results.append(1)
+            
             elif future_low <= analysis["stop_loss"]:
                 results.append(0)
-
+            
+            else:
+                exit_price = float(future["Close"].iloc[-1])
+            
+                if exit_price > analysis["close_price"]:
+                    results.append(1)
+                else:
+                    results.append(0)
         elif analysis["signal_type"] == "sell" and analysis["stop_loss"] and analysis["target1"]:
             if future_low <= analysis["target1"]:
                 results.append(1)
