@@ -1499,7 +1499,13 @@ def simple_backtest(df):
 
         future_high = float(future["High"].max())
         future_low = float(future["Low"].min())
-
+        if analysis["signal_type"] in ["buy", "sell"]:
+            st.write(
+                "Target =", round(float(analysis["target1"]), 2),
+                "SL =", round(float(analysis["stop_loss"]), 2),
+                "FH =", round(future_high, 2),
+                "FL =", round(future_low, 2)
+            )
         if analysis["signal_type"] == "buy" and analysis["stop_loss"] and analysis["target1"]:
             if future_high >= analysis["target1"]:
                 results.append(1)
