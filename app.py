@@ -942,8 +942,7 @@ def get_angel_candles(
         }
         st.write(params)
         candles = angel.getCandleData(params)
-        st.write("Angel Raw Response:")
-        st.write(candles)
+        
         
         
         return candles
@@ -1455,22 +1454,7 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
 
 def simple_backtest(df):
     results = []
-    df = df.copy()
-
-    required_cols = [
-        "Open",
-        "High",
-        "Low",
-        "Close",
-        "EMA20",
-        "EMA50",
-        "RSI",
-        "MACD",
-        "SignalLine",
-        "ATR"
-    ]
-
-    df = df.dropna(subset=required_cols)
+    df = df.copy().dropna()
     
     
     
@@ -1480,18 +1464,7 @@ def simple_backtest(df):
         if len(sub) < 30:
             continue
 
-        analysis = analyze_signal(
-            sub,
-            htf_bias=None,
-            timeframe_label="1d",
-            backtest_win_rate=50
-        )
-        
-    
-            
-                
-                
-            
+        analysis = analyze_signal(sub, htf_bias=None, timeframe_label="1d", backtest_win_rate=50)
         future = df.iloc[i + 1:i + 10]
 
         if future.empty:
@@ -1499,28 +1472,13 @@ def simple_backtest(df):
 
         future_high = float(future["High"].max())
         future_low = float(future["Low"].min())
-        
-            
-            
-                
-                
-                
-                
-            
+
         if analysis["signal_type"] == "buy" and analysis["stop_loss"] and analysis["target1"]:
             if future_high >= analysis["target1"]:
                 results.append(1)
-            
             elif future_low <= analysis["stop_loss"]:
                 results.append(0)
-            
-            else:
-                exit_price = float(future["Close"].iloc[-1])
-            
-                if exit_price > analysis["close_price"]:
-                    results.append(1)
-                else:
-                    results.append(0)
+
         elif analysis["signal_type"] == "sell" and analysis["stop_loss"] and analysis["target1"]:
             if future_low <= analysis["target1"]:
                 results.append(1)
