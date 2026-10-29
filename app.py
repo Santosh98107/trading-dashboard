@@ -1470,7 +1470,7 @@ def simple_backtest(df):
         "ATR"
     ]
 
-df = df.dropna(subset=required_cols)
+    df = df.dropna(subset=required_cols)
     
     
     
