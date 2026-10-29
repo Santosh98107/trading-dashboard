@@ -21,7 +21,7 @@ except Exception:
     SMART_WS_AVAILABLE = False
 
 
-st.set_page_config(page_title="Elite Trading Dashboard Ultimate V4", layout="wide")
+st.set_page_config(page_title="Elite Trading Dashboard Ultimate V5", layout="wide")
 
 JOURNAL_FILE = "trade_journal.csv"
 SIGNAL_STATE_FILE = "last_signal_state.txt"
@@ -1565,6 +1565,39 @@ def fetch_market_snapshot(symbol_map):
     return pd.DataFrame(rows)
 
 
+def get_intraday_trend_label(df):
+    if df.empty or len(df) < 20:
+        return "----"
+
+    df = add_indicators(df).bfill().ffill()
+    if df.empty:
+        return "----"
+
+    latest = df.iloc[-1]
+
+    if latest["EMA20"] > latest["EMA50"]:
+        return "BULLISH"
+    elif latest["EMA20"] < latest["EMA50"]:
+        return "BEARISH"
+    return "NEUTRAL"
+
+
+def safe_fetch_intraday_trend(ticker, minutes="1m"):
+    try:
+        df = fetch_data(ticker, "1m", "7d")
+        if df.empty:
+            return "----"
+
+        if minutes == "2m":
+            df = resample_ohlcv(df, "2min")
+        elif minutes == "3m":
+            df = resample_ohlcv(df, "3min")
+
+        return get_intraday_trend_label(df)
+    except Exception:
+        return "----"
+
+
 @st.cache_data(ttl=300)
 def fetch_fno_style_scanner(symbol_map):
     rows = []
@@ -1599,11 +1632,18 @@ def fetch_fno_style_scanner(symbol_map):
                         change_str = f"{change_pct:+.2f}%"
                         direction = "BULLISH" if change_pct >= 0 else "BEARISH"
 
+            trend_1m = safe_fetch_intraday_trend(ticker, "1m")
+            trend_2m = safe_fetch_intraday_trend(ticker, "2m")
+            trend_3m = safe_fetch_intraday_trend(ticker, "3m")
+
             rows.append({
                 "S.NO": sno,
                 "STOCKS": name,
                 "CMP": cmp_value,
                 "% Change": change_str,
+                "1m": trend_1m,
+                "2m": trend_2m,
+                "3m": trend_3m,
                 "Direction": direction
             })
             sno += 1
@@ -1614,11 +1654,61 @@ def fetch_fno_style_scanner(symbol_map):
                 "STOCKS": name,
                 "CMP": "----",
                 "% Change": "----",
+                "1m": "----",
+                "2m": "----",
+                "3m": "----",
                 "Direction": "----"
             })
             sno += 1
 
-    return pd.DataFrame(rows, columns=["S.NO", "STOCKS", "CMP", "% Change", "Direction"])
+    return pd.DataFrame(rows, columns=[
+        "S.NO", "STOCKS", "CMP", "% Change", "1m", "2m", "3m", "Direction"
+    ])
+
+
+def summarize_fno_bias(fno_df):
+    valid = fno_df[fno_df["Direction"].isin(["BULLISH", "BEARISH"])].copy()
+
+    if valid.empty:
+        return {
+            "overall_bias": "N/A",
+            "bullish_pct": 0,
+            "bearish_pct": 0,
+            "strongest_gainer": "N/A",
+            "strongest_loser": "N/A"
+        }
+
+    bullish_count = (valid["Direction"] == "BULLISH").sum()
+    bearish_count = (valid["Direction"] == "BEARISH").sum()
+    total = len(valid)
+
+    bullish_pct = round((bullish_count / total) * 100)
+    bearish_pct = round((bearish_count / total) * 100)
+
+    overall_bias = "BULLISH" if bullish_count >= bearish_count else "BEARISH"
+
+    valid["ChangeNum"] = valid["% Change"].astype(str).str.replace("%", "", regex=False)
+    valid["ChangeNum"] = pd.to_numeric(valid["ChangeNum"], errors="coerce")
+
+    gainers = valid.dropna(subset=["ChangeNum"]).sort_values("ChangeNum", ascending=False)
+    losers = valid.dropna(subset=["ChangeNum"]).sort_values("ChangeNum", ascending=True)
+
+    strongest_gainer = "N/A"
+    strongest_loser = "N/A"
+
+    if not gainers.empty:
+        strongest_gainer = f"{gainers.iloc[0]['STOCKS']} ({gainers.iloc[0]['% Change']})"
+
+    if not losers.empty:
+        strongest_loser = f"{losers.iloc[0]['STOCKS']} ({losers.iloc[0]['% Change']})"
+
+    return {
+        "overall_bias": overall_bias,
+        "bullish_pct": bullish_pct,
+        "bearish_pct": bearish_pct,
+        "strongest_gainer": strongest_gainer,
+        "strongest_loser": strongest_loser
+    }
 
 
 # ----------------------------
@@ -1761,7 +1851,7 @@ major_stocks = {
     "POWER GRID": "POWERGRID.NS"
 }
 
-st.title("📈 Elite Trading Dashboard Ultimate V4")
+st.title("📈 Elite Trading Dashboard Ultimate V5")
 st.caption("Journal + Paper Trading + Alerts + MTF + Backtest + Global/India Market Snapshot + Angel Ready")
 
 debug_mode = st.sidebar.checkbox("Debug Mode", value=False)
@@ -2093,11 +2183,49 @@ with a5:
 with a6:
     st.metric("MTF Status", mtf_confirmation)
 
-st.subheader("📘 Backtest Trade Log")
-if not backtest_trades_df.empty:
-    st.dataframe(backtest_trades_df, use_container_width=True)
+with st.expander("📘 Backtest Trade Log", expanded=False):
+    if not backtest_trades_df.empty:
+        st.dataframe(backtest_trades_df, use_container_width=True)
+    else:
+        st.info("No backtest trades found for current symbol/timeframe.")
+
+st.subheader("📋 F&O Style Stocks Table")
+st.caption("Yahoo Mode shows underlying spot % change, not futures % change. For genuine futures % change, a valid Angel One futures contract/quote is required.")
+
+fno_scanner_df = fetch_fno_style_scanner(major_stocks)
+
+if not fno_scanner_df.empty:
+    def highlight_trend(val):
+        if val == "BULLISH":
+            return "background-color: #163d1a; color: #7CFC00; font-weight: bold;"
+        elif val == "BEARISH":
+            return "background-color: #4a1515; color: #ff6b6b; font-weight: bold;"
+        elif val == "NEUTRAL":
+            return "background-color: #3a3a3a; color: #f2c94c; font-weight: bold;"
+        return ""
+
+    styled_fno_df = (
+        fno_scanner_df.style
+        .map(highlight_trend, subset=["1m", "2m", "3m", "Direction"])
+    )
+
+    st.dataframe(styled_fno_df, use_container_width=True, hide_index=True)
+
+    fno_summary = summarize_fno_bias(fno_scanner_df)
+
+    st.markdown(
+        f"""
+**Overall Bias:** {fno_summary['overall_bias']}
+
+**Bullish = {fno_summary['bullish_pct']}%**  
+**Bearish = {fno_summary['bearish_pct']}%**
+
+**Strongest Gainer :** {fno_summary['strongest_gainer']}  
+**Strongest Loser  :** {fno_summary['strongest_loser']}
+"""
+    )
 else:
-    st.info("No backtest trades found for current symbol/timeframe.")
+    st.info("F&O style scanner data unavailable.")
 
 st.subheader("🎯 Option CALL/PUT Suggestion")
 if option_suggestion["type"] == "CALL":
@@ -2137,24 +2265,6 @@ if not india_df.empty:
     st.dataframe(india_df, use_container_width=True)
 else:
     st.info("Indian market data unavailable.")
-
-st.subheader("📋 F&O Style Stocks Table")
-st.caption("Yahoo Mode shows underlying spot % change, not futures % change. For genuine futures % change, a valid Angel One futures contract/quote is required.")
-
-fno_scanner_df = fetch_fno_style_scanner(major_stocks)
-
-if not fno_scanner_df.empty:
-    def highlight_direction(val):
-        if val == "BULLISH":
-            return "background-color: #163d1a; color: #7CFC00; font-weight: bold;"
-        elif val == "BEARISH":
-            return "background-color: #4a1515; color: #ff6b6b; font-weight: bold;"
-        return ""
-
-    styled_fno_df = fno_scanner_df.style.map(highlight_direction, subset=["Direction"])
-    st.dataframe(styled_fno_df, use_container_width=True, hide_index=True)
-else:
-    st.info("F&O style scanner data unavailable.")
 
 st.subheader("💼 Paper Trading")
 paper_state = load_paper_state()
