@@ -1455,7 +1455,22 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
 
 def simple_backtest(df):
     results = []
-    df = df.copy().dropna()
+    df = df.copy()
+
+    required_cols = [
+        "Open",
+        "High",
+        "Low",
+        "Close",
+        "EMA20",
+        "EMA50",
+        "RSI",
+        "MACD",
+        "SignalLine",
+        "ATR"
+    ]
+
+df = df.dropna(subset=required_cols)
     
     
     
