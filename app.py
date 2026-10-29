@@ -1,6 +1,7 @@
 import os
 from datetime import datetime, time, timedelta, timezone
 import threading
+import time as pytime
 
 import numpy as np
 import pandas as pd
@@ -21,13 +22,17 @@ except Exception:
     SMART_WS_AVAILABLE = False
 
 
-st.set_page_config(page_title="Elite Trading Dashboard Ultimate V5", layout="wide")
+st.set_page_config(page_title="Elite Trading Dashboard Ultimate V6", layout="wide")
 
 JOURNAL_FILE = "trade_journal.csv"
 SIGNAL_STATE_FILE = "last_signal_state.txt"
 PAPER_STATE_FILE = "paper_trade_state.csv"
 USERS_FILE = "users.csv"
 SESSION_SUMMARY_FILE = "daily_summary.csv"
+RISK_STATE_FILE = "risk_state.csv"
+
+MAX_WS_RETRIES = 5
+WS_RETRY_DELAY_SEC = 5
 
 
 # ----------------------------
@@ -76,6 +81,16 @@ def init_daily_summary():
         ]).to_csv(SESSION_SUMMARY_FILE, index=False)
 
 
+def init_risk_state():
+    if not os.path.exists(RISK_STATE_FILE):
+        pd.DataFrame([{
+            "DailyLossLimit": 2000.0,
+            "MaxTradesPerDay": 5,
+            "RiskPerTradePct": 1.0,
+            "TradingEnabled": True
+        }]).to_csv(RISK_STATE_FILE, index=False)
+
+
 # ----------------------------
 # LOGIN
 # ----------------------------
@@ -109,6 +124,34 @@ def login_panel():
             except Exception as e:
                 st.sidebar.error(f"Login error: {e}")
 
+        with st.sidebar.expander("Reset Password"):
+            reset_user = st.text_input("Username for reset", key="reset_user")
+            old_pass = st.text_input("Old Password", type="password", key="old_pass")
+            new_pass = st.text_input("New Password", type="password", key="new_pass")
+            confirm_pass = st.text_input("Confirm New Password", type="password", key="confirm_pass")
+
+            if st.button("Reset Password"):
+                try:
+                    if not reset_user or not old_pass or not new_pass or not confirm_pass:
+                        st.sidebar.warning("Please fill all password reset fields.")
+                    elif new_pass != confirm_pass:
+                        st.sidebar.error("New password and confirm password do not match.")
+                    else:
+                        users = pd.read_csv(USERS_FILE)
+                        match_idx = users[
+                            (users["username"].astype(str).str.strip() == reset_user.strip()) &
+                            (users["password"].astype(str).str.strip() == old_pass.strip())
+                        ].index
+
+                        if len(match_idx) == 0:
+                            st.sidebar.error("Username / old password invalid.")
+                        else:
+                            users.loc[match_idx[0], "password"] = new_pass.strip()
+                            users.to_csv(USERS_FILE, index=False)
+                            st.sidebar.success("Password reset successful. Please login.")
+                except Exception as e:
+                    st.sidebar.error(f"Password reset error: {e}")
+
         st.stop()
 
     st.sidebar.success(f"Logged in as: {st.session_state.username}")
@@ -137,6 +180,15 @@ def load_paper_state():
 
 def save_paper_state(df):
     df.to_csv(PAPER_STATE_FILE, index=False)
+
+
+def load_risk_state():
+    init_risk_state()
+    return pd.read_csv(RISK_STATE_FILE)
+
+
+def save_risk_state(df):
+    df.to_csv(RISK_STATE_FILE, index=False)
 
 
 def add_trade_to_journal(symbol, timeframe, signal, entry_price, quantity, stop_loss, target1, target2, trailing_stop, notes=""):
@@ -224,6 +276,65 @@ def update_daily_summary():
 
     summary = pd.concat([summary, pd.DataFrame([new_row])], ignore_index=True)
     summary.to_csv(SESSION_SUMMARY_FILE, index=False)
+
+
+def get_today_closed_trades():
+    journal = load_journal()
+    if journal.empty:
+        return pd.DataFrame()
+
+    closed = journal[journal["Status"] == "CLOSED"].copy()
+    if closed.empty:
+        return closed
+
+    closed["DateOnly"] = pd.to_datetime(
+        closed["DateTime"],
+        format="%d-%m-%Y %H:%M:%S",
+        errors="coerce"
+    ).dt.date
+
+    today = datetime.now().date()
+    return closed[closed["DateOnly"] == today].copy()
+
+
+def risk_check_before_trade():
+    risk_state = load_risk_state()
+    journal_today = get_today_closed_trades()
+
+    trading_enabled = bool(risk_state.loc[0, "TradingEnabled"])
+    daily_loss_limit = float(risk_state.loc[0, "DailyLossLimit"])
+    max_trades_per_day = int(risk_state.loc[0, "MaxTradesPerDay"])
+
+    if not trading_enabled:
+        return False, "Trading disabled by Risk Management module."
+
+    realized_pnl_today = pd.to_numeric(journal_today.get("PnL", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()
+    trades_today = len(journal_today)
+
+    if realized_pnl_today <= -abs(daily_loss_limit):
+        return False, f"Daily loss limit hit. Realized PnL today: {round(realized_pnl_today, 2)}"
+
+    if trades_today >= max_trades_per_day:
+        return False, f"Max trades per day reached ({max_trades_per_day})."
+
+    return True, "Risk checks passed."
+
+
+def calculate_position_size(entry_price, stop_loss, paper_balance):
+    risk_state = load_risk_state()
+    risk_pct = float(risk_state.loc[0, "RiskPerTradePct"])
+
+    if entry_price is None or stop_loss is None:
+        return 1
+
+    risk_amount = paper_balance * (risk_pct / 100.0)
+    per_unit_risk = abs(float(entry_price) - float(stop_loss))
+
+    if per_unit_risk <= 0:
+        return 1
+
+    qty = int(risk_amount // per_unit_risk)
+    return max(1, qty)
 
 
 # ----------------------------
@@ -722,9 +833,17 @@ def get_pcr():
 
         session = requests.Session()
         session.get("https://www.nseindia.com", headers=headers, timeout=10)
-        resp = session.get(url, headers=headers, timeout=10)
 
-        if resp.status_code != 200:
+        resp = None
+        for _ in range(3):
+            try:
+                resp = session.get(url, headers=headers, timeout=10)
+                if resp.status_code == 200:
+                    break
+            except Exception:
+                continue
+
+        if resp is None or resp.status_code != 200:
             return None
 
         data = resp.json()
@@ -1421,7 +1540,9 @@ def init_ws_state():
         "ws_error": "",
         "ws_last_tick": None,
         "ws_thread_started": False,
-        "live_price": None
+        "live_price": None,
+        "ws_retries": 0,
+        "ws_should_run": False
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -1463,56 +1584,75 @@ def start_angel_websocket(api_key, client_code, pin, totp_secret, symbol_name):
             st.session_state["ws_error"] = "Feed token not received"
             return
 
+        st.session_state["ws_should_run"] = True
+
         def run_socket():
-            try:
-                sws = SmartWebSocketV2(auth_token, api_key, client_code, feed_token)
-                correlation_id = "elite_dashboard_feed"
-                mode = 1
-                token_list = [{"exchangeType": 1, "tokens": [symbol_token]}]
+            retry_count = 0
 
-                def on_data(wsapp, message):
-                    st.session_state["ws_last_tick"] = message
-                    st.session_state["ws_connected"] = True
-                    try:
-                        ltp = None
-                        if isinstance(message, dict):
-                            ltp = (
-                                message.get("last_traded_price")
-                                or message.get("ltp")
-                                or message.get("lastTradedPrice")
-                            )
-                            if ltp is not None:
-                                try:
-                                    ltp_f = float(ltp)
-                                    st.session_state["live_price"] = ltp_f / 100 if ltp_f > 10000 else ltp_f
-                                except Exception:
-                                    pass
-                    except Exception:
-                        pass
+            while st.session_state.get("ws_should_run", False) and retry_count <= MAX_WS_RETRIES:
+                try:
+                    sws = SmartWebSocketV2(auth_token, api_key, client_code, feed_token)
+                    correlation_id = "elite_dashboard_feed"
+                    mode = 1
+                    token_list = [{"exchangeType": 1, "tokens": [symbol_token]}]
 
-                def on_open(wsapp):
-                    st.session_state["ws_connected"] = True
-                    sws.subscribe(correlation_id, mode, token_list)
+                    def on_data(wsapp, message):
+                        st.session_state["ws_last_tick"] = message
+                        st.session_state["ws_connected"] = True
+                        st.session_state["ws_error"] = ""
+                        st.session_state["ws_retries"] = retry_count
+                        try:
+                            ltp = None
+                            if isinstance(message, dict):
+                                ltp = (
+                                    message.get("last_traded_price")
+                                    or message.get("ltp")
+                                    or message.get("lastTradedPrice")
+                                )
+                                if ltp is not None:
+                                    try:
+                                        ltp_f = float(ltp)
+                                        st.session_state["live_price"] = ltp_f / 100 if ltp_f > 10000 else ltp_f
+                                    except Exception:
+                                        pass
+                        except Exception:
+                            pass
 
-                def on_error(wsapp, error):
-                    st.session_state["ws_error"] = str(error)
+                    def on_open(wsapp):
+                        st.session_state["ws_connected"] = True
+                        st.session_state["ws_error"] = ""
+                        sws.subscribe(correlation_id, mode, token_list)
+
+                    def on_error(wsapp, error):
+                        st.session_state["ws_error"] = f"{error} | retrying..."
+                        st.session_state["ws_connected"] = False
+
+                    def on_close(wsapp):
+                        st.session_state["ws_connected"] = False
+
+                    sws.on_open = on_open
+                    sws.on_data = on_data
+                    sws.on_error = on_error
+                    sws.on_close = on_close
+
+                    st.session_state["ws_running"] = True
+                    sws.connect()
+
+                except Exception as e:
+                    st.session_state["ws_error"] = f"{e} | reconnect attempt {retry_count + 1}/{MAX_WS_RETRIES}"
                     st.session_state["ws_connected"] = False
+                    st.session_state["ws_running"] = False
 
-                def on_close(wsapp):
-                    st.session_state["ws_connected"] = False
+                retry_count += 1
+                st.session_state["ws_retries"] = retry_count
 
-                sws.on_open = on_open
-                sws.on_data = on_data
-                sws.on_error = on_error
-                sws.on_close = on_close
+                if retry_count <= MAX_WS_RETRIES and st.session_state.get("ws_should_run", False):
+                    pytime.sleep(WS_RETRY_DELAY_SEC)
 
-                st.session_state["ws_running"] = True
-                sws.connect()
-
-            except Exception as e:
-                st.session_state["ws_error"] = str(e)
-                st.session_state["ws_connected"] = False
+            if retry_count > MAX_WS_RETRIES:
+                st.session_state["ws_error"] = "Max WebSocket reconnect attempts reached."
                 st.session_state["ws_running"] = False
+                st.session_state["ws_connected"] = False
 
         thread = threading.Thread(target=run_socket, daemon=True)
         thread.start()
@@ -1780,6 +1920,7 @@ login_panel()
 init_journal()
 init_paper_state()
 init_daily_summary()
+init_risk_state()
 init_ws_state()
 
 stocks = {
@@ -1851,7 +1992,7 @@ major_stocks = {
     "POWER GRID": "POWERGRID.NS"
 }
 
-st.title("📈 Elite Trading Dashboard Ultimate V5")
+st.title("📈 Elite Trading Dashboard Ultimate V6")
 st.caption("Journal + Paper Trading + Alerts + MTF + Backtest + Global/India Market Snapshot + Angel Ready")
 
 debug_mode = st.sidebar.checkbox("Debug Mode", value=False)
@@ -1884,6 +2025,13 @@ with st.expander("Angel One API Settings"):
             st.success("✅ Angel One Login Successful")
         else:
             st.error("❌ Angel login failed")
+
+    if st.button("Stop WebSocket"):
+        st.session_state["ws_should_run"] = False
+        st.session_state["ws_connected"] = False
+        st.session_state["ws_running"] = False
+        st.session_state["ws_thread_started"] = False
+        st.warning("WebSocket stop requested.")
 
 if auto_refresh:
     st_autorefresh(interval=refresh_seconds * 1000, key="ultimate_refresh")
@@ -2099,7 +2247,7 @@ if telegram_enabled and telegram_bot_token and telegram_chat_id:
 st.subheader("🚨 Live Signal Analytics")
 
 if data_source == "Angel" and ws_enable:
-    ws_col1, ws_col2, ws_col3 = st.columns(3)
+    ws_col1, ws_col2, ws_col3, ws_col4 = st.columns(4)
     with ws_col1:
         st.metric("WebSocket Status", "Connected" if st.session_state.get("ws_connected") else "Disconnected")
     with ws_col2:
@@ -2107,6 +2255,8 @@ if data_source == "Angel" and ws_enable:
         st.metric("Live Price", round(live_price, 2) if live_price else "-")
     with ws_col3:
         st.metric("WS Available", "Yes" if SMART_WS_AVAILABLE else "No")
+    with ws_col4:
+        st.metric("WS Retries", st.session_state.get("ws_retries", 0))
 
     if st.session_state.get("ws_error"):
         st.warning(f"WebSocket: {st.session_state['ws_error']}")
@@ -2266,6 +2416,70 @@ if not india_df.empty:
 else:
     st.info("Indian market data unavailable.")
 
+st.subheader("🛡 Risk Management Module")
+
+risk_state = load_risk_state()
+today_closed = get_today_closed_trades()
+today_realized_pnl = pd.to_numeric(today_closed.get("PnL", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()
+today_trade_count = len(today_closed)
+
+r1, r2, r3 = st.columns(3)
+with r1:
+    daily_loss_limit = st.number_input(
+        "Daily Loss Limit",
+        min_value=100.0,
+        value=float(risk_state.loc[0, "DailyLossLimit"]),
+        step=100.0
+    )
+with r2:
+    max_trades_per_day = st.number_input(
+        "Max Trades Per Day",
+        min_value=1,
+        value=int(risk_state.loc[0, "MaxTradesPerDay"]),
+        step=1
+    )
+with r3:
+    risk_per_trade_pct = st.number_input(
+        "Risk Per Trade (%)",
+        min_value=0.1,
+        value=float(risk_state.loc[0, "RiskPerTradePct"]),
+        step=0.1
+    )
+
+trading_enabled = st.checkbox(
+    "Enable Trading",
+    value=bool(risk_state.loc[0, "TradingEnabled"])
+)
+
+if st.button("Save Risk Settings"):
+    risk_state.loc[0, "DailyLossLimit"] = daily_loss_limit
+    risk_state.loc[0, "MaxTradesPerDay"] = int(max_trades_per_day)
+    risk_state.loc[0, "RiskPerTradePct"] = float(risk_per_trade_pct)
+    risk_state.loc[0, "TradingEnabled"] = bool(trading_enabled)
+    save_risk_state(risk_state)
+    st.success("Risk settings saved.")
+    st.rerun()
+
+rr1, rr2, rr3 = st.columns(3)
+with rr1:
+    st.metric("Today Closed Trades", today_trade_count)
+with rr2:
+    st.metric("Today Realized PnL", round(today_realized_pnl, 2))
+with rr3:
+    paper_state_for_risk = load_paper_state()
+    suggested_qty = calculate_position_size(
+        analysis["close_price"],
+        analysis["stop_loss"],
+        float(paper_state_for_risk.loc[0, "Balance"])
+    ) if analysis["stop_loss"] is not None else 1
+    st.metric("Suggested Qty", suggested_qty)
+
+risk_ok, risk_msg = risk_check_before_trade()
+if risk_ok:
+    st.success(risk_msg)
+else:
+    st.error(risk_msg)
+
 st.subheader("💼 Paper Trading")
 paper_state = load_paper_state()
 
@@ -2277,25 +2491,38 @@ with p2:
 with p3:
     st.metric("Open Positions", int(paper_state.loc[0, "OpenPositions"]))
 
-paper_qty = st.number_input("Paper Trade Quantity", min_value=1, value=1, step=1)
+paper_qty = st.number_input("Paper Trade Quantity (Manual Override)", min_value=1, value=1, step=1)
 
 if st.button("Take Paper Trade"):
-    if analysis["signal_type"] in ["buy", "sell"]:
-        success = paper_trade_entry(analysis["close_price"], paper_qty)
+    risk_ok, risk_msg = risk_check_before_trade()
+
+    if not risk_ok:
+        st.error(risk_msg)
+
+    elif analysis["signal_type"] in ["buy", "sell"]:
+        final_qty = paper_qty
+        if analysis["stop_loss"] is not None:
+            final_qty = calculate_position_size(
+                analysis["close_price"],
+                analysis["stop_loss"],
+                float(paper_state.loc[0, "Balance"])
+            )
+
+        success = paper_trade_entry(analysis["close_price"], final_qty)
         if success:
             add_trade_to_journal(
                 symbol=selected,
                 timeframe=timeframe,
                 signal=analysis["signal_text"],
                 entry_price=analysis["close_price"],
-                quantity=paper_qty,
+                quantity=final_qty,
                 stop_loss=analysis["stop_loss"],
                 target1=analysis["target1"],
                 target2=analysis["target2"],
                 trailing_stop=analysis["trailing_stop"],
                 notes="Paper Trade"
             )
-            st.success("Paper trade entered and journal updated.")
+            st.success(f"Paper trade entered and journal updated. Qty used: {final_qty}")
             st.rerun()
         else:
             st.error("Insufficient paper balance.")
@@ -2514,4 +2741,5 @@ if debug_mode:
         st.write("WebSocket Available:", SMART_WS_AVAILABLE)
         st.write("WS Connected:", st.session_state.get("ws_connected"))
         st.write("WS Error:", st.session_state.get("ws_error"))
+        st.write("WS Retries:", st.session_state.get("ws_retries"))
         st.write("Last Tick:", st.session_state.get("ws_last_tick"))
