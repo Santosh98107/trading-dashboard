@@ -1121,20 +1121,41 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
     }
 
 
-def simple_backtest(df):
-    results = []
-    df = df.copy().dropna()
+def simple_backtest(df, symbol=""):
+    trades = []
+
+    required_cols = [
+        "Open", "High", "Low", "Close",
+        "EMA20", "EMA50", "VWAP", "RSI",
+        "MACD", "SignalLine", "ATR"
+    ]
+
+    df = df.copy()
+
+    for col in required_cols:
+        if col not in df.columns:
+            empty_df = pd.DataFrame(columns=[
+                "Date", "Time", "Symbol", "Signal", "Entry",
+                "SL", "Target", "Exit", "Result", "PnL"
+            ])
+            return 0, 0, 0, 0.0, empty_df
+
+    df = df.replace([np.inf, -np.inf], np.nan)
+    df = df.dropna(subset=required_cols).copy()
 
     if len(df) < 60:
-        return 0, 0, 0, 0.0
+        empty_df = pd.DataFrame(columns=[
+            "Date", "Time", "Symbol", "Signal", "Entry",
+            "SL", "Target", "Exit", "Result", "PnL"
+        ])
+        return 0, 0, 0, 0.0, empty_df
 
     for i in range(50, len(df) - 10):
-        sub = df.iloc[:i + 1].copy()
-        latest = sub.iloc[-1]
+        latest = df.iloc[i]
+        ts = df.index[i]
 
         buy_signal = (
             latest["EMA20"] > latest["EMA50"] and
-            pd.notna(latest["VWAP"]) and
             latest["Close"] > latest["VWAP"] and
             latest["RSI"] > 55 and
             latest["MACD"] > latest["SignalLine"]
@@ -1142,7 +1163,6 @@ def simple_backtest(df):
 
         sell_signal = (
             latest["EMA20"] < latest["EMA50"] and
-            pd.notna(latest["VWAP"]) and
             latest["Close"] < latest["VWAP"] and
             latest["RSI"] < 45 and
             latest["MACD"] < latest["SignalLine"]
@@ -1152,42 +1172,87 @@ def simple_backtest(df):
         if pd.isna(atr) or atr <= 0:
             continue
 
-        entry = latest["Close"]
-        future = df.iloc[i + 1:i + 10]
+        entry = float(latest["Close"])
+        future = df.iloc[i + 1:i + 11]
+
+        if future.empty:
+            continue
 
         if buy_signal:
-            sl = entry - atr
-            tgt = entry + atr
-            outcome = None
+            signal = "BUY"
+            sl = float(entry - atr)
+            target = float(entry + atr)
+            exit_price = None
+            result = None
+
             for _, row in future.iterrows():
                 if row["Low"] <= sl:
-                    outcome = 0
+                    exit_price = sl
+                    result = "LOSS"
                     break
-                if row["High"] >= tgt:
-                    outcome = 1
+                if row["High"] >= target:
+                    exit_price = target
+                    result = "WIN"
                     break
-            if outcome is not None:
-                results.append(outcome)
+
+            if result is not None:
+                pnl = round(exit_price - entry, 2)
+                trades.append({
+                    "Date": pd.to_datetime(ts).strftime("%d-%m-%Y"),
+                    "Time": pd.to_datetime(ts).strftime("%H:%M:%S"),
+                    "Symbol": symbol,
+                    "Signal": signal,
+                    "Entry": round(entry, 2),
+                    "SL": round(sl, 2),
+                    "Target": round(target, 2),
+                    "Exit": round(exit_price, 2),
+                    "Result": result,
+                    "PnL": pnl
+                })
 
         elif sell_signal:
-            sl = entry + atr
-            tgt = entry - atr
-            outcome = None
+            signal = "SELL"
+            sl = float(entry + atr)
+            target = float(entry - atr)
+            exit_price = None
+            result = None
+
             for _, row in future.iterrows():
                 if row["High"] >= sl:
-                    outcome = 0
+                    exit_price = sl
+                    result = "LOSS"
                     break
-                if row["Low"] <= tgt:
-                    outcome = 1
+                if row["Low"] <= target:
+                    exit_price = target
+                    result = "WIN"
                     break
-            if outcome is not None:
-                results.append(outcome)
 
-    total = len(results)
-    wins = sum(results)
-    losses = total - wins
+            if result is not None:
+                pnl = round(entry - exit_price, 2)
+                trades.append({
+                    "Date": pd.to_datetime(ts).strftime("%d-%m-%Y"),
+                    "Time": pd.to_datetime(ts).strftime("%H:%M:%S"),
+                    "Symbol": symbol,
+                    "Signal": signal,
+                    "Entry": round(entry, 2),
+                    "SL": round(sl, 2),
+                    "Target": round(target, 2),
+                    "Exit": round(exit_price, 2),
+                    "Result": result,
+                    "PnL": pnl
+                })
+
+    trades_df = pd.DataFrame(trades, columns=[
+        "Date", "Time", "Symbol", "Signal", "Entry",
+        "SL", "Target", "Exit", "Result", "PnL"
+    ])
+
+    total = len(trades_df)
+    wins = len(trades_df[trades_df["Result"] == "WIN"])
+    losses = len(trades_df[trades_df["Result"] == "LOSS"])
     win_rate = (wins / total * 100) if total else 0.0
-    return wins, losses, total, round(win_rate, 2)
+
+    return wins, losses, total, round(win_rate, 2), trades_df
 
 
 # ----------------------------
@@ -1696,6 +1761,7 @@ elif timeframe == "10m":
     data = resample_ohlcv(data, "10min")
 
 data = add_indicators(data)
+backtest_data = data.copy()
 data = data.bfill().ffill()
 
 if len(data) < 30:
@@ -1721,7 +1787,7 @@ if not htf_data.empty:
 else:
     htf_bias = None
 
-wins, losses, total_trades, backtest_win_rate = simple_backtest(data)
+wins, losses, total_trades, backtest_win_rate, backtest_trades_df = simple_backtest(backtest_data, symbol=selected)
 
 analysis = analyze_signal(
     data,
@@ -1923,6 +1989,12 @@ with a5:
     st.metric("Backtest Win Rate", f"{backtest_win_rate:.1f}%")
 with a6:
     st.metric("MTF Status", mtf_confirmation)
+
+st.subheader("📘 Backtest Trade Log")
+if not backtest_trades_df.empty:
+    st.dataframe(backtest_trades_df, use_container_width=True)
+else:
+    st.info("No backtest trades found.")
 
 st.subheader("🎯 Option CALL/PUT Suggestion")
 if option_suggestion["type"] == "CALL":
@@ -2164,6 +2236,14 @@ st.download_button(
     mime="text/csv"
 )
 
+backtest_csv = backtest_trades_df.to_csv(index=False).encode("utf-8")
+st.download_button(
+    label="📥 Download Backtest CSV",
+    data=backtest_csv,
+    file_name=f"{selected}_{timeframe}_backtest_trades.csv",
+    mime="text/csv"
+)
+
 if debug_mode:
     st.subheader("🐞 Debug")
     st.write("Data Source:", data_source)
@@ -2175,6 +2255,10 @@ if debug_mode:
     st.dataframe(data.tail(5), use_container_width=True)
     st.write("PCR Debug:", pcr)
     st.write("Angel Token:", ANGEL_TOKENS.get(selected))
+    st.write("Backtest Rows:", len(backtest_data))
+    st.write("Backtest Trades:", len(backtest_trades_df))
+    st.write("Backtest Required Nulls:")
+    st.write(backtest_data[["EMA20", "EMA50", "VWAP", "RSI", "MACD", "SignalLine", "ATR"]].isna().sum())
     if data_source == "Angel":
         st.write("WebSocket Available:", SMART_WS_AVAILABLE)
         st.write("WS Connected:", st.session_state.get("ws_connected"))
