@@ -1,5 +1,6 @@
 import os
-from datetime import datetime, time
+from datetime import datetime, time, timedelta, timezone
+import threading
 
 import numpy as np
 import pandas as pd
@@ -7,9 +8,18 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 import yfinance as yf
-from SmartApi import SmartConnect
 import pyotp
+from SmartApi import SmartConnect
 from streamlit_autorefresh import st_autorefresh
+
+# Optional WebSocket import
+SMART_WS_AVAILABLE = False
+try:
+    from SmartApi.smartWebSocketV2 import SmartWebSocketV2
+    SMART_WS_AVAILABLE = True
+except Exception:
+    SMART_WS_AVAILABLE = False
+
 
 st.set_page_config(page_title="Elite Trading Dashboard Ultimate", layout="wide")
 
@@ -19,87 +29,26 @@ PAPER_STATE_FILE = "paper_trade_state.csv"
 USERS_FILE = "users.csv"
 SESSION_SUMMARY_FILE = "daily_summary.csv"
 
+
+# ----------------------------
+# INIT FILES
+# ----------------------------
 def init_users():
     if not os.path.exists(USERS_FILE):
-
         pd.DataFrame([
-            {
-                "username": "admin",
-                "password": "admin123"
-            }
+            {"username": "admin", "password": "admin123"}
+        ]).to_csv(USERS_FILE, index=False)
+        return
+
+    try:
+        users = pd.read_csv(USERS_FILE)
+        if "username" not in users.columns or "password" not in users.columns:
+            raise ValueError("Invalid users file structure")
+    except Exception:
+        pd.DataFrame([
+            {"username": "admin", "password": "admin123"}
         ]).to_csv(USERS_FILE, index=False)
 
-    else:
-
-        try:
-
-            users = pd.read_csv(USERS_FILE)
-
-            if "username" not in users.columns:
-                raise Exception()
-
-            if "password" not in users.columns:
-                raise Exception()
-
-        except Exception:
-
-            pd.DataFrame([
-                {
-                    "username": "admin",
-                    "password": "admin123"
-                }
-            ]).to_csv(USERS_FILE, index=False)
-
-def login_panel():
-
-    if "logged_in" not in st.session_state:
-        st.session_state.logged_in = False
-
-    if "username" not in st.session_state:
-        st.session_state.username = ""
-
-    if not st.session_state.logged_in:
-
-        st.sidebar.subheader("🔐 Login")
-
-        username = st.sidebar.text_input("Username")
-        password = st.sidebar.text_input(
-            "Password",
-            type="password"
-        )
-
-        
-        
-
-        if st.sidebar.button("Login"):
-
-            if (
-                username.strip() == "admin"
-                and
-                password.strip() == "admin123"
-            ):
-
-                st.session_state.logged_in = True
-                st.session_state.username = username
-
-                st.rerun()
-
-            else:
-
-                st.sidebar.error("Invalid credentials")
-
-        st.stop()
-
-    st.sidebar.success(
-        f"Logged in as: {st.session_state.username}"
-    )
-
-    if st.sidebar.button("Logout"):
-
-        st.session_state.logged_in = False
-        st.session_state.username = ""
-
-        st.rerun()
 
 def init_journal():
     if not os.path.exists(JOURNAL_FILE):
@@ -127,6 +76,51 @@ def init_daily_summary():
         ]).to_csv(SESSION_SUMMARY_FILE, index=False)
 
 
+# ----------------------------
+# LOGIN
+# ----------------------------
+def login_panel():
+    init_users()
+
+    if "logged_in" not in st.session_state:
+        st.session_state.logged_in = False
+
+    if "username" not in st.session_state:
+        st.session_state.username = ""
+
+    if not st.session_state.logged_in:
+        st.sidebar.subheader("🔐 Login")
+        username = st.sidebar.text_input("Username")
+        password = st.sidebar.text_input("Password", type="password")
+
+        if st.sidebar.button("Login"):
+            try:
+                users = pd.read_csv(USERS_FILE)
+                match = users[
+                    (users["username"].astype(str).str.strip() == username.strip()) &
+                    (users["password"].astype(str).str.strip() == password.strip())
+                ]
+                if not match.empty:
+                    st.session_state.logged_in = True
+                    st.session_state.username = username.strip()
+                    st.rerun()
+                else:
+                    st.sidebar.error("Invalid credentials")
+            except Exception as e:
+                st.sidebar.error(f"Login error: {e}")
+
+        st.stop()
+
+    st.sidebar.success(f"Logged in as: {st.session_state.username}")
+    if st.sidebar.button("Logout"):
+        st.session_state.logged_in = False
+        st.session_state.username = ""
+        st.rerun()
+
+
+# ----------------------------
+# FILE HELPERS
+# ----------------------------
 def load_journal():
     init_journal()
     return pd.read_csv(JOURNAL_FILE)
@@ -178,10 +172,10 @@ def close_trade_in_journal(index_id, exit_price):
 
         if "BUY" in signal or "CALL" in signal:
             pnl = (exit_price - entry) * qty
-            pnl_pct = ((exit_price - entry) / entry) * 100
+            pnl_pct = ((exit_price - entry) / entry) * 100 if entry else 0
         else:
             pnl = (entry - exit_price) * qty
-            pnl_pct = ((entry - exit_price) / entry) * 100
+            pnl_pct = ((entry - exit_price) / entry) * 100 if entry else 0
 
         journal.at[index_id, "ExitPrice"] = exit_price
         journal.at[index_id, "Status"] = "CLOSED"
@@ -232,6 +226,9 @@ def update_daily_summary():
     summary.to_csv(SESSION_SUMMARY_FILE, index=False)
 
 
+# ----------------------------
+# PAPER TRADE
+# ----------------------------
 def paper_trade_entry(price, quantity):
     state = load_paper_state()
     bal = float(state.loc[0, "Balance"])
@@ -265,6 +262,10 @@ def paper_trade_exit(entry_price, exit_price, quantity, signal):
     return pnl
 
 
+# ----------------------------
+# MARKET DATA
+# ----------------------------
+@st.cache_data(ttl=60)
 def fetch_data(ticker, interval, period):
     df = yf.download(
         ticker,
@@ -285,57 +286,42 @@ def fetch_data(ticker, interval, period):
     if missing:
         return pd.DataFrame()
 
-    df = df[needed].dropna().copy()
- 
-    df["Volume"] = df["Volume"].fillna(1)
-    df["Volume"] = df["Volume"].replace(0, 1)
- 
+    df = df[needed].copy()
+    df = df.dropna(subset=["Open", "High", "Low", "Close"])
+    df["Volume"] = pd.to_numeric(df["Volume"], errors="coerce").fillna(0)
     return df
 
 
-def resample_to_10m(df):
+def resample_ohlcv(df, rule):
     df = df.copy()
     df.index = pd.to_datetime(df.index)
-    return df.resample("10min").agg({
+    resampled = df.resample(rule).agg({
         "Open": "first",
         "High": "max",
         "Low": "min",
         "Close": "last",
         "Volume": "sum"
     }).dropna()
-def resample_to_3m(df):
-    df = df.copy()
-    df.index = pd.to_datetime(df.index)
+    return resampled
 
-    return df.resample("3min").agg({
-        "Open": "first",
-        "High": "max",
-        "Low": "min",
-        "Close": "last",
-        "Volume": "sum"
-    }).dropna()
 
 def compute_rsi(series, window=14):
     delta = series.diff()
- 
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
- 
+
     avg_gain = gain.rolling(window=window).mean()
-    avg_loss = loss.rolling(window=window).mean()
- 
-    rs = avg_gain / avg_loss.replace(0, np.nan)
- 
+    avg_loss = loss.rolling(window=window).mean().replace(0, np.nan)
+    rs = avg_gain / avg_loss
     rsi = 100 - (100 / (1 + rs))
- 
-    return rsi.fillna(50)
-    
+    return rsi.fillna(50).clip(lower=1, upper=99)
 
 
 def compute_stochastic(df, k_window=14, d_window=3):
     low_min = df["Low"].rolling(k_window).min()
     high_max = df["High"].rolling(k_window).max()
-    k = 100 * ((df["Close"] - low_min) / (high_max - low_min).replace(0, 1e-10))
+    denom = (high_max - low_min).replace(0, 1e-10)
+    k = 100 * ((df["Close"] - low_min) / denom)
     d = k.rolling(d_window).mean()
     return k, d
 
@@ -345,11 +331,11 @@ def compute_adx(df, period=14):
     low = df["Low"]
     close = df["Close"]
 
-    plus_dm = high.diff()
-    minus_dm = -low.diff()
+    plus_dm_raw = high.diff()
+    minus_dm_raw = -low.diff()
 
-    plus_dm = np.where((plus_dm > minus_dm) & (plus_dm > 0), plus_dm, 0.0)
-    minus_dm = np.where((minus_dm > plus_dm) & (minus_dm > 0), minus_dm, 0.0)
+    plus_dm = np.where((plus_dm_raw > minus_dm_raw) & (plus_dm_raw > 0), plus_dm_raw, 0.0)
+    minus_dm = np.where((minus_dm_raw > plus_dm_raw) & (minus_dm_raw > 0), minus_dm_raw, 0.0)
 
     tr1 = high - low
     tr2 = (high - close.shift(1)).abs()
@@ -366,39 +352,33 @@ def compute_adx(df, period=14):
     return adx, plus_di, minus_di
 
 
+def compute_vwap(df):
+    df = df.copy()
+    if df.empty:
+        df["VWAP"] = np.nan
+        return df
+
+    df.index = pd.to_datetime(df.index)
+    df["Volume"] = pd.to_numeric(df["Volume"], errors="coerce").fillna(0)
+    tp = (df["High"] + df["Low"] + df["Close"]) / 3
+    trade_date = pd.Series(df.index.date, index=df.index)
+
+    cum_pv = (tp * df["Volume"]).groupby(trade_date).cumsum()
+    cum_vol = df["Volume"].groupby(trade_date).cumsum().replace(0, np.nan)
+
+    df["VWAP"] = (cum_pv / cum_vol).replace([np.inf, -np.inf], np.nan)
+    return df
+
+
 def add_indicators(df):
     df = df.copy()
 
     df["EMA20"] = df["Close"].ewm(span=20, adjust=False).mean()
     df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
 
-    tp = (df["High"] + df["Low"] + df["Close"]) / 3
-    
-    df["TradeDate"] = pd.to_datetime(df.index).date
-    
-    df["VWAP"] = (
-        (tp * df["Volume"])
-        .groupby(df["TradeDate"])
-        .cumsum()
-        /
-        df["Volume"]
-        .groupby(df["TradeDate"])
-        .cumsum()
-    )
-    
-    df.drop(columns=["TradeDate"], inplace=True)
- 
-    df["VWAP"] = df["VWAP"].replace([np.inf, -np.inf], np.nan)
-    
-    if df["Volume"].sum() <= 0:
-        df["VWAP"] = np.nan
-    
+    df = compute_vwap(df)
 
     df["RSI"] = compute_rsi(df["Close"], 14)
-
-    df["RSI"] = df["RSI"].replace([np.inf, -np.inf], np.nan)
-    df["RSI"] = df["RSI"].fillna(50)
-    df["RSI"] = df["RSI"].clip(lower=1, upper=99)
 
     ema12 = df["Close"].ewm(span=12, adjust=False).mean()
     ema26 = df["Close"].ewm(span=26, adjust=False).mean()
@@ -424,122 +404,93 @@ def add_indicators(df):
     df["PivotLow"] = df["Low"].rolling(20).min()
     df["Breakout"] = df["Close"] > df["PivotHigh"].shift(1)
     df["Breakdown"] = df["Close"] < df["PivotLow"].shift(1)
+
     df["RetestBull"] = (
         df["Breakout"].shift(1)
-        &
-        (df["Low"] <= df["PivotHigh"].shift(1))
-        &
-        (df["Close"] > df["PivotHigh"].shift(1))
+        & (df["Low"] <= df["PivotHigh"].shift(1))
+        & (df["Close"] > df["PivotHigh"].shift(1))
     )
-    
+
     df["RetestBear"] = (
         df["Breakdown"].shift(1)
-        &
-        (df["High"] >= df["PivotLow"].shift(1))
-        &
-        (df["Close"] < df["PivotLow"].shift(1))
+        & (df["High"] >= df["PivotLow"].shift(1))
+        & (df["Close"] < df["PivotLow"].shift(1))
     )
+
     k, d = compute_stochastic(df)
- 
     df["StochK"] = k.rolling(3).mean()
     df["StochD"] = d.rolling(3).mean()
+
     df["ADX"], df["PlusDI"], df["MinusDI"] = compute_adx(df)
 
     candle_body = (df["Close"] - df["Open"]).abs()
     candle_range = (df["High"] - df["Low"]).replace(0, 1e-10)
-    
+
     upper_shadow = df["High"] - df[["Open", "Close"]].max(axis=1)
-    lower_shadow = df[["Open", "Close"]].min(axis=1) - df["Low"]    
+    lower_shadow = df[["Open", "Close"]].min(axis=1) - df["Low"]
+
     df["BullishMarubozu"] = (
-    (df["Close"] > df["Open"])
-    & (upper_shadow < candle_body * 0.1)
-    & (lower_shadow < candle_body * 0.1)
+        (df["Close"] > df["Open"])
+        & (upper_shadow < candle_body * 0.1)
+        & (lower_shadow < candle_body * 0.1)
     )
-    
-        
-        
-    
-    
+
     df["BearishMarubozu"] = (
         (df["Close"] < df["Open"])
         & (upper_shadow < candle_body * 0.1)
         & (lower_shadow < candle_body * 0.1)
     )
+
     df["BullishEngulfing"] = (
-    (df["Close"] > df["Open"])
-    & (df["Close"].shift(1) < df["Open"].shift(1))
-    & (df["Open"] <= df["Close"].shift(1))
-    & (df["Close"] >= df["Open"].shift(1))
+        (df["Close"] > df["Open"])
+        & (df["Close"].shift(1) < df["Open"].shift(1))
+        & (df["Open"] <= df["Close"].shift(1))
+        & (df["Close"] >= df["Open"].shift(1))
     )
 
     df["BearishEngulfing"] = (
-    (df["Close"] < df["Open"])
-    & (df["Close"].shift(1) > df["Open"].shift(1))
-    & (df["Open"] >= df["Close"].shift(1))
-    & (df["Close"] <= df["Open"].shift(1))
+        (df["Close"] < df["Open"])
+        & (df["Close"].shift(1) > df["Open"].shift(1))
+        & (df["Open"] >= df["Close"].shift(1))
+        & (df["Close"] <= df["Open"].shift(1))
     )
+
     df["PiercingPattern"] = (
         (df["Close"].shift(1) < df["Open"].shift(1))
-        &
-        (df["Close"] > df["Open"])
-        &
-        (
-            df["Close"]
-            >
-            (
-                (df["Open"].shift(1) + df["Close"].shift(1))
-                / 2
-            )
-        )
+        & (df["Close"] > df["Open"])
+        & (df["Close"] > ((df["Open"].shift(1) + df["Close"].shift(1)) / 2))
     )
 
     df["DarkCloudCover"] = (
         (df["Close"].shift(1) > df["Open"].shift(1))
-        &
-        (df["Close"] < df["Open"])
-        &
-        (
-            df["Close"]
-            <
-            (
-                (df["Open"].shift(1) + df["Close"].shift(1))
-                / 2
-            )
-        )
-    )
-    df["TweezerBottom"] = (
-        abs(df["Low"] - df["Low"].shift(1))
-        <= (df["ATR"] * 0.1)
-    )
-    # Bullish Harami
-    df["BullishHarami"] = (
-        (df["Close"].shift(1) < df["Open"].shift(1))
-        &
-        (df["Close"] > df["Open"])
-        &
-        (df["Open"] > df["Close"].shift(1))
-        &
-        (df["Close"] < df["Open"].shift(1))
+        & (df["Close"] < df["Open"])
+        & (df["Close"] < ((df["Open"].shift(1) + df["Close"].shift(1)) / 2))
     )
 
-    # Bearish Harami
+    df["TweezerBottom"] = (
+        abs(df["Low"] - df["Low"].shift(1)) <= (df["ATR"] * 0.1)
+    )
+
+    df["BullishHarami"] = (
+        (df["Close"].shift(1) < df["Open"].shift(1))
+        & (df["Close"] > df["Open"])
+        & (df["Open"] > df["Close"].shift(1))
+        & (df["Close"] < df["Open"].shift(1))
+    )
+
     df["BearishHarami"] = (
         (df["Close"].shift(1) > df["Open"].shift(1))
-        &
-        (df["Close"] < df["Open"])
-        &
-        (df["Open"] < df["Close"].shift(1))
-        &
-        (df["Close"] > df["Open"].shift(1))
+        & (df["Close"] < df["Open"])
+        & (df["Open"] < df["Close"].shift(1))
+        & (df["Close"] > df["Open"].shift(1))
     )
+
     df["Doji"] = candle_body <= (candle_range * 0.1)
+
     df["TweezerTop"] = (
-        abs(df["High"] - df["High"].shift(1))
-        <= (df["ATR"] * 0.1)
+        abs(df["High"] - df["High"].shift(1)) <= (df["ATR"] * 0.1)
     )
-    
-    
-    
+
     df["Hammer"] = (
         (lower_shadow > candle_body * 2)
         & (upper_shadow < candle_body)
@@ -571,48 +522,35 @@ def add_indicators(df):
         (candle_body <= candle_range * 0.05)
         & (upper_shadow > candle_body * 3)
     )
+
     df["ThreeWhiteSoldiers"] = (
         (df["Close"] > df["Open"])
-        &
-        (df["Close"].shift(1) > df["Open"].shift(1))
-        &
-        (df["Close"].shift(2) > df["Open"].shift(2))
-        &
-        (df["Close"] > df["Close"].shift(1))
-        &
-        (df["Close"].shift(1) > df["Close"].shift(2))
+        & (df["Close"].shift(1) > df["Open"].shift(1))
+        & (df["Close"].shift(2) > df["Open"].shift(2))
+        & (df["Close"] > df["Close"].shift(1))
+        & (df["Close"].shift(1) > df["Close"].shift(2))
     )
 
     df["ThreeBlackCrows"] = (
         (df["Close"] < df["Open"])
-        &
-        (df["Close"].shift(1) < df["Open"].shift(1))
-        &
-        (df["Close"].shift(2) < df["Open"].shift(2))
-        &
-        (df["Close"] < df["Close"].shift(1))
-        &
-        (df["Close"].shift(1) < df["Close"].shift(2))
-    )
-    # Morning Star
-    df["MorningStar"] = (
-        (df["Close"].shift(2) < df["Open"].shift(2))
-        &
-        (abs(df["Close"].shift(1) - df["Open"].shift(1))
-         < candle_body.shift(1))
-        &
-        (df["Close"] > df["Open"])
+        & (df["Close"].shift(1) < df["Open"].shift(1))
+        & (df["Close"].shift(2) < df["Open"].shift(2))
+        & (df["Close"] < df["Close"].shift(1))
+        & (df["Close"].shift(1) < df["Close"].shift(2))
     )
 
-    # Evening Star
+    df["MorningStar"] = (
+        (df["Close"].shift(2) < df["Open"].shift(2))
+        & (abs(df["Close"].shift(1) - df["Open"].shift(1)) < candle_body.shift(1))
+        & (df["Close"] > df["Open"])
+    )
+
     df["EveningStar"] = (
         (df["Close"].shift(2) > df["Open"].shift(2))
-        &
-        (abs(df["Close"].shift(1) - df["Open"].shift(1))
-         < candle_body.shift(1))
-        &
-        (df["Close"] < df["Open"])
+        & (abs(df["Close"].shift(1) - df["Open"].shift(1)) < candle_body.shift(1))
+        & (df["Close"] < df["Open"])
     )
+
     df["BodyStrength"] = candle_body / candle_range
 
     df["BuyMarker"] = np.where(
@@ -630,113 +568,14 @@ def add_indicators(df):
     )
 
     return df
-    
-    
-def get_mtf_signal(ticker, tf, period):
-    if data_source == "Angel":
 
-        if "live_angel_data" not in st.session_state:
-            return "⚪ N/A"
 
-        data = st.session_state["live_angel_data"].copy()
-        
-            
-            
-        
-    if data_source != "Angel":
-    
-        if tf == "1m":
-            data = fetch_data(ticker, "1m", "7d")
-    
-        elif tf == "3m":
-            data = fetch_data(ticker, "1m", "7d")
-    
-            if not data.empty:
-                data = resample_to_3m(data)
-    
-        elif tf == "5m":
-            data = fetch_data(ticker, "5m", "30d")
-    
-        elif tf == "15m":
-            data = fetch_data(ticker, "15m", "30d")
-    
-        else:
-            st.error("15M FETCH FAILED")
-            return "⚪ N/A"
-    if data_source == "Angel":
-        
-        if tf == "3m":
-            data = resample_to_3m(data)
-    
-        elif tf == "15m":
-            
-            candles_15m = get_angel_candles(
-                angel_api_key,
-                angel_client_code,
-                angel_pin,
-                angel_totp_secret,
-                selected,
-                "FIFTEEN_MINUTE"
-            )
-           
-            if isinstance(candles_15m, dict) and candles_15m.get("data"):
-                st.success(
-                    f"15M Rows={len(candles_15m['data'])}"
-                )
-                data = pd.DataFrame(
-                    candles_15m["data"],
-                    columns=[
-                        "Datetime",
-                        "Open",
-                        "High",
-                        "Low",
-                        "Close",
-                        "Volume"
-                    ]
-                )
-    
-                data["Datetime"] = pd.to_datetime(data["Datetime"])
-                data = data.set_index("Datetime")
-    
-            else:
-                return "⚪ N/A"
-    data = add_indicators(data)
-    
-        
-        
-    
-    data = data.bfill()
-    data = data.ffill()
-    
-        
-        
-    
-    if len(data) < 5:
-        return "⚪ N/A"
-    
-        
-        
-    
-
-    
-        
-        
-    
-    latest = data.iloc[-1]
-
-    if latest["EMA20"] > latest["EMA50"]:
-        return "🟢 Bullish"
-
-    elif latest["EMA20"] < latest["EMA50"]:
-        return "🔴 Bearish"
-
-    return "⚪ Neutral"
-    
-    
+# ----------------------------
+# SIGNAL UTILS
+# ----------------------------
 def get_higher_timeframe(tf):
     if tf == "1m":
         return "3m", "7d"
-
     if tf == "3m":
         return "5m", "30d"
     if tf == "5m":
@@ -746,7 +585,7 @@ def get_higher_timeframe(tf):
     if tf == "15m":
         return "30m", "60d"
     if tf == "30m":
-        return "60m", "90d"
+        return "1h", "90d"
     if tf == "1h":
         return "1d", "1y"
     return "1d", "1y"
@@ -764,6 +603,7 @@ def session_filter(df, tf):
             return {"valid": False, "message": "Avoid first few minutes after market open"}
         if time(12, 15) <= current_t <= time(13, 15):
             return {"valid": False, "message": "Lunch/session low momentum zone"}
+
         return {"valid": True, "message": "Session timing looks okay"}
     except Exception:
         return {"valid": True, "message": "Session filter unavailable"}
@@ -772,7 +612,7 @@ def session_filter(df, tf):
 def calculate_win_chance(bullish, bearish, adx, volume_spike, breakout, breakdown, htf_bias, sideways, rr_ratio, backtest_win_rate):
     score = 50
     score += (bullish - bearish) * 4
-    
+
     if adx > 25:
         score += 8
     elif adx < 18:
@@ -835,197 +675,42 @@ def suggest_option_strike(symbol, spot_price, signal_type):
         "text": "No option strike suggestion"
     }
 
-def angel_login(
-    api_key,
-    client_code,
-    pin,
-    totp_secret
-):
-    try:
-        # if "angel_api" in st.session_state:
-        #     return (
-        #         st.session_state["angel_api"],
-        #         st.session_state["angel_session"]
-        #     )
-        smart_api = SmartConnect(
-            api_key=api_key
-        )
 
-        totp = pyotp.TOTP(
-            totp_secret
-        ).now()
-
-        session = smart_api.generateSession(
-            client_code,
-            pin,
-            totp
-        )
-        
-        if session:
-        
-            st.session_state["angel_api"] = smart_api
-            st.session_state["angel_session"] = session
-        
-            return smart_api, session
-        return None, None
-
-    except Exception as e:
-
-        st.error(
-            f"Angel Login Failed: {e}"
-        )
-
-        return None, None
-def get_angel_profile(
-    api_key,
-    client_code,
-    pin,
-    totp_secret
-):
-    try:
-
-        angel, session = angel_login(
-            api_key,
-            client_code,
-            pin,
-            totp_secret
-        )
-
-        if angel is None:
-            return None
-
-        profile = angel.getProfile(
-            session["data"]["refreshToken"]
-        )
-
-        return profile
-
-    except Exception as e:
-    
-        return {
-            "status": False,
-            "message": str(e)
-        }
-def get_angel_candles(
-    api_key,
-    client_code,
-    pin,
-    totp_secret,
-    symbol_name,
-    interval="FIVE_MINUTE"
-):
-    try:
-
-        angel, session = angel_login(
-            api_key,
-            client_code,
-            pin,
-            totp_secret
-        )
-
-        if angel is None:
-            return None
-        from datetime import timezone, timedelta
-
-        ist = timezone(timedelta(hours=5, minutes=30))
-        to_date = datetime.now(ist)
-        from_date = to_date - timedelta(days=5)
-        
-        
-        # st.write("Using Token:", ANGEL_TOKENS.get(symbol_name, "3045"))
-        params = {
-            "exchange": "NSE",
-            "symboltoken": ANGEL_TOKENS.get(symbol_name, "3045"),
-            "interval": interval,
-            "fromdate": from_date.strftime("%Y-%m-%d %H:%M"),
-            "todate": to_date.strftime("%Y-%m-%d %H:%M")
-        }
-        st.write(params)
-        candles = angel.getCandleData(params)
-        
-        
-        
-        return candles
-
-    except Exception as e:
-
-        return str(e)        
-def send_telegram_alert(token, chat_id, message):
-    try:
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
- 
-        payload = {
-            "chat_id": chat_id,
-            "text": message
-        }
- 
-        response = requests.post(
-            url,
-            data=payload,
-            timeout=10
-        )
- 
-        return response.status_code == 200
- 
-    except Exception:
-        return False
-    try:
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
-        payload = {"chat_id": chat_id, "text": message}
-        response = requests.post(url, data=payload, timeout=10)
-        return response.status_code == 200
-    except Exception:
-        return False
-
+@st.cache_data(ttl=60)
 def get_pcr():
-
     try:
-
         url = "https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY"
-
         headers = {
-            "User-Agent": "Mozilla/5.0"
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "application/json,text/plain,*/*",
+            "Referer": "https://www.nseindia.com/option-chain"
         }
 
         session = requests.Session()
+        session.get("https://www.nseindia.com", headers=headers, timeout=10)
+        resp = session.get(url, headers=headers, timeout=10)
 
-        session.get(
-            "https://www.nseindia.com",
-            headers=headers
-        )
-
-        resp = session.get(
-            url,
-            headers=headers,
-            timeout=10
-        )
+        if resp.status_code != 200:
+            return None
 
         data = resp.json()
-
         total_ce = 0
         total_pe = 0
 
-        for item in data["records"]["data"]:
-
+        for item in data.get("records", {}).get("data", []):
             if "CE" in item:
-                total_ce += item["CE"].get(
-                    "openInterest",
-                    0
-                )
-
+                total_ce += item["CE"].get("openInterest", 0)
             if "PE" in item:
-                total_pe += item["PE"].get(
-                    "openInterest",
-                    0
-                )
+                total_pe += item["PE"].get("openInterest", 0)
 
-        if total_ce == 0:
+        if total_ce <= 0:
             return None
 
         return round(total_pe / total_ce, 2)
-
-    except:
+    except Exception:
         return None
+
+
 def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50):
     latest = df.iloc[-1]
     prev = df.iloc[-2]
@@ -1034,31 +719,26 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
     ema20 = float(latest["EMA20"])
     ema50 = float(latest["EMA50"])
     ema20_slope = ema20 - float(prev["EMA20"])
-    ema50_slope = ema50 - float(prev["EMA50"])
-    vwap = float(latest["VWAP"])
+    vwap = float(latest["VWAP"]) if pd.notna(latest["VWAP"]) else np.nan
     rsi = float(latest["RSI"])
     macd = float(latest["MACD"])
     macd_signal = float(latest["SignalLine"])
-    atr = float(latest["ATR"])
-    stoch_k = float(latest["StochK"])
-    stoch_d = float(latest["StochD"])
-    adx = float(latest["ADX"])
-    support = float(latest["PivotLow"])
-    resistance = float(latest["PivotHigh"])
-    distance_to_resistance = (
-        (resistance - close_price) / close_price
-    ) * 100
+    atr = float(latest["ATR"]) if pd.notna(latest["ATR"]) else 0.0
+    stoch_k = float(latest["StochK"]) if pd.notna(latest["StochK"]) else 50.0
+    stoch_d = float(latest["StochD"]) if pd.notna(latest["StochD"]) else 50.0
+    adx = float(latest["ADX"]) if pd.notna(latest["ADX"]) else 0.0
+    support = float(latest["PivotLow"]) if pd.notna(latest["PivotLow"]) else close_price
+    resistance = float(latest["PivotHigh"]) if pd.notna(latest["PivotHigh"]) else close_price
 
-    distance_to_support = (
-        (close_price - support) / close_price
-    ) * 100
-    trend_strength = abs(ema20 - ema50) / close_price * 100
+    distance_to_resistance = ((resistance - close_price) / close_price) * 100 if close_price else 0
+    distance_to_support = ((close_price - support) / close_price) * 100 if close_price else 0
+    trend_strength = abs(ema20 - ema50) / close_price * 100 if close_price else 0
+
     volume_spike = bool(latest["Volume_Spike"])
-    if data_source == "Angel" and latest["Volume"] <= 0:
-        volume_spike = False
     breakout = bool(latest["Breakout"])
     breakdown = bool(latest["Breakdown"])
-    body_strength = float(latest["BodyStrength"])
+    body_strength = float(latest["BodyStrength"]) if pd.notna(latest["BodyStrength"]) else 0
+
     hammer = bool(latest.get("Hammer", False))
     shooting_star = bool(latest.get("ShootingStar", False))
     bull_maru = bool(latest.get("BullishMarubozu", False))
@@ -1068,33 +748,29 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
     bear_engulf = bool(latest.get("BearishEngulfing", False))
     retest_bull = bool(latest.get("RetestBull", False))
     retest_bear = bool(latest.get("RetestBear", False))
-    plus_di = float(latest["PlusDI"])
-    minus_di = float(latest["MinusDI"])
+    plus_di = float(latest["PlusDI"]) if pd.notna(latest["PlusDI"]) else 0
+    minus_di = float(latest["MinusDI"]) if pd.notna(latest["MinusDI"]) else 0
 
     bullish = 0
     bearish = 0
     reasons = []
-    pcr = get_pcr()
 
+    pcr = get_pcr()
     if pcr is not None:
-    
         if pcr > 1.2:
             bullish += 1
-            reasons.append(
-                f"PCR Bullish ({pcr})"
-            )
-    
+            reasons.append(f"PCR Bullish ({pcr})")
         elif pcr < 0.8:
             bearish += 1
-            reasons.append(
-                f"PCR Bearish ({pcr})"
-            )
+            reasons.append(f"PCR Bearish ({pcr})")
+
     if ema20 > ema50:
         bullish += 1
         reasons.append("EMA20 > EMA50 bullish trend")
     else:
         bearish += 1
         reasons.append("EMA20 < EMA50 bearish trend")
+
     if close_price > ema20 > ema50:
         bullish += 1
         reasons.append("Perfect bullish EMA alignment")
@@ -1102,22 +778,22 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
     if close_price < ema20 < ema50:
         bearish += 1
         reasons.append("Perfect bearish EMA alignment")
+
     if close_price > ema20:
         bullish += 1
         reasons.append("Price above EMA20")
     else:
         bearish += 1
         reasons.append("Price below EMA20")
-    valid_vwap = pd.notna(latest["VWAP"])
-    
-    if valid_vwap:
-    
+
+    if pd.notna(vwap):
         if close_price > vwap:
             bullish += 1
             reasons.append("Price above VWAP")
         else:
             bearish += 1
             reasons.append("Price below VWAP")
+
     if rsi > 60:
         bullish += 1
         reasons.append("RSI bullish strength")
@@ -1126,30 +802,31 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
         reasons.append("RSI bearish weakness")
     else:
         reasons.append("RSI neutral")
+
     if rsi > float(prev["RSI"]):
         bullish += 1
         reasons.append("RSI momentum increasing")
-
     elif rsi < float(prev["RSI"]):
         bearish += 1
         reasons.append("RSI momentum decreasing")
+
     if macd > macd_signal:
         bullish += 1
         reasons.append("MACD above signal")
     else:
         bearish += 1
         reasons.append("MACD below signal")
+
     if latest["MACD_Hist"] > prev["MACD_Hist"]:
         bullish += 1
         reasons.append("MACD momentum increasing")
-
     elif latest["MACD_Hist"] < prev["MACD_Hist"]:
         bearish += 1
         reasons.append("MACD momentum decreasing")
+
     if ema20_slope > 0:
         bullish += 1
         reasons.append("EMA20 rising")
-
     if ema20_slope < 0:
         bearish += 1
         reasons.append("EMA20 falling")
@@ -1162,14 +839,15 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
             bearish += 1
     else:
         reasons.append("ADX low / sideways risk")
+
     if adx > 30:
         if plus_di > minus_di:
             bullish += 1
             reasons.append("Strong bullish trend")
-
         elif minus_di > plus_di:
             bearish += 1
             reasons.append("Strong bearish trend")
+
     if stoch_k > stoch_d and stoch_k < 80:
         bullish += 1
         reasons.append("Stochastic bullish crossover")
@@ -1188,7 +866,6 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
     if breakout:
         bullish += 2
         reasons.append("Resistance breakout")
-
         if volume_spike and htf_bias == "bullish":
             bullish += 3
             reasons.append("High quality breakout")
@@ -1196,10 +873,10 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
     if breakdown:
         bearish += 2
         reasons.append("Support breakdown")
-
         if volume_spike and htf_bias == "bearish":
             bearish += 3
             reasons.append("High quality breakdown")
+
     if retest_bull:
         bullish += 3
         reasons.append("Bullish breakout retest confirmed")
@@ -1207,9 +884,11 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
     if retest_bear:
         bearish += 3
         reasons.append("Bearish breakdown retest confirmed")
+
     if hammer:
         bullish += 2
         reasons.append("Hammer pattern detected")
+
     if bool(latest.get("InvertedHammer", False)):
         bullish += 2
         reasons.append("Inverted Hammer detected")
@@ -1225,31 +904,32 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
     if bool(latest.get("GravestoneDoji", False)):
         bearish += 2
         reasons.append("Gravestone Doji detected")
+
     if bull_maru:
         bullish += 4
         bearish = max(0, bearish - 2)
         reasons.append("Strong Bullish Marubozu detected")
-    
+
     if shooting_star:
         bearish += 2
         reasons.append("Shooting Star detected")
-    
+
     if bear_maru:
         bearish += 4
         bullish = max(0, bullish - 2)
         reasons.append("Strong Bearish Marubozu detected")
-        if bear_maru and bullish > bearish:
-            reasons.append("Bearish Marubozu caution")
-            bullish = max(0, bullish - 2)
+
     if bool(latest.get("ThreeWhiteSoldiers", False)):
         bullish += 4
         reasons.append("Three White Soldiers detected")
 
     if bool(latest.get("ThreeBlackCrows", False)):
         bearish += 4
-        reasons.append("Three Black Crows detected")           
+        reasons.append("Three Black Crows detected")
+
     if doji:
-        reasons.append("Doji pattern (market indecision)")   
+        reasons.append("Doji pattern (market indecision)")
+
     if bull_engulf:
         bullish += 3
         reasons.append("Bullish Engulfing detected")
@@ -1257,6 +937,7 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
     if bear_engulf:
         bearish += 3
         reasons.append("Bearish Engulfing detected")
+
     if bool(latest.get("PiercingPattern", False)):
         bullish += 3
         reasons.append("Piercing Pattern detected")
@@ -1264,6 +945,7 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
     if bool(latest.get("DarkCloudCover", False)):
         bearish += 3
         reasons.append("Dark Cloud Cover detected")
+
     if bool(latest.get("BullishHarami", False)):
         bullish += 3
         reasons.append("Bullish Harami detected")
@@ -1271,6 +953,7 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
     if bool(latest.get("BearishHarami", False)):
         bearish += 3
         reasons.append("Bearish Harami detected")
+
     if bool(latest.get("TweezerBottom", False)):
         bullish += 2
         reasons.append("Tweezer Bottom detected")
@@ -1278,6 +961,7 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
     if bool(latest.get("TweezerTop", False)):
         bearish += 2
         reasons.append("Tweezer Top detected")
+
     if bool(latest.get("MorningStar", False)):
         bullish += 4
         reasons.append("Morning Star detected")
@@ -1285,6 +969,7 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
     if bool(latest.get("EveningStar", False)):
         bearish += 4
         reasons.append("Evening Star detected")
+
     if bull_engulf and volume_spike:
         bullish += 2
         reasons.append("Bullish Engulfing with Volume Confirmation")
@@ -1292,6 +977,7 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
     if bear_engulf and volume_spike:
         bearish += 2
         reasons.append("Bearish Engulfing with Volume Confirmation")
+
     if volume_spike:
         reasons.append("Volume spike present")
         if close_price > ema20:
@@ -1307,6 +993,7 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
             bearish += 1
     else:
         reasons.append("Weak candle body")
+
     if bullish > bearish and distance_to_resistance < 0.5:
         bullish -= 2
         reasons.append("Too close to resistance")
@@ -1314,12 +1001,14 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
     if bearish > bullish and distance_to_support < 0.5:
         bearish -= 2
         reasons.append("Too close to support")
+
     if htf_bias == "bullish":
         bullish += 2
         reasons.append("Higher timeframe bullish confirmation")
     elif htf_bias == "bearish":
         bearish += 2
         reasons.append("Higher timeframe bearish confirmation")
+
     if bullish > bearish and htf_bias == "bearish":
         bullish -= 2
         reasons.append("Higher timeframe conflict")
@@ -1327,10 +1016,8 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
     if bearish > bullish and htf_bias == "bullish":
         bearish -= 2
         reasons.append("Higher timeframe conflict")
-    sideways = bool(
-        adx < 18
-        and trend_strength < 0.3
-    )
+
+    sideways = bool(adx < 18 and trend_strength < 0.3)
     session_info = session_filter(df, timeframe_label)
 
     signal_text = "NO TRADE"
@@ -1346,14 +1033,8 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
     if atr and atr > 0:
         rr_ratio = 2.0
 
-    if not sideways and session_info["valid"]:
-        if (
-            bullish >= 8
-            and (bullish - bearish) >= 3
-            and rsi > 55
-            and macd > macd_signal
-            and adx > 25
-        ):
+    if not sideways and session_info["valid"] and atr > 0:
+        if bullish >= 8 and (bullish - bearish) >= 3 and rsi > 55 and macd > macd_signal and adx > 25:
             signal_text = "STRONG BUY"
             signal_type = "buy"
             strength = "High"
@@ -1363,13 +1044,7 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
             target2 = close_price + (2 * atr)
             trailing_stop = close_price - (0.5 * atr)
 
-        elif (
-            bearish >= 8
-            and (bearish - bullish) >= 3
-            and rsi < 45
-            and macd < macd_signal
-            and adx > 25
-        ):
+        elif bearish >= 8 and (bearish - bullish) >= 3 and rsi < 45 and macd < macd_signal and adx > 25:
             signal_text = "STRONG SELL"
             signal_type = "sell"
             strength = "High"
@@ -1397,24 +1072,18 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
             target1 = close_price - atr
             trailing_stop = close_price + (0.4 * atr)
 
-    
-    
-    confidence = min(
-        100,
-        max(
-            40,
-            int((max(bullish, bearish) / 15) * 100)
-        )
-    )
+    confidence = min(100, max(40, int((max(bullish, bearish) / 15) * 100)))
+
     win_chance = calculate_win_chance(
         bullish, bearish, adx, volume_spike, breakout, breakdown,
         htf_bias, sideways, rr_ratio, backtest_win_rate
     )
+
     if bear_maru:
         win_chance = max(5, win_chance - 10)
-
     if bull_maru:
         win_chance = min(95, win_chance + 10)
+
     return {
         "close_price": close_price,
         "ema20": ema20,
@@ -1455,47 +1124,410 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
 def simple_backtest(df):
     results = []
     df = df.copy().dropna()
-    
-    
-    
-    
-    for i in range(30, len(df) - 10):
-        sub = df.iloc[:i + 1]
-        if len(sub) < 30:
+
+    if len(df) < 60:
+        return 0, 0, 0, 0.0
+
+    for i in range(50, len(df) - 10):
+        sub = df.iloc[:i + 1].copy()
+        latest = sub.iloc[-1]
+
+        buy_signal = (
+            latest["EMA20"] > latest["EMA50"] and
+            pd.notna(latest["VWAP"]) and
+            latest["Close"] > latest["VWAP"] and
+            latest["RSI"] > 55 and
+            latest["MACD"] > latest["SignalLine"]
+        )
+
+        sell_signal = (
+            latest["EMA20"] < latest["EMA50"] and
+            pd.notna(latest["VWAP"]) and
+            latest["Close"] < latest["VWAP"] and
+            latest["RSI"] < 45 and
+            latest["MACD"] < latest["SignalLine"]
+        )
+
+        atr = latest["ATR"]
+        if pd.isna(atr) or atr <= 0:
             continue
 
-        analysis = analyze_signal(sub, htf_bias=None, timeframe_label="1d", backtest_win_rate=50)
+        entry = latest["Close"]
         future = df.iloc[i + 1:i + 10]
 
-        if future.empty:
-            continue
+        if buy_signal:
+            sl = entry - atr
+            tgt = entry + atr
+            outcome = None
+            for _, row in future.iterrows():
+                if row["Low"] <= sl:
+                    outcome = 0
+                    break
+                if row["High"] >= tgt:
+                    outcome = 1
+                    break
+            if outcome is not None:
+                results.append(outcome)
 
-        future_high = float(future["High"].max())
-        future_low = float(future["Low"].min())
-
-        if analysis["signal_type"] == "buy" and analysis["stop_loss"] and analysis["target1"]:
-            if future_high >= analysis["target1"]:
-                results.append(1)
-            elif future_low <= analysis["stop_loss"]:
-                results.append(0)
-
-        elif analysis["signal_type"] == "sell" and analysis["stop_loss"] and analysis["target1"]:
-            if future_low <= analysis["target1"]:
-                results.append(1)
-            elif future_high >= analysis["stop_loss"]:
-                results.append(0)
+        elif sell_signal:
+            sl = entry + atr
+            tgt = entry - atr
+            outcome = None
+            for _, row in future.iterrows():
+                if row["High"] >= sl:
+                    outcome = 0
+                    break
+                if row["Low"] <= tgt:
+                    outcome = 1
+                    break
+            if outcome is not None:
+                results.append(outcome)
 
     total = len(results)
-    wins = sum(results) if total > 0 else 0
+    wins = sum(results)
     losses = total - wins
-    win_rate = (wins / total * 100) if total > 0 else 0
-    return wins, losses, total, win_rate
+    win_rate = (wins / total * 100) if total else 0.0
+    return wins, losses, total, round(win_rate, 2)
 
 
+# ----------------------------
+# ANGEL ONE
+# ----------------------------
+def map_angel_interval(timeframe):
+    mapping = {
+        "1m": "ONE_MINUTE",
+        "3m": "ONE_MINUTE",
+        "5m": "FIVE_MINUTE",
+        "10m": "FIVE_MINUTE",
+        "15m": "FIFTEEN_MINUTE",
+        "30m": "THIRTY_MINUTE",
+        "1h": "ONE_HOUR",
+        "1d": "ONE_DAY"
+    }
+    return mapping.get(timeframe, "FIVE_MINUTE")
+
+
+def angel_login(api_key, client_code, pin, totp_secret, force_refresh=False):
+    try:
+        cache_key = f"{client_code}_{api_key}"
+
+        if (
+            not force_refresh
+            and "angel_api" in st.session_state
+            and "angel_session" in st.session_state
+            and st.session_state.get("angel_cache_key") == cache_key
+        ):
+            return st.session_state["angel_api"], st.session_state["angel_session"]
+
+        smart_api = SmartConnect(api_key=api_key)
+        totp = pyotp.TOTP(totp_secret).now()
+        session = smart_api.generateSession(client_code, pin, totp)
+
+        if session and session.get("status"):
+            st.session_state["angel_api"] = smart_api
+            st.session_state["angel_session"] = session
+            st.session_state["angel_cache_key"] = cache_key
+            return smart_api, session
+
+        return None, None
+
+    except Exception as e:
+        st.error(f"Angel Login Failed: {e}")
+        return None, None
+
+
+def get_angel_profile(api_key, client_code, pin, totp_secret):
+    try:
+        angel, session = angel_login(api_key, client_code, pin, totp_secret)
+        if angel is None or session is None:
+            return None
+
+        refresh_token = session["data"].get("refreshToken")
+        if not refresh_token:
+            return None
+
+        return angel.getProfile(refresh_token)
+    except Exception as e:
+        return {"status": False, "message": str(e)}
+
+
+def get_angel_candles(api_key, client_code, pin, totp_secret, symbol_name, interval="FIVE_MINUTE"):
+    try:
+        angel, session = angel_login(api_key, client_code, pin, totp_secret)
+        if angel is None or not session or not session.get("data"):
+            return None
+
+        symbol_token = ANGEL_TOKENS.get(symbol_name)
+        if not symbol_token:
+            return {"status": False, "message": f"Missing Angel token for {symbol_name}"}
+
+        ist = timezone(timedelta(hours=5, minutes=30))
+        to_date = datetime.now(ist)
+        from_date = to_date - timedelta(days=7)
+
+        params = {
+            "exchange": "NSE",
+            "symboltoken": symbol_token,
+            "interval": interval,
+            "fromdate": from_date.strftime("%Y-%m-%d %H:%M"),
+            "todate": to_date.strftime("%Y-%m-%d %H:%M")
+        }
+
+        candles = angel.getCandleData(params)
+        return candles
+
+    except Exception as e:
+        return {"status": False, "message": str(e)}
+
+
+def candles_to_df(candles):
+    if not isinstance(candles, dict) or not candles.get("data"):
+        return pd.DataFrame()
+
+    df = pd.DataFrame(
+        candles["data"],
+        columns=["Datetime", "Open", "High", "Low", "Close", "Volume"]
+    )
+
+    df["Datetime"] = pd.to_datetime(df["Datetime"], errors="coerce")
+    df = df.dropna(subset=["Datetime"]).set_index("Datetime")
+
+    for col in ["Open", "High", "Low", "Close", "Volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df = df.dropna(subset=["Open", "High", "Low", "Close"])
+    df["Volume"] = df["Volume"].fillna(0)
+    return df
+
+
+# ----------------------------
+# ANGEL WEBSOCKET (BASIC READY STRUCTURE)
+# ----------------------------
+def init_ws_state():
+    defaults = {
+        "ws_running": False,
+        "ws_connected": False,
+        "ws_error": "",
+        "ws_last_tick": None,
+        "ws_thread_started": False,
+        "live_price": None
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+
+def start_angel_websocket(api_key, client_code, pin, totp_secret, symbol_name):
+    """
+    Streamlit + broker websocket can be tricky due to reruns.
+    This function provides a basic background-thread starter if SmartWebSocketV2 is available.
+    """
+
+    init_ws_state()
+
+    if not SMART_WS_AVAILABLE:
+        st.session_state["ws_error"] = "SmartWebSocketV2 not available in installed SmartApi package."
+        return
+
+    if st.session_state.get("ws_thread_started"):
+        return
+
+    symbol_token = ANGEL_TOKENS.get(symbol_name)
+    if not symbol_token:
+        st.session_state["ws_error"] = f"Missing token for {symbol_name}"
+        return
+
+    angel, session = angel_login(api_key, client_code, pin, totp_secret)
+    if angel is None or session is None:
+        st.session_state["ws_error"] = "Angel login failed for WebSocket"
+        return
+
+    try:
+        auth_token = session["data"]["jwtToken"]
+        feed_token_resp = angel.getfeedToken()
+
+        if isinstance(feed_token_resp, dict):
+            feed_token = feed_token_resp.get("data", {}).get("feedToken", None)
+            if feed_token is None:
+                feed_token = feed_token_resp.get("feedToken", None)
+        else:
+            feed_token = feed_token_resp
+
+        if not feed_token:
+            st.session_state["ws_error"] = "Feed token not received"
+            return
+
+        def run_socket():
+            try:
+                sws = SmartWebSocketV2(auth_token, api_key, client_code, feed_token)
+                correlation_id = "elite_dashboard_feed"
+                mode = 1
+                token_list = [{"exchangeType": 1, "tokens": [symbol_token]}]
+
+                def on_data(wsapp, message):
+                    st.session_state["ws_last_tick"] = message
+                    st.session_state["ws_connected"] = True
+                    try:
+                        ltp = None
+                        if isinstance(message, dict):
+                            ltp = (
+                                message.get("last_traded_price")
+                                or message.get("ltp")
+                                or message.get("lastTradedPrice")
+                            )
+                            if ltp is not None:
+                                try:
+                                    st.session_state["live_price"] = float(ltp) / 100 if float(ltp) > 10000 else float(ltp)
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+
+                def on_open(wsapp):
+                    st.session_state["ws_connected"] = True
+                    sws.subscribe(correlation_id, mode, token_list)
+
+                def on_error(wsapp, error):
+                    st.session_state["ws_error"] = str(error)
+                    st.session_state["ws_connected"] = False
+
+                def on_close(wsapp):
+                    st.session_state["ws_connected"] = False
+
+                sws.on_open = on_open
+                sws.on_data = on_data
+                sws.on_error = on_error
+                sws.on_close = on_close
+
+                st.session_state["ws_running"] = True
+                sws.connect()
+
+            except Exception as e:
+                st.session_state["ws_error"] = str(e)
+                st.session_state["ws_connected"] = False
+                st.session_state["ws_running"] = False
+
+        thread = threading.Thread(target=run_socket, daemon=True)
+        thread.start()
+        st.session_state["ws_thread_started"] = True
+
+    except Exception as e:
+        st.session_state["ws_error"] = str(e)
+
+
+# ----------------------------
+# TELEGRAM
+# ----------------------------
+def send_telegram_alert(token, chat_id, message):
+    try:
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        payload = {"chat_id": chat_id, "text": message}
+        response = requests.post(url, data=payload, timeout=10)
+        return response.status_code == 200
+    except Exception:
+        return False
+
+
+# ----------------------------
+# SNAPSHOT TABLES
+# ----------------------------
+@st.cache_data(ttl=300)
+def fetch_market_snapshot(symbol_map):
+    rows = []
+    for name, ticker in symbol_map.items():
+        try:
+            df = yf.download(ticker, period="5d", interval="1d", progress=False, auto_adjust=False)
+            if df.empty or len(df) < 2:
+                continue
+
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+
+            close = float(df["Close"].iloc[-1])
+            prev_close = float(df["Close"].iloc[-2])
+            change_pct = ((close - prev_close) / prev_close) * 100 if prev_close else 0.0
+
+            rows.append({
+                "Name": name,
+                "CMP": round(close, 2),
+                "% Change": round(change_pct, 2)
+            })
+        except Exception:
+            continue
+
+    return pd.DataFrame(rows)
+
+
+# ----------------------------
+# MTF SIGNAL
+# ----------------------------
+def get_data_for_timeframe(data_source, selected, ticker, tf, angel_creds):
+    if data_source == "Yahoo":
+        if tf == "1m":
+            data = fetch_data(ticker, "1m", "7d")
+        elif tf == "3m":
+            data = fetch_data(ticker, "1m", "7d")
+            if not data.empty:
+                data = resample_ohlcv(data, "3min")
+        elif tf == "5m":
+            data = fetch_data(ticker, "5m", "30d")
+        elif tf == "10m":
+            data = fetch_data(ticker, "5m", "30d")
+            if not data.empty:
+                data = resample_ohlcv(data, "10min")
+        elif tf == "15m":
+            data = fetch_data(ticker, "15m", "30d")
+        elif tf == "30m":
+            data = fetch_data(ticker, "30m", "60d")
+        elif tf == "1h":
+            data = fetch_data(ticker, "60m", "90d")
+        else:
+            data = fetch_data(ticker, "1d", "1y")
+        return data
+
+    api_key, client_code, pin, totp_secret = angel_creds
+    interval = map_angel_interval(tf)
+    candles = get_angel_candles(api_key, client_code, pin, totp_secret, selected, interval)
+    data = candles_to_df(candles)
+
+    if data.empty:
+        return data
+
+    if tf == "3m":
+        data = resample_ohlcv(data, "3min")
+    elif tf == "10m":
+        data = resample_ohlcv(data, "10min")
+
+    return data
+
+
+def get_mtf_signal(data_source, selected, ticker, tf, angel_creds):
+    data = get_data_for_timeframe(data_source, selected, ticker, tf, angel_creds)
+    if data.empty:
+        return "⚪ N/A"
+
+    data = add_indicators(data)
+    data = data.bfill().ffill()
+
+    if len(data) < 5:
+        return "⚪ N/A"
+
+    latest = data.iloc[-1]
+    if latest["EMA20"] > latest["EMA50"]:
+        return "🟢 Bullish"
+    elif latest["EMA20"] < latest["EMA50"]:
+        return "🔴 Bearish"
+    return "⚪ Neutral"
+
+
+# ----------------------------
+# APP START
+# ----------------------------
 login_panel()
 init_journal()
 init_paper_state()
 init_daily_summary()
+init_ws_state()
 
 stocks = {
     "NIFTY": "^NSEI",
@@ -1508,25 +1540,63 @@ stocks = {
     "ICICIBANK": "ICICIBANK.NS",
     "ITC": "ITC.NS"
 }
+
+# IMPORTANT:
+# Verify/update these Angel tokens from your broker/master contract source.
 ANGEL_TOKENS = {
     "SBIN": "3045",
     "RELIANCE": "2885",
     "INFY": "1594",
-    "TCS": "28973",
+    "TCS": "11536",
     "NIFTY": "99926000",
-    "BANKNIFTY": "26009"
+    "BANKNIFTY": "99926009",
+    "HDFCBANK": "1333",
+    "ICICIBANK": "4963",
+    "ITC": "1660"
 }
+
+global_indices = {
+    "S&P 500": "^GSPC",
+    "Dow Jones": "^DJI",
+    "Nasdaq": "^IXIC",
+    "FTSE 100": "^FTSE",
+    "DAX": "^GDAXI",
+    "Nikkei 225": "^N225",
+    "Hang Seng": "^HSI",
+    "Crude Oil": "CL=F",
+    "Gold": "GC=F",
+    "USD/INR": "INR=X"
+}
+
+indian_indices = {
+    "NIFTY 50": "^NSEI",
+    "BANKNIFTY": "^NSEBANK",
+    "SENSEX": "^BSESN",
+    "NIFTY IT": "^CNXIT",
+    "NIFTY AUTO": "^CNXAUTO",
+    "NIFTY PHARMA": "^CNXPHARMA"
+}
+
+major_stocks = {
+    "RELIANCE": "RELIANCE.NS",
+    "TCS": "TCS.NS",
+    "INFY": "INFY.NS",
+    "HDFCBANK": "HDFCBANK.NS",
+    "ICICIBANK": "ICICIBANK.NS",
+    "SBIN": "SBIN.NS",
+    "ITC": "ITC.NS",
+    "LT": "LT.NS",
+    "AXISBANK": "AXISBANK.NS"
+}
+
 st.title("📈 Elite Trading Dashboard Ultimate")
-st.caption("Journal + Entry/Exit + Paper Trading + Auto Telegram + Option Suggestion + Daily Summary")
+st.caption("Journal + Paper Trading + Alerts + MTF + Backtest + Global/India Market Snapshot + Angel Ready")
+
+debug_mode = st.sidebar.checkbox("Debug Mode", value=False)
 
 selected = st.selectbox("Select Stock / Index", list(stocks.keys()))
-data_source = st.radio(
-    "Data Source",
-    ["Yahoo", "Angel"],
-    horizontal=True
-)
-st.write("Selected Symbol:", selected)
-timeframe = st.selectbox("Select Time Frame", ["1m","3m", "5m", "10m", "15m", "30m", "1h", "1d"])
+data_source = st.radio("Data Source", ["Yahoo", "Angel"], horizontal=True)
+timeframe = st.selectbox("Select Time Frame", ["1m", "3m", "5m", "10m", "15m", "30m", "1h", "1d"])
 auto_refresh = st.checkbox("Enable Auto Refresh", value=True)
 refresh_seconds = st.selectbox("Refresh Every (seconds)", [10, 20, 30, 60], index=2)
 
@@ -1535,54 +1605,57 @@ with st.expander("Telegram Alert Settings"):
     telegram_bot_token = st.text_input("Telegram Bot Token", type="password")
     telegram_chat_id = st.text_input("Telegram Chat ID")
     auto_send_telegram = st.checkbox("Auto-send on New Signal", value=False)
-with st.expander("Angel One API Settings"):
-    search_symbol = st.text_input(
-        "Search Angel Symbol",
-        value="NIFTY"
-    )
-    angel_enabled = st.checkbox("Enable Angel One API", value=False)
 
+with st.expander("Angel One API Settings"):
+    angel_enabled = st.checkbox("Enable Angel One API", value=(data_source == "Angel"))
     angel_api_key = st.text_input("Angel API Key", type="password")
     angel_client_code = st.text_input("Angel Client Code")
     angel_pin = st.text_input("Angel PIN", type="password")
     angel_totp_secret = st.text_input("Angel TOTP Secret", type="password")
-if angel_enabled:
+    ws_enable = st.checkbox("Enable Angel WebSocket", value=False)
 
     if st.button("Test Angel Login"):
-
         angel, session = angel_login(
-            angel_api_key,
-            angel_client_code,
-            angel_pin,
-            angel_totp_secret
+            angel_api_key, angel_client_code, angel_pin, angel_totp_secret, force_refresh=True
         )
-
-        if angel:
+        if angel and session:
             st.success("✅ Angel One Login Successful")
-            st.success("✅ Angel Session Active")
+        else:
+            st.error("❌ Angel login failed")
 
-            st.write(session)
-candles = None
+if auto_refresh:
+    st_autorefresh(interval=refresh_seconds * 1000, key="ultimate_refresh")
+
+ticker = stocks[selected]
+
+if timeframe == "1m":
+    yf_interval, yf_period = "1m", "7d"
+elif timeframe == "3m":
+    yf_interval, yf_period = "1m", "7d"
+elif timeframe == "5m":
+    yf_interval, yf_period = "5m", "30d"
+elif timeframe == "10m":
+    yf_interval, yf_period = "5m", "30d"
+elif timeframe == "15m":
+    yf_interval, yf_period = "15m", "30d"
+elif timeframe == "30m":
+    yf_interval, yf_period = "30m", "60d"
+elif timeframe == "1h":
+    yf_interval, yf_period = "60m", "90d"
+else:
+    yf_interval, yf_period = "1d", "1y"
+
+data = pd.DataFrame()
+
 if "last_good_candles" not in st.session_state:
     st.session_state["last_good_candles"] = None
+
 if data_source == "Angel":
+    if not (angel_api_key and angel_client_code and angel_pin and angel_totp_secret):
+        st.warning("Please fill Angel credentials to use Angel data source.")
+        st.stop()
 
-    angel_interval = "FIVE_MINUTE"
-
-    if timeframe == "1m":
-        angel_interval = "ONE_MINUTE"
-
-    elif timeframe == "3m":
-        angel_interval = "ONE_MINUTE"
-
-    elif timeframe == "5m":
-        angel_interval = "FIVE_MINUTE"
-
-    elif timeframe == "15m":
-        angel_interval = "FIFTEEN_MINUTE"
-
-    st.error(f"Angel Interval Used = {angel_interval}")
-
+    angel_interval = map_angel_interval(timeframe)
     candles = get_angel_candles(
         angel_api_key,
         angel_client_code,
@@ -1591,296 +1664,55 @@ if data_source == "Angel":
         selected,
         angel_interval
     )
-    st.error(f"Angel Interval Used = {angel_interval}")    
-        
-if data_source == "Angel":
 
-    st.subheader("Angel Candle Test")
+    data = candles_to_df(candles)
 
-    st.write(
-        "Angel Token:",
-        ANGEL_TOKENS.get(selected, "3045")
-    )
-
-    st.write("Selected Symbol:", selected)
-    
-    
-    if (
-        isinstance(candles, dict)
-        and candles.get("status") == True
-        and len(candles.get("data", [])) > 0
-    ):
-        st.session_state["last_good_candles"] = candles
-        df = pd.DataFrame(
-            candles["data"],
-            columns=[
-                "Datetime",
-                "Open",
-                "High",
-                "Low",
-                "Close",
-                "Volume"
-            ]
-        )
-
-        st.dataframe(df.tail(10))            
-# profile = get_angel_profile(
-#     angel_api_key,
-#     angel_client_code,
-#     angel_pin,
-#     angel_totp_secret
-# )
-
-# st.write(profile)            
-if auto_refresh:
-    st_autorefresh(interval=refresh_seconds * 1000, key="ultimate_refresh")
-
-if timeframe == "1m":
-    yf_interval = "1m"
-    yf_period = "7d"
-elif timeframe == "3m":
-    yf_interval = "1m"
-    yf_period = "7d"
-elif timeframe == "5m":
-    yf_interval = "5m"
-    yf_period = "30d"
-elif timeframe == "10m":
-    yf_interval = "5m"
-    yf_period = "30d"
-elif timeframe == "15m":
-    yf_interval = "15m"
-    yf_period = "30d"
-elif timeframe == "30m":
-    yf_interval = "30m"
-    yf_period = "60d"
-elif timeframe == "1h":
-    yf_interval = "60m"
-    yf_period = "90d"
-else:
-    yf_interval = "1d"
-    yf_period = "1y"
-st.write("Current Data Source:", data_source)
-st.write("Selected:", selected)
-st.write("Token:", ANGEL_TOKENS.get(selected))
-ticker = stocks[selected]
-
-if data_source == "Angel":
-
-    if isinstance(candles, dict) and candles.get("data"):
-
-        data = pd.DataFrame(
-            candles["data"],
-            columns=[
-                "Datetime",
-                "Open",
-                "High",
-                "Low",
-                "Close",
-                "Volume"
-            ]
-        )
-
-        data["Datetime"] = pd.to_datetime(
-            data["Datetime"]
-        )
-
-        data = data.set_index(
-            "Datetime"
-        )
-
-        for col in [
-            "Open",
-            "High",
-            "Low",
-            "Close",
-            "Volume"
-        ]:
-            data[col] = pd.to_numeric(
-                data[col],
-                errors="coerce"
-            )
-
+    if data.empty:
+        last_good = st.session_state.get("last_good_candles")
+        data = candles_to_df(last_good)
+        if not data.empty:
+            st.warning("Using last successful Angel candle data.")
     else:
-    
-        candles = st.session_state["last_good_candles"]
-        
-        
-        if isinstance(candles, dict) and candles.get("data"):
-    
-            data = pd.DataFrame(
-                candles["data"],
-                columns=[
-                    "Datetime",
-                    "Open",
-                    "High",
-                    "Low",
-                    "Close",
-                    "Volume"
-                ]
-            )
-    
-            data["Datetime"] = pd.to_datetime(
-                data["Datetime"]
-            )
-    
-            data = data.set_index("Datetime")
-    
-            for col in [
-                "Open",
-                "High",
-                "Low",
-                "Close",
-                "Volume"
-            ]:
-                data[col] = pd.to_numeric(
-                    data[col],
-                    errors="coerce"
-                )
-            
-            st.warning(
-                "Using last successful Angel data."
-            )
-    
-        else:
-    
-            data = pd.DataFrame()
-else:
+        st.session_state["last_good_candles"] = candles
 
-    data = fetch_data(
-        ticker,
-        yf_interval,
-        yf_period
-    )
-st.write("Rows Loaded:", len(data))
-st.write("Data Columns:", list(data.columns))
-st.write("Data Source Selected:", data_source)
- 
-st.dataframe(data.tail())
- 
+    if ws_enable:
+        start_angel_websocket(
+            angel_api_key,
+            angel_client_code,
+            angel_pin,
+            angel_totp_secret,
+            selected
+        )
+else:
+    data = fetch_data(ticker, yf_interval, yf_period)
+
 if data.empty:
     st.error("No data found")
     st.stop()
+
 if timeframe == "3m":
-    data = resample_to_3m(data)
+    data = resample_ohlcv(data, "3min")
 elif timeframe == "10m":
-    data = resample_to_10m(data)
+    data = resample_ohlcv(data, "10min")
 
 data = add_indicators(data)
+data = data.bfill().ffill()
 
-
-
- 
-# Only drop rows where critical indicators are missing
-required_cols = [
-    "EMA20",
-    "EMA50",
-    "RSI",
-    "MACD",
-    "SignalLine",
-    "ATR"
-]
- 
- # data = data.dropna(subset=required_cols).copy()
- 
-data = data.bfill()
-data = data.ffill()
- 
-
- 
 if len(data) < 30:
     st.warning(f"Only {len(data)} rows available after indicator calculation.")
     st.stop()
 
 htf_interval, htf_period = get_higher_timeframe(timeframe)
+
+angel_creds = (angel_api_key, angel_client_code, angel_pin, angel_totp_secret)
+
 if data_source == "Angel":
-    
-       
-    if htf_interval == "3m":
-    
-        if "live_angel_data" in st.session_state:
-    
-            htf_data = resample_to_3m(
-                st.session_state["live_angel_data"].copy()
-            )
-    
-        else:
-    
-            htf_data = data.copy()
-    
-    elif htf_interval == "5m":
-    
-        candles_htf = get_angel_candles(
-            angel_api_key,
-            angel_client_code,
-            angel_pin,
-            angel_totp_secret,
-            selected,
-            "FIFTEEN_MINUTE"
-        )
-        if isinstance(candles_htf, dict) and candles_htf.get("data"):
-
-            htf_data = pd.DataFrame(
-                candles_htf["data"],
-                columns=[
-                    "Datetime",
-                    "Open",
-                    "High",
-                    "Low",
-                    "Close",
-                    "Volume"
-                ]
-            )
-
-            htf_data["Datetime"] = pd.to_datetime(
-                htf_data["Datetime"]
-            )
-
-            htf_data = htf_data.set_index(
-                "Datetime"
-            )
-
-            for col in [
-                "Open",
-                "High",
-                "Low",
-                "Close",
-                "Volume"
-            ]:
-                htf_data[col] = pd.to_numeric(
-                    htf_data[col],
-                    errors="coerce"
-                )
-
-        else:
-            htf_data = pd.DataFrame()
-
-    else:
-        htf_data = data.copy()
-
+    htf_data = get_data_for_timeframe(data_source, selected, ticker, htf_interval, angel_creds)
 else:
-
-    htf_data = fetch_data(
-        ticker,
-        htf_interval,
-        htf_period
-    )
-
-
-
-
-    
-
-
-
-
-
-   
-  
+    htf_data = get_data_for_timeframe(data_source, selected, ticker, htf_interval, angel_creds)
 
 if not htf_data.empty:
-    htf_data = add_indicators(htf_data)
-    htf_data = htf_data.bfill()
-    htf_data = htf_data.ffill()
+    htf_data = add_indicators(htf_data).bfill().ffill()
     if len(htf_data) > 20:
         htf_latest = htf_data.iloc[-1]
         htf_bias = "bullish" if htf_latest["EMA20"] > htf_latest["EMA50"] else "bearish"
@@ -1890,85 +1722,46 @@ else:
     htf_bias = None
 
 wins, losses, total_trades, backtest_win_rate = simple_backtest(data)
+
 analysis = analyze_signal(
     data,
     htf_bias=htf_bias,
     timeframe_label=timeframe,
     backtest_win_rate=backtest_win_rate
 )
-pcr = get_pcr()
 
-st.write("PCR Debug =", pcr)
-# VWAP Debug
+pcr = get_pcr()
 latest = data.iloc[-1]
 
-st.subheader("VWAP Debug")
-
-st.write("Close Price:", round(float(latest["Close"]), 2))
-if pd.notna(latest["VWAP"]):
-    st.write(
-        "VWAP:",
-        round(float(latest["VWAP"]), 2)
-    )
-else:
-    st.write("VWAP: N/A")
-st.write("Latest Volume =", latest["Volume"])
-st.dataframe(
-    data[["Close", "High", "Low", "Volume", "VWAP"]].tail(10),
-    use_container_width=True
-)
-st.write("Volume Unique Values:")
-st.write(data["Volume"].tail(20).unique())
-st.write("First Row Time :", data.index[0])
-st.write("Last Row Time :", data.index[-1])
-st.error(f"Selected Timeframe = {timeframe}")
-
-st.write(data.head(3))
-st.session_state["live_angel_data"] = data.copy()
-
-    
-    
 mtf_table = pd.DataFrame({
     "Timeframe": ["1m", "3m", "5m", "15m"],
     "Trend": [
-        get_mtf_signal(ticker, "1m", "7d"),
-        get_mtf_signal(ticker, "3m", "7d"),
-        get_mtf_signal(ticker, "5m", "30d"),
-        get_mtf_signal(ticker, "15m", "30d")
+        get_mtf_signal(data_source, selected, ticker, "1m", angel_creds),
+        get_mtf_signal(data_source, selected, ticker, "3m", angel_creds),
+        get_mtf_signal(data_source, selected, ticker, "5m", angel_creds),
+        get_mtf_signal(data_source, selected, ticker, "15m", angel_creds)
     ]
 })
-bull_count = 0
-bear_count = 0
 
-for sig in mtf_table["Trend"]:
-    if "Bullish" in sig:
-        bull_count += 1
-    elif "Bearish" in sig:
-        bear_count += 1
+bull_count = sum("Bullish" in sig for sig in mtf_table["Trend"])
+bear_count = sum("Bearish" in sig for sig in mtf_table["Trend"])
 
 if bull_count >= 3:
     mtf_grade = "🔥 Strong Bullish Alignment"
-
 elif bear_count >= 3:
     mtf_grade = "🔥 Strong Bearish Alignment"
-
 else:
     mtf_grade = "⚠️ Mixed Timeframes"
-mtf_confirmation = "➖ Neutral"
 
+mtf_confirmation = "➖ Neutral"
 if analysis["signal_type"] == "buy" and htf_bias == "bullish":
     mtf_confirmation = "✅ Bullish Alignment"
-
 elif analysis["signal_type"] == "sell" and htf_bias == "bearish":
     mtf_confirmation = "✅ Bearish Alignment"
-
 elif analysis["signal_type"] in ["buy", "sell"]:
     mtf_confirmation = "⚠️ Timeframe Conflict"
-quality_score = (
-    analysis["win_chance"] +
-    analysis["confidence"]
-) / 2
 
+quality_score = (analysis["win_chance"] + analysis["confidence"]) / 2
 if quality_score >= 85:
     signal_quality = "🔥 Excellent"
 elif quality_score >= 70:
@@ -1977,69 +1770,41 @@ elif quality_score >= 55:
     signal_quality = "⚠️ Moderate"
 else:
     signal_quality = "❌ Weak"
-latest = data.iloc[-1]
 
 patterns = []
-if latest["InvertedHammer"]:
-    patterns.append("🟢 Inverted Hammer")
+pattern_map = {
+    "InvertedHammer": "🟢 Inverted Hammer",
+    "HangingMan": "🔴 Hanging Man",
+    "DragonflyDoji": "🟢 Dragonfly Doji",
+    "GravestoneDoji": "🔴 Gravestone Doji",
+    "ThreeWhiteSoldiers": "🟢 Three White Soldiers",
+    "ThreeBlackCrows": "🔴 Three Black Crows",
+    "Hammer": "🟢 Hammer",
+    "ShootingStar": "🔴 Shooting Star",
+    "BullishMarubozu": "🟢 Bullish Marubozu",
+    "BearishMarubozu": "🔴 Bearish Marubozu",
+    "Doji": "🟡 Doji",
+    "BullishEngulfing": "🟢 Bullish Engulfing",
+    "BearishEngulfing": "🔴 Bearish Engulfing",
+    "PiercingPattern": "🟢 Piercing Pattern",
+    "DarkCloudCover": "🔴 Dark Cloud Cover",
+    "TweezerBottom": "🟢 Tweezer Bottom",
+    "TweezerTop": "🔴 Tweezer Top",
+    "MorningStar": "🟢 Morning Star",
+    "EveningStar": "🔴 Evening Star",
+    "BullishHarami": "🟢 Bullish Harami",
+    "BearishHarami": "🔴 Bearish Harami"
+}
 
-if latest["HangingMan"]:
-    patterns.append("🔴 Hanging Man")
+for key, label in pattern_map.items():
+    if bool(latest.get(key, False)):
+        patterns.append(label)
 
-if latest["DragonflyDoji"]:
-    patterns.append("🟢 Dragonfly Doji")
-
-if latest["GravestoneDoji"]:
-    patterns.append("🔴 Gravestone Doji")
-if latest["ThreeWhiteSoldiers"]:
-    patterns.append("🟢 Three White Soldiers")
-
-if latest["ThreeBlackCrows"]:
-    patterns.append("🔴 Three Black Crows")
-if latest["Hammer"]:
-    patterns.append("🟢 Hammer")
-
-if latest["ShootingStar"]:
-    patterns.append("🔴 Shooting Star")
-
-if latest["BullishMarubozu"]:
-    patterns.append("🟢 Bullish Marubozu")
-
-if latest["BearishMarubozu"]:
-    patterns.append("🔴 Bearish Marubozu")
-
-if latest["Doji"]:
-    patterns.append("🟡 Doji")
-if latest["BullishEngulfing"]:
-    patterns.append("🟢 Bullish Engulfing")
-
-if latest["BearishEngulfing"]:
-    patterns.append("🔴 Bearish Engulfing")
-if latest["PiercingPattern"]:
-    patterns.append("🟢 Piercing Pattern")
-
-if latest["DarkCloudCover"]:
-    patterns.append("🔴 Dark Cloud Cover")
-if latest["TweezerBottom"]:
-    patterns.append("🟢 Tweezer Bottom")
-
-if latest["TweezerTop"]:
-    patterns.append("🔴 Tweezer Top")
-if latest["MorningStar"]:
-    patterns.append("🟢 Morning Star")
-
-if latest["EveningStar"]:
-    patterns.append("🔴 Evening Star")
-if latest["BullishHarami"]:
-    patterns.append("🟢 Bullish Harami")
-
-if latest["BearishHarami"]:
-    patterns.append("🔴 Bearish Harami")
 if bool(latest.get("RetestBull", False)):
     patterns.append("🚀 Bullish Retest")
-
 if bool(latest.get("RetestBear", False)):
     patterns.append("🔻 Bearish Retest")
+
 option_suggestion = suggest_option_strike(selected, analysis["close_price"], analysis["signal_type"])
 
 alert_text = (
@@ -2050,7 +1815,6 @@ alert_text = (
 )
 
 current_signal_key = f"{selected}|{timeframe}|{analysis['signal_text']}|{round(analysis['close_price'], 2)}"
-
 last_signal_key = ""
 if os.path.exists(SIGNAL_STATE_FILE):
     with open(SIGNAL_STATE_FILE, "r") as f:
@@ -2070,79 +1834,83 @@ if telegram_enabled and telegram_bot_token and telegram_chat_id:
             with open(SIGNAL_STATE_FILE, "w") as f:
                 f.write(current_signal_key)
 
+# ----------------------------
+# DASHBOARD
+# ----------------------------
 st.subheader("🚨 Live Signal Analytics")
+
+if data_source == "Angel" and ws_enable:
+    ws_col1, ws_col2, ws_col3 = st.columns(3)
+    with ws_col1:
+        st.metric("WebSocket Status", "Connected" if st.session_state.get("ws_connected") else "Disconnected")
+    with ws_col2:
+        live_price = st.session_state.get("live_price")
+        st.metric("Live Price", round(live_price, 2) if live_price else "-")
+    with ws_col3:
+        st.metric("WS Available", "Yes" if SMART_WS_AVAILABLE else "No")
+
+    if st.session_state.get("ws_error"):
+        st.warning(f"WebSocket: {st.session_state['ws_error']}")
+
 st.subheader("📊 Multi Timeframe Alignment")
 st.dataframe(mtf_table, use_container_width=True)
-col1, col2 = st.columns(2)
 
+col1, col2 = st.columns(2)
 with col1:
     st.metric("Bullish TF", bull_count)
-
 with col2:
     st.metric("Bearish TF", bear_count)
+
 if "Strong Bullish" in mtf_grade:
     st.success(mtf_grade)
-
 elif "Strong Bearish" in mtf_grade:
     st.error(mtf_grade)
-
 else:
     st.warning(mtf_grade)
-st.subheader("🕯 Candlestick Patterns")
 
+st.subheader("🕯 Candlestick Patterns")
 if patterns:
     st.success(" | ".join(patterns))
 else:
     st.info("No major candlestick pattern detected")
+
 if analysis["signal_type"] == "buy":
     st.success(alert_text)
 elif analysis["signal_type"] == "sell":
     st.error(alert_text)
 else:
     st.warning(alert_text)
+
 if analysis["signal_type"] == "buy" and bear_count >= 3:
     st.error("⚠️ BUY signal hai lekin MTF Alignment Bearish hai")
-
 if analysis["signal_type"] == "sell" and bull_count >= 3:
     st.error("⚠️ SELL signal hai lekin MTF Alignment Bullish hai")
-m1, m2, m3, m4, m5, m6, m7, m8 = st.columns(8)
 
+m1, m2, m3, m4, m5, m6, m7, m8 = st.columns(8)
 with m1:
     st.metric("Current Price", round(analysis["close_price"], 2))
-    st.metric("VWAP", round(analysis["vwap"], 2))
-
+    st.metric("VWAP", round(analysis["vwap"], 2) if pd.notna(analysis["vwap"]) else "N/A")
 with m2:
     st.metric("EMA20", round(analysis["ema20"], 2))
     st.metric("EMA50", round(analysis["ema50"], 2))
-
 with m3:
     st.metric("RSI", round(analysis["rsi"], 2))
     st.metric("ATR", round(analysis["atr"], 2))
-
 with m4:
     st.metric("MACD", round(analysis["macd"], 2))
     st.metric("ADX", round(analysis["adx"], 2))
-
 with m5:
     st.metric("Win Chance %", analysis["win_chance"])
     st.metric("Confidence %", analysis["confidence"])
-
 with m6:
     st.metric("Bullish Score", analysis["bullish_score"])
     st.metric("Bearish Score", analysis["bearish_score"])
 with m7:
     st.metric("Signal Quality", signal_quality)
-
 with m8:
+    st.metric("PCR", pcr if pcr is not None else "N/A")
 
-    if pcr is not None:
-        st.metric("PCR", pcr)
-    else:
-        st.metric("PCR", "N/A")
-if pcr is not None:
-    st.metric("PCR", pcr)
-a1, a2, a3, a4, a5,a6 = st.columns(6)
-
+a1, a2, a3, a4, a5, a6 = st.columns(6)
 with a1:
     st.metric("Support", round(analysis["support"], 2))
 with a2:
@@ -2155,6 +1923,7 @@ with a5:
     st.metric("Backtest Win Rate", f"{backtest_win_rate:.1f}%")
 with a6:
     st.metric("MTF Status", mtf_confirmation)
+
 st.subheader("🎯 Option CALL/PUT Suggestion")
 if option_suggestion["type"] == "CALL":
     st.success(option_suggestion["text"])
@@ -2179,6 +1948,28 @@ if analysis["stop_loss"] is not None:
 with st.expander("Why this signal?"):
     for reason in analysis["reasons"]:
         st.write("-", reason)
+
+st.subheader("🌍 Global / Macro Performance (Latest Daily Close)")
+global_df = fetch_market_snapshot(global_indices)
+if not global_df.empty:
+    st.dataframe(global_df, use_container_width=True)
+else:
+    st.info("Global / macro data unavailable.")
+
+st.subheader("🇮🇳 Indian Market Performance (Latest Daily Close)")
+india_df = fetch_market_snapshot(indian_indices)
+if not india_df.empty:
+    st.dataframe(india_df, use_container_width=True)
+else:
+    st.info("Indian market data unavailable.")
+
+st.subheader("📡 Major Stocks Scanner — CMP & % Change")
+scanner_df = fetch_market_snapshot(major_stocks)
+if not scanner_df.empty:
+    scanner_df = scanner_df.sort_values("% Change", ascending=False).reset_index(drop=True)
+    st.dataframe(scanner_df, use_container_width=True)
+else:
+    st.info("Scanner data unavailable.")
 
 st.subheader("💼 Paper Trading")
 paper_state = load_paper_state()
@@ -2227,7 +2018,6 @@ fig.add_trace(go.Candlestick(
     close=data["Close"],
     name="Candles"
 ))
-
 fig.add_trace(go.Scatter(x=data.index, y=data["EMA20"], mode="lines", name="EMA20", line=dict(color="orange", width=1.5)))
 fig.add_trace(go.Scatter(x=data.index, y=data["EMA50"], mode="lines", name="EMA50", line=dict(color="blue", width=1.5)))
 fig.add_trace(go.Scatter(x=data.index, y=data["VWAP"], mode="lines", name="VWAP", line=dict(color="purple", width=1.3, dash="dot")))
@@ -2241,7 +2031,6 @@ fig.add_trace(go.Scatter(
     name="Buy Signal",
     marker=dict(symbol="triangle-up", color="green", size=12)
 ))
-
 fig.add_trace(go.Scatter(
     x=data.index,
     y=data["SellMarker"],
@@ -2309,14 +2098,12 @@ st.dataframe(journal_df, use_container_width=True)
 st.subheader("📌 Entry / Exit History")
 
 open_trades = journal_df[journal_df["Status"] == "OPEN"]
-
 if not open_trades.empty:
     st.write("Open Trades")
     st.dataframe(open_trades, use_container_width=True)
 
     open_indices = open_trades.index.tolist()
     selected_trade_index = st.selectbox("Select Open Trade Row to Exit", open_indices)
-
     exit_price_input = st.number_input("Exit Price", min_value=0.0, value=float(analysis["close_price"]), step=0.1)
 
     if st.button("Close Selected Trade"):
@@ -2342,19 +2129,17 @@ if not closed_trades.empty:
     total_pnl = pd.to_numeric(closed_trades["PnL"], errors="coerce").fillna(0).sum()
     avg_pnl_pct = pd.to_numeric(closed_trades["PnLPercent"], errors="coerce").fillna(0).mean()
 
-    p1, p2 = st.columns(2)
-    with p1:
+    rp1, rp2 = st.columns(2)
+    with rp1:
         st.metric("Total Realized PnL", round(total_pnl, 2))
-    with p2:
+    with rp2:
         st.metric("Average PnL %", round(avg_pnl_pct, 2))
 
 st.subheader("📊 Daily Summary Report")
-init_daily_summary()
 summary_df = pd.read_csv(SESSION_SUMMARY_FILE)
 st.dataframe(summary_df, use_container_width=True)
 
 st.subheader("Downloads")
-
 market_csv = data.to_csv().encode("utf-8")
 st.download_button(
     label="📥 Download Market Data CSV",
@@ -2378,3 +2163,20 @@ st.download_button(
     file_name="daily_summary.csv",
     mime="text/csv"
 )
+
+if debug_mode:
+    st.subheader("🐞 Debug")
+    st.write("Data Source:", data_source)
+    st.write("Selected:", selected)
+    st.write("Timeframe:", timeframe)
+    st.write("Rows Loaded:", len(data))
+    st.write("Columns:", list(data.columns))
+    st.write("Latest Row:")
+    st.dataframe(data.tail(5), use_container_width=True)
+    st.write("PCR Debug:", pcr)
+    st.write("Angel Token:", ANGEL_TOKENS.get(selected))
+    if data_source == "Angel":
+        st.write("WebSocket Available:", SMART_WS_AVAILABLE)
+        st.write("WS Connected:", st.session_state.get("ws_connected"))
+        st.write("WS Error:", st.session_state.get("ws_error"))
+        st.write("Last Tick:", st.session_state.get("ws_last_tick"))
