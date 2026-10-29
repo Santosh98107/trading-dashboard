@@ -21,7 +21,7 @@ except Exception:
     SMART_WS_AVAILABLE = False
 
 
-st.set_page_config(page_title="Elite Trading Dashboard Ultimate", layout="wide")
+st.set_page_config(page_title="Elite Trading Dashboard Ultimate V4", layout="wide")
 
 JOURNAL_FILE = "trade_journal.csv"
 SIGNAL_STATE_FILE = "last_signal_state.txt"
@@ -267,13 +267,16 @@ def paper_trade_exit(entry_price, exit_price, quantity, signal):
 # ----------------------------
 @st.cache_data(ttl=60)
 def fetch_data(ticker, interval, period):
-    df = yf.download(
-        ticker,
-        interval=interval,
-        period=period,
-        progress=False,
-        auto_adjust=False
-    )
+    try:
+        df = yf.download(
+            ticker,
+            interval=interval,
+            period=period,
+            progress=False,
+            auto_adjust=False
+        )
+    except Exception:
+        return pd.DataFrame()
 
     if df.empty:
         return df
@@ -287,6 +290,8 @@ def fetch_data(ticker, interval, period):
         return pd.DataFrame()
 
     df = df[needed].copy()
+    df.index = pd.to_datetime(df.index, errors="coerce")
+    df = df[~df.index.isna()].copy()
     df = df.dropna(subset=["Open", "High", "Low", "Close"])
     df["Volume"] = pd.to_numeric(df["Volume"], errors="coerce").fillna(0)
     return df
@@ -294,7 +299,12 @@ def fetch_data(ticker, interval, period):
 
 def resample_ohlcv(df, rule):
     df = df.copy()
-    df.index = pd.to_datetime(df.index)
+    df.index = pd.to_datetime(df.index, errors="coerce")
+    df = df[~df.index.isna()].copy()
+
+    if df.empty:
+        return df
+
     resampled = df.resample(rule).agg({
         "Open": "first",
         "High": "max",
@@ -302,6 +312,7 @@ def resample_ohlcv(df, rule):
         "Close": "last",
         "Volume": "sum"
     }).dropna()
+
     return resampled
 
 
@@ -354,19 +365,40 @@ def compute_adx(df, period=14):
 
 def compute_vwap(df):
     df = df.copy()
+
     if df.empty:
         df["VWAP"] = np.nan
         return df
 
-    df.index = pd.to_datetime(df.index)
-    df["Volume"] = pd.to_numeric(df["Volume"], errors="coerce").fillna(0)
+    df.index = pd.to_datetime(df.index, errors="coerce")
+    df = df[~df.index.isna()].copy()
+
+    for col in ["High", "Low", "Close", "Volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df["Volume"] = df["Volume"].fillna(0)
+
     tp = (df["High"] + df["Low"] + df["Close"]) / 3
+
+    if df["Volume"].sum() <= 0:
+        df["VWAP"] = tp.expanding().mean()
+        df["VWAP"] = df["VWAP"].bfill().ffill()
+        return df
+
     trade_date = pd.Series(df.index.date, index=df.index)
-
     cum_pv = (tp * df["Volume"]).groupby(trade_date).cumsum()
-    cum_vol = df["Volume"].groupby(trade_date).cumsum().replace(0, np.nan)
+    cum_vol = df["Volume"].groupby(trade_date).cumsum()
 
-    df["VWAP"] = (cum_pv / cum_vol).replace([np.inf, -np.inf], np.nan)
+    df["VWAP"] = np.where(
+        cum_vol > 0,
+        cum_pv / cum_vol,
+        tp.expanding().mean()
+    )
+
+    df["VWAP"] = pd.to_numeric(df["VWAP"], errors="coerce")
+    df["VWAP"] = df["VWAP"].replace([np.inf, -np.inf], np.nan)
+    df["VWAP"] = df["VWAP"].bfill().ffill()
+
     return df
 
 
@@ -683,7 +715,9 @@ def get_pcr():
         headers = {
             "User-Agent": "Mozilla/5.0",
             "Accept": "application/json,text/plain,*/*",
-            "Referer": "https://www.nseindia.com/option-chain"
+            "Referer": "https://www.nseindia.com/option-chain",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Connection": "keep-alive"
         }
 
         session = requests.Session()
@@ -707,6 +741,7 @@ def get_pcr():
             return None
 
         return round(total_pe / total_ce, 2)
+
     except Exception:
         return None
 
@@ -719,7 +754,7 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
     ema20 = float(latest["EMA20"])
     ema50 = float(latest["EMA50"])
     ema20_slope = ema20 - float(prev["EMA20"])
-    vwap = float(latest["VWAP"]) if pd.notna(latest["VWAP"]) else np.nan
+    vwap = float(latest["VWAP"]) if pd.notna(latest["VWAP"]) else float(close_price)
     rsi = float(latest["RSI"])
     macd = float(latest["MACD"])
     macd_signal = float(latest["SignalLine"])
@@ -1124,13 +1159,12 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
 def simple_backtest(df, symbol=""):
     trades = []
 
+    df = df.copy()
     required_cols = [
         "Open", "High", "Low", "Close",
         "EMA20", "EMA50", "VWAP", "RSI",
         "MACD", "SignalLine", "ATR"
     ]
-
-    df = df.copy()
 
     for col in required_cols:
         if col not in df.columns:
@@ -1140,31 +1174,35 @@ def simple_backtest(df, symbol=""):
             ])
             return 0, 0, 0, 0.0, empty_df
 
+    df.index = pd.to_datetime(df.index, errors="coerce")
+    df = df[~df.index.isna()].copy()
     df = df.replace([np.inf, -np.inf], np.nan)
-    df = df.dropna(subset=required_cols).copy()
+    df = df.dropna(subset=["Open", "High", "Low", "Close", "EMA20", "EMA50", "RSI", "MACD", "SignalLine", "ATR"]).copy()
 
-    if len(df) < 60:
+    if len(df) < 30:
         empty_df = pd.DataFrame(columns=[
             "Date", "Time", "Symbol", "Signal", "Entry",
             "SL", "Target", "Exit", "Result", "PnL"
         ])
         return 0, 0, 0, 0.0, empty_df
 
-    for i in range(50, len(df) - 10):
+    for i in range(20, len(df) - 1):
         latest = df.iloc[i]
         ts = df.index[i]
 
+        vwap_value = latest["VWAP"] if pd.notna(latest["VWAP"]) else latest["Close"]
+
         buy_signal = (
             latest["EMA20"] > latest["EMA50"] and
-            latest["Close"] > latest["VWAP"] and
-            latest["RSI"] > 55 and
+            latest["Close"] >= vwap_value and
+            latest["RSI"] > 52 and
             latest["MACD"] > latest["SignalLine"]
         )
 
         sell_signal = (
             latest["EMA20"] < latest["EMA50"] and
-            latest["Close"] < latest["VWAP"] and
-            latest["RSI"] < 45 and
+            latest["Close"] <= vwap_value and
+            latest["RSI"] < 48 and
             latest["MACD"] < latest["SignalLine"]
         )
 
@@ -1195,20 +1233,24 @@ def simple_backtest(df, symbol=""):
                     result = "WIN"
                     break
 
-            if result is not None:
-                pnl = round(exit_price - entry, 2)
-                trades.append({
-                    "Date": pd.to_datetime(ts).strftime("%d-%m-%Y"),
-                    "Time": pd.to_datetime(ts).strftime("%H:%M:%S"),
-                    "Symbol": symbol,
-                    "Signal": signal,
-                    "Entry": round(entry, 2),
-                    "SL": round(sl, 2),
-                    "Target": round(target, 2),
-                    "Exit": round(exit_price, 2),
-                    "Result": result,
-                    "PnL": pnl
-                })
+            if exit_price is None:
+                exit_price = float(future.iloc[-1]["Close"])
+                result = "WIN" if exit_price > entry else "LOSS"
+
+            pnl = round(exit_price - entry, 2)
+
+            trades.append({
+                "Date": pd.to_datetime(ts).strftime("%d-%m-%Y"),
+                "Time": pd.to_datetime(ts).strftime("%H:%M:%S"),
+                "Symbol": symbol,
+                "Signal": signal,
+                "Entry": round(entry, 2),
+                "SL": round(sl, 2),
+                "Target": round(target, 2),
+                "Exit": round(exit_price, 2),
+                "Result": result,
+                "PnL": pnl
+            })
 
         elif sell_signal:
             signal = "SELL"
@@ -1227,20 +1269,24 @@ def simple_backtest(df, symbol=""):
                     result = "WIN"
                     break
 
-            if result is not None:
-                pnl = round(entry - exit_price, 2)
-                trades.append({
-                    "Date": pd.to_datetime(ts).strftime("%d-%m-%Y"),
-                    "Time": pd.to_datetime(ts).strftime("%H:%M:%S"),
-                    "Symbol": symbol,
-                    "Signal": signal,
-                    "Entry": round(entry, 2),
-                    "SL": round(sl, 2),
-                    "Target": round(target, 2),
-                    "Exit": round(exit_price, 2),
-                    "Result": result,
-                    "PnL": pnl
-                })
+            if exit_price is None:
+                exit_price = float(future.iloc[-1]["Close"])
+                result = "WIN" if exit_price < entry else "LOSS"
+
+            pnl = round(entry - exit_price, 2)
+
+            trades.append({
+                "Date": pd.to_datetime(ts).strftime("%d-%m-%Y"),
+                "Time": pd.to_datetime(ts).strftime("%H:%M:%S"),
+                "Symbol": symbol,
+                "Signal": signal,
+                "Entry": round(entry, 2),
+                "SL": round(sl, 2),
+                "Target": round(target, 2),
+                "Exit": round(exit_price, 2),
+                "Result": result,
+                "PnL": pnl
+            })
 
     trades_df = pd.DataFrame(trades, columns=[
         "Date", "Time", "Symbol", "Signal", "Entry",
@@ -1366,7 +1412,7 @@ def candles_to_df(candles):
 
 
 # ----------------------------
-# ANGEL WEBSOCKET (BASIC READY STRUCTURE)
+# ANGEL WEBSOCKET
 # ----------------------------
 def init_ws_state():
     defaults = {
@@ -1383,11 +1429,6 @@ def init_ws_state():
 
 
 def start_angel_websocket(api_key, client_code, pin, totp_secret, symbol_name):
-    """
-    Streamlit + broker websocket can be tricky due to reruns.
-    This function provides a basic background-thread starter if SmartWebSocketV2 is available.
-    """
-
     init_ws_state()
 
     if not SMART_WS_AVAILABLE:
@@ -1442,7 +1483,8 @@ def start_angel_websocket(api_key, client_code, pin, totp_secret, symbol_name):
                             )
                             if ltp is not None:
                                 try:
-                                    st.session_state["live_price"] = float(ltp) / 100 if float(ltp) > 10000 else float(ltp)
+                                    ltp_f = float(ltp)
+                                    st.session_state["live_price"] = ltp_f / 100 if ltp_f > 10000 else ltp_f
                                 except Exception:
                                     pass
                     except Exception:
@@ -1521,6 +1563,62 @@ def fetch_market_snapshot(symbol_map):
             continue
 
     return pd.DataFrame(rows)
+
+
+@st.cache_data(ttl=300)
+def fetch_fno_style_scanner(symbol_map):
+    rows = []
+    sno = 1
+
+    for name, ticker in symbol_map.items():
+        try:
+            df = yf.download(
+                ticker,
+                period="5d",
+                interval="1d",
+                progress=False,
+                auto_adjust=False
+            )
+
+            cmp_value = "----"
+            change_str = "----"
+            direction = "----"
+
+            if not df.empty and len(df) >= 2:
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = df.columns.get_level_values(0)
+
+                if "Close" in df.columns:
+                    close = float(df["Close"].iloc[-1])
+                    prev_close = float(df["Close"].iloc[-2])
+
+                    cmp_value = f"{close:.2f}"
+
+                    if prev_close:
+                        change_pct = ((close - prev_close) / prev_close) * 100
+                        change_str = f"{change_pct:+.2f}%"
+                        direction = "BULLISH" if change_pct >= 0 else "BEARISH"
+
+            rows.append({
+                "S.NO": sno,
+                "STOCKS": name,
+                "CMP": cmp_value,
+                "% Change": change_str,
+                "Direction": direction
+            })
+            sno += 1
+
+        except Exception:
+            rows.append({
+                "S.NO": sno,
+                "STOCKS": name,
+                "CMP": "----",
+                "% Change": "----",
+                "Direction": "----"
+            })
+            sno += 1
+
+    return pd.DataFrame(rows, columns=["S.NO", "STOCKS", "CMP", "% Change", "Direction"])
 
 
 # ----------------------------
@@ -1606,8 +1704,6 @@ stocks = {
     "ITC": "ITC.NS"
 }
 
-# IMPORTANT:
-# Verify/update these Angel tokens from your broker/master contract source.
 ANGEL_TOKENS = {
     "SBIN": "3045",
     "RELIANCE": "2885",
@@ -1644,17 +1740,28 @@ indian_indices = {
 
 major_stocks = {
     "RELIANCE": "RELIANCE.NS",
-    "TCS": "TCS.NS",
+    "HDFC BANK": "HDFCBANK.NS",
+    "ICICI BANK": "ICICIBANK.NS",
     "INFY": "INFY.NS",
-    "HDFCBANK": "HDFCBANK.NS",
-    "ICICIBANK": "ICICIBANK.NS",
-    "SBIN": "SBIN.NS",
+    "TCS": "TCS.NS",
     "ITC": "ITC.NS",
     "LT": "LT.NS",
-    "AXISBANK": "AXISBANK.NS"
+    "SBI": "SBIN.NS",
+    "AXIS BANK": "AXISBANK.NS",
+    "BHARTI AIRTEL": "BHARTIARTL.NS",
+    "KOTAK BANK": "KOTAKBANK.NS",
+    "HCLTECH": "HCLTECH.NS",
+    "ASIAN PAINTS": "ASIANPAINT.NS",
+    "MARUTI": "MARUTI.NS",
+    "SUN PHARMA": "SUNPHARMA.NS",
+    "TITAN": "TITAN.NS",
+    "ULTRATECH CEMENT": "ULTRACEMCO.NS",
+    "NESTLE INDIA": "NESTLEIND.NS",
+    "BAJAJ FINANCE": "BAJFINANCE.NS",
+    "POWER GRID": "POWERGRID.NS"
 }
 
-st.title("📈 Elite Trading Dashboard Ultimate")
+st.title("📈 Elite Trading Dashboard Ultimate V4")
 st.caption("Journal + Paper Trading + Alerts + MTF + Backtest + Global/India Market Snapshot + Angel Ready")
 
 debug_mode = st.sidebar.checkbox("Debug Mode", value=False)
@@ -1769,13 +1876,9 @@ if len(data) < 30:
     st.stop()
 
 htf_interval, htf_period = get_higher_timeframe(timeframe)
-
 angel_creds = (angel_api_key, angel_client_code, angel_pin, angel_totp_secret)
 
-if data_source == "Angel":
-    htf_data = get_data_for_timeframe(data_source, selected, ticker, htf_interval, angel_creds)
-else:
-    htf_data = get_data_for_timeframe(data_source, selected, ticker, htf_interval, angel_creds)
+htf_data = get_data_for_timeframe(data_source, selected, ticker, htf_interval, angel_creds)
 
 if not htf_data.empty:
     htf_data = add_indicators(htf_data).bfill().ffill()
@@ -1955,7 +2058,7 @@ if analysis["signal_type"] == "sell" and bull_count >= 3:
 m1, m2, m3, m4, m5, m6, m7, m8 = st.columns(8)
 with m1:
     st.metric("Current Price", round(analysis["close_price"], 2))
-    st.metric("VWAP", round(analysis["vwap"], 2) if pd.notna(analysis["vwap"]) else "N/A")
+    st.metric("VWAP", round(float(analysis["vwap"]), 2) if analysis["vwap"] is not None else "N/A")
 with m2:
     st.metric("EMA20", round(analysis["ema20"], 2))
     st.metric("EMA50", round(analysis["ema50"], 2))
@@ -1974,7 +2077,7 @@ with m6:
 with m7:
     st.metric("Signal Quality", signal_quality)
 with m8:
-    st.metric("PCR", pcr if pcr is not None else "N/A")
+    st.metric("PCR", pcr if pcr is not None else "Unavailable")
 
 a1, a2, a3, a4, a5, a6 = st.columns(6)
 with a1:
@@ -1994,7 +2097,7 @@ st.subheader("📘 Backtest Trade Log")
 if not backtest_trades_df.empty:
     st.dataframe(backtest_trades_df, use_container_width=True)
 else:
-    st.info("No backtest trades found.")
+    st.info("No backtest trades found for current symbol/timeframe.")
 
 st.subheader("🎯 Option CALL/PUT Suggestion")
 if option_suggestion["type"] == "CALL":
@@ -2035,13 +2138,23 @@ if not india_df.empty:
 else:
     st.info("Indian market data unavailable.")
 
-st.subheader("📡 Major Stocks Scanner — CMP & % Change")
-scanner_df = fetch_market_snapshot(major_stocks)
-if not scanner_df.empty:
-    scanner_df = scanner_df.sort_values("% Change", ascending=False).reset_index(drop=True)
-    st.dataframe(scanner_df, use_container_width=True)
+st.subheader("📋 F&O Style Stocks Table")
+st.caption("Yahoo Mode shows underlying spot % change, not futures % change. For genuine futures % change, a valid Angel One futures contract/quote is required.")
+
+fno_scanner_df = fetch_fno_style_scanner(major_stocks)
+
+if not fno_scanner_df.empty:
+    def highlight_direction(val):
+        if val == "BULLISH":
+            return "background-color: #163d1a; color: #7CFC00; font-weight: bold;"
+        elif val == "BEARISH":
+            return "background-color: #4a1515; color: #ff6b6b; font-weight: bold;"
+        return ""
+
+    styled_fno_df = fno_scanner_df.style.map(highlight_direction, subset=["Direction"])
+    st.dataframe(styled_fno_df, use_container_width=True, hide_index=True)
 else:
-    st.info("Scanner data unavailable.")
+    st.info("F&O style scanner data unavailable.")
 
 st.subheader("💼 Paper Trading")
 paper_state = load_paper_state()
@@ -2244,6 +2357,14 @@ st.download_button(
     mime="text/csv"
 )
 
+fno_csv = fno_scanner_df.to_csv(index=False).encode("utf-8")
+st.download_button(
+    label="📥 Download F&O Style Stocks CSV",
+    data=fno_csv,
+    file_name="fno_style_stocks.csv",
+    mime="text/csv"
+)
+
 if debug_mode:
     st.subheader("🐞 Debug")
     st.write("Data Source:", data_source)
@@ -2257,8 +2378,28 @@ if debug_mode:
     st.write("Angel Token:", ANGEL_TOKENS.get(selected))
     st.write("Backtest Rows:", len(backtest_data))
     st.write("Backtest Trades:", len(backtest_trades_df))
-    st.write("Backtest Required Nulls:")
-    st.write(backtest_data[["EMA20", "EMA50", "VWAP", "RSI", "MACD", "SignalLine", "ATR"]].isna().sum())
+    if "VWAP" in data.columns:
+        st.write("VWAP Null Count:", int(data["VWAP"].isna().sum()))
+        st.dataframe(data[["Close", "Volume", "VWAP"]].tail(10), use_container_width=True)
+    if "Volume" in data.columns:
+        st.write("Volume Sum:", float(data["Volume"].fillna(0).sum()))
+    if all(col in backtest_data.columns for col in ["EMA20", "EMA50", "VWAP", "RSI", "MACD", "SignalLine", "ATR"]):
+        st.write("Backtest Required Nulls:")
+        st.write(backtest_data[["EMA20", "EMA50", "VWAP", "RSI", "MACD", "SignalLine", "ATR"]].isna().sum())
+
+        buy_debug = (
+            (backtest_data["EMA20"] > backtest_data["EMA50"]) &
+            (backtest_data["RSI"] > 52) &
+            (backtest_data["MACD"] > backtest_data["SignalLine"])
+        )
+        sell_debug = (
+            (backtest_data["EMA20"] < backtest_data["EMA50"]) &
+            (backtest_data["RSI"] < 48) &
+            (backtest_data["MACD"] < backtest_data["SignalLine"])
+        )
+        st.write("Possible Buy Signals:", int(buy_debug.sum()))
+        st.write("Possible Sell Signals:", int(sell_debug.sum()))
+
     if data_source == "Angel":
         st.write("WebSocket Available:", SMART_WS_AVAILABLE)
         st.write("WS Connected:", st.session_state.get("ws_connected"))
