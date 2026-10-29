@@ -1465,7 +1465,18 @@ def simple_backtest(df):
         if len(sub) < 30:
             continue
 
-        analysis = analyze_signal(sub, htf_bias=None, timeframe_label="1d", backtest_win_rate=50)
+        analysis = analyze_signal(
+            sub,
+            htf_bias=None,
+            timeframe_label="1d",
+            backtest_win_rate=50
+        )
+        
+        if analysis["signal_type"] != "neutral":
+            st.write(
+                "BT Signal:",
+                analysis["signal_type"]
+            )
         future = df.iloc[i + 1:i + 10]
 
         if future.empty:
