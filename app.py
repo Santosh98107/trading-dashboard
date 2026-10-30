@@ -1557,7 +1557,7 @@ def ws_log(msg):
     with WS_STATE_LOCK:
         ts = datetime.now().strftime("%H:%M:%S")
         WS_SHARED_STATE["log"].append(f"[{ts}] {msg}")
-        WS_SHARED_STATE["log"] = WS_SHARED_STATE["log"][-50:]
+        WS_SHARED_STATE["log"] = WS_SHARED_STATE["log"][-100:]
 
 
 def ws_set_state(**kwargs):
@@ -1663,6 +1663,8 @@ def extract_ltp_from_message(message):
 
 
 def start_angel_websocket(api_key, client_code, pin, totp_secret, symbol_name):
+    ws_log("Entered start_angel_websocket()")
+    ws_log(f"Inputs => symbol={symbol_name}, ws_available={SMART_WS_AVAILABLE}")
     init_ws_state()
 
     if not SMART_WS_AVAILABLE:
@@ -1770,12 +1772,7 @@ def start_angel_websocket(api_key, client_code, pin, totp_secret, symbol_name):
 
                 correlation_id = f"elite_dashboard_feed_{symbol_name}"
                 mode = 1
-
-                if symbol_name in ["NIFTY", "BANKNIFTY"]:
-                    token_list = [{"exchangeType": 1, "tokens": [str(symbol_token)]}]
-                else:
-                    token_list = [{"exchangeType": 1, "tokens": [str(symbol_token)]}]
-
+                token_list = [{"exchangeType": 1, "tokens": [str(symbol_token)]}]
                 ws_log(f"Prepared subscribe payload: {token_list}")
 
                 def on_data(wsapp, message):
@@ -2234,6 +2231,7 @@ with st.expander("Angel One API Settings"):
     angel_pin = st.text_input("Angel PIN", type="password")
     angel_totp_secret = st.text_input("Angel TOTP Secret", type="password")
     ws_enable = st.checkbox("Enable Angel WebSocket", value=False)
+    st.sidebar.write("WS Enable current value:", ws_enable)
 
     if st.button("Test Angel Login"):
         angel, session = angel_login(
@@ -2306,6 +2304,9 @@ if data_source == "Angel":
         st.session_state["last_good_candles"] = candles
 
     if ws_enable:
+        st.write("DEBUG: ws_enable is TRUE")
+        st.write("About to start WebSocket for:", selected)
+        ws_log(f"UI requested WS start for {selected}")
         start_angel_websocket(
             angel_api_key,
             angel_client_code,
@@ -2313,6 +2314,10 @@ if data_source == "Angel":
             angel_totp_secret,
             selected
         )
+        sync_ws_state_to_session()
+    else:
+        st.write("DEBUG: ws_enable is FALSE")
+        ws_log("WS not started because ws_enable is False")
 else:
     data = fetch_data(ticker, yf_interval, yf_period)
 
@@ -2485,6 +2490,12 @@ if data_source == "Angel" and ws_enable:
 
     if st.session_state.get("ws_last_tick") is None:
         st.info("WebSocket connected nahi hua ya abhi tak koi tick receive nahi hua.")
+
+    st.write("DEBUG WS LOG RAW:", st.session_state.get("ws_log", []))
+
+    with st.expander("WS Live Log", expanded=True):
+        sync_ws_state_to_session()
+        st.code("\n".join(st.session_state.get("ws_log", [])) if st.session_state.get("ws_log") else "No WS logs yet")
 
 st.subheader("📊 Multi Timeframe Alignment")
 st.dataframe(mtf_table, use_container_width=True)
