@@ -1,5 +1,6 @@
 import os
 import json
+import math
 import shutil
 import hashlib
 from datetime import datetime, timedelta, time, timezone
@@ -25,6 +26,9 @@ except Exception:
 
 st.set_page_config(page_title="Elite Trading Dashboard Final Ultimate", layout="wide")
 
+# =========================================================
+# FILES / CONFIG
+# =========================================================
 DATA_DIR = "elite_data"
 BACKUP_DIR = os.path.join(DATA_DIR, "backup")
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -43,6 +47,7 @@ RISK_STATE_FILE = os.path.join(DATA_DIR, "risk_state.csv")
 WEEKLY_RISK_FILE = os.path.join(DATA_DIR, "weekly_risk_state.csv")
 MONTHLY_RISK_FILE = os.path.join(DATA_DIR, "monthly_risk_state.csv")
 OPTION_CHAIN_FILE = os.path.join(DATA_DIR, "option_chain_cache.json")
+NEWS_CACHE_FILE = os.path.join(DATA_DIR, "news_cache.json")
 
 MAX_WS_RETRIES = 5
 WS_RETRY_DELAY_SEC = 5
@@ -84,7 +89,9 @@ WS_SHARED_STATE = {
     "log": []
 }
 
-
+# =========================================================
+# BASIC UTILITIES
+# =========================================================
 def now_str():
     return datetime.now().strftime("%d-%m-%Y %H:%M:%S")
 
@@ -93,21 +100,15 @@ def hash_password(password: str) -> str:
     return hashlib.sha256(password.encode()).hexdigest()
 
 
-def log_app_error(source, message):
+def backup_file(path):
     try:
-        row = pd.DataFrame([{
-            "DateTime": now_str(),
-            "Source": str(source),
-            "Message": str(message)
-        }])
-        if os.path.exists(ERROR_LOG_FILE):
-            old = pd.read_csv(ERROR_LOG_FILE)
-            old = pd.concat([old, row], ignore_index=True)
-            old.to_csv(ERROR_LOG_FILE, index=False)
-        else:
-            row.to_csv(ERROR_LOG_FILE, index=False)
-    except Exception:
-        pass
+        if os.path.exists(path):
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            name = os.path.basename(path)
+            shutil.copy(path, os.path.join(BACKUP_DIR, f"{ts}_{name}"))
+            enforce_backup_retention()
+    except Exception as e:
+        log_app_error("backup_file", e)
 
 
 def enforce_backup_retention():
@@ -128,15 +129,21 @@ def enforce_backup_retention():
         log_app_error("enforce_backup_retention", e)
 
 
-def backup_file(path):
+def log_app_error(source, message):
     try:
-        if os.path.exists(path):
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            name = os.path.basename(path)
-            shutil.copy(path, os.path.join(BACKUP_DIR, f"{ts}_{name}"))
-            enforce_backup_retention()
-    except Exception as e:
-        log_app_error("backup_file", e)
+        row = pd.DataFrame([{
+            "DateTime": now_str(),
+            "Source": str(source),
+            "Message": str(message)
+        }])
+        if os.path.exists(ERROR_LOG_FILE):
+            old = pd.read_csv(ERROR_LOG_FILE)
+            old = pd.concat([old, row], ignore_index=True)
+            old.to_csv(ERROR_LOG_FILE, index=False)
+        else:
+            row.to_csv(ERROR_LOG_FILE, index=False)
+    except Exception:
+        pass
 
 
 def safe_read_csv(path, default_df=None):
@@ -174,9 +181,15 @@ def data_integrity_check(df, required_cols=None, min_rows=1):
         return False, str(e)
 
 
+# =========================================================
+# INIT FILES
+# =========================================================
 def init_users():
     if not os.path.exists(USERS_FILE):
-        df = pd.DataFrame([{"username": "admin", "password": hash_password("admin123")}])
+        df = pd.DataFrame([{
+            "username": "admin",
+            "password": hash_password("admin123")
+        }])
         safe_write_csv(df, USERS_FILE)
         return
     try:
@@ -184,7 +197,10 @@ def init_users():
         if "username" not in users.columns or "password" not in users.columns:
             raise ValueError("Invalid users file structure")
     except Exception:
-        df = pd.DataFrame([{"username": "admin", "password": hash_password("admin123")}])
+        df = pd.DataFrame([{
+            "username": "admin",
+            "password": hash_password("admin123")
+        }])
         safe_write_csv(df, USERS_FILE)
 
 
@@ -212,17 +228,23 @@ def init_paper_state():
 
 def init_daily_summary():
     if not os.path.exists(DAILY_SUMMARY_FILE):
-        safe_write_csv(pd.DataFrame(columns=["Date", "TotalTrades", "Wins", "Losses", "RealizedPnL", "WinRate"]), DAILY_SUMMARY_FILE)
+        safe_write_csv(pd.DataFrame(columns=[
+            "Date", "TotalTrades", "Wins", "Losses", "RealizedPnL", "WinRate"
+        ]), DAILY_SUMMARY_FILE)
 
 
 def init_weekly_summary():
     if not os.path.exists(WEEKLY_SUMMARY_FILE):
-        safe_write_csv(pd.DataFrame(columns=["WeekKey", "TotalTrades", "Wins", "Losses", "RealizedPnL", "WinRate"]), WEEKLY_SUMMARY_FILE)
+        safe_write_csv(pd.DataFrame(columns=[
+            "WeekKey", "TotalTrades", "Wins", "Losses", "RealizedPnL", "WinRate"
+        ]), WEEKLY_SUMMARY_FILE)
 
 
 def init_monthly_summary():
     if not os.path.exists(MONTHLY_SUMMARY_FILE):
-        safe_write_csv(pd.DataFrame(columns=["MonthKey", "TotalTrades", "Wins", "Losses", "RealizedPnL", "WinRate"]), MONTHLY_SUMMARY_FILE)
+        safe_write_csv(pd.DataFrame(columns=[
+            "MonthKey", "TotalTrades", "Wins", "Losses", "RealizedPnL", "WinRate"
+        ]), MONTHLY_SUMMARY_FILE)
 
 
 def init_risk_state():
@@ -270,6 +292,9 @@ def init_signal_audit():
         safe_write_csv(df, SIGNAL_AUDIT_FILE)
 
 
+# =========================================================
+# LOAD / SAVE
+# =========================================================
 def load_journal():
     init_journal()
     return safe_read_csv(JOURNAL_FILE, pd.DataFrame())
@@ -349,6 +374,9 @@ def save_signal_audit(df):
     safe_write_csv(df, SIGNAL_AUDIT_FILE)
 
 
+# =========================================================
+# AUTH
+# =========================================================
 def login_panel():
     init_users()
     if "logged_in" not in st.session_state:
@@ -386,17 +414,23 @@ def login_panel():
         st.rerun()
 
 
+# =========================================================
+# DATA FETCH
+# =========================================================
 @st.cache_data(ttl=30)
 def fetch_data(ticker, interval, period):
     try:
         df = yf.download(ticker, interval=interval, period=period, progress=False, auto_adjust=False)
         if df.empty:
             return pd.DataFrame()
+
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
+
         needed = ["Open", "High", "Low", "Close", "Volume"]
         if any(c not in df.columns for c in needed):
             return pd.DataFrame()
+
         df = df[needed].copy()
         df.index = pd.to_datetime(df.index, errors="coerce")
         df = df[~df.index.isna()].copy()
@@ -523,6 +557,9 @@ def get_angel_ltp_polling(api_key, client_code, pin, totp_secret, symbol_name):
         return None
 
 
+# =========================================================
+# OPTIONAL WEBSOCKET
+# =========================================================
 def ws_log(msg):
     with WS_STATE_LOCK:
         ts = datetime.now().strftime("%H:%M:%S")
@@ -543,7 +580,7 @@ def ws_get_state():
 
 def sync_ws_state_to_session():
     state = ws_get_state()
-    mapping = {
+    for k, v in {
         "ws_running": state["running"],
         "ws_connected": state["connected"],
         "ws_error": state["error"],
@@ -553,8 +590,7 @@ def sync_ws_state_to_session():
         "ws_should_run": state["should_run"],
         "ws_thread_started": state["thread_started"],
         "ws_log": state["log"]
-    }
-    for k, v in mapping.items():
+    }.items():
         st.session_state[k] = v
 
 
@@ -643,6 +679,7 @@ def start_angel_websocket(api_key, client_code, pin, totp_secret, symbol_name):
             if retry_count >= MAX_WS_RETRIES:
                 ws_set_state(error="Max reconnect attempts reached", running=False, connected=False, retries=retry_count, thread_started=False, socket=None)
                 break
+
             try:
                 angel, session = angel_login(api_key, client_code, pin, totp_secret, force_refresh=True)
                 if angel is None or session is None or not session.get("data"):
@@ -705,7 +742,10 @@ def start_angel_websocket(api_key, client_code, pin, totp_secret, symbol_name):
                     ws_set_state(connected=False, running=False, socket=None)
 
             except Exception as e:
-                ws_set_state(error=f"Reconnect attempt {retry_count + 1}/{MAX_WS_RETRIES}: {e}", connected=False, running=False, socket=None)
+                ws_set_state(
+                    error=f"Reconnect attempt {retry_count + 1}/{MAX_WS_RETRIES}: {e}",
+                    connected=False, running=False, socket=None
+                )
                 log_app_error("start_angel_websocket", e)
 
             retry_count += 1
@@ -720,6 +760,9 @@ def start_angel_websocket(api_key, client_code, pin, totp_secret, symbol_name):
     sync_ws_state_to_session()
 
 
+# =========================================================
+# INDICATORS
+# =========================================================
 def compute_rsi(series, window=14):
     delta = series.diff()
     gain = delta.clip(lower=0)
@@ -909,6 +952,7 @@ def add_indicators(df):
         (df["Low"] <= df["PivotHigh"].shift(1)) &
         (df["Close"] > df["PivotHigh"].shift(1))
     )
+
     df["RetestBear"] = (
         df["Breakdown"].shift(1) &
         (df["High"] >= df["PivotLow"].shift(1)) &
@@ -944,14 +988,18 @@ def add_indicators(df):
     return df
 
 
+# =========================================================
+# NEWS FILTER API
+# =========================================================
 @st.cache_data(ttl=300)
 def get_news_events(news_api_key, symbol):
     if not news_api_key:
         return {"allow_trade": True, "message": "News API key not configured", "events": []}
     try:
+        query = symbol
         url = "https://newsapi.org/v2/everything"
         params = {
-            "q": symbol,
+            "q": query,
             "sortBy": "publishedAt",
             "pageSize": 10,
             "language": "en",
@@ -997,6 +1045,9 @@ def get_news_events(news_api_key, symbol):
         return {"allow_trade": True, "message": "News filter fallback", "events": []}
 
 
+# =========================================================
+# OPTION CHAIN / PCR / OI
+# =========================================================
 @st.cache_data(ttl=120)
 def get_option_chain_snapshot(symbol="NIFTY"):
     try:
@@ -1083,6 +1134,9 @@ def parse_option_chain_metrics(symbol="NIFTY"):
         }
 
 
+# =========================================================
+# SIGNAL ANALYSIS HELPERS
+# =========================================================
 def detect_gap_filter(df):
     try:
         if len(df) < 2:
@@ -1257,7 +1311,16 @@ def calculate_win_chance(bullish, bearish, adx, volume_spike, breakout, breakdow
     return int(max(5, min(score, 95)))
 
 
-def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50, mtf_bull_count=0, mtf_bear_count=0, option_metrics=None, news_info=None):
+def analyze_signal(
+    df,
+    htf_bias=None,
+    timeframe_label="1d",
+    backtest_win_rate=50,
+    mtf_bull_count=0,
+    mtf_bear_count=0,
+    option_metrics=None,
+    news_info=None
+):
     latest = df.iloc[-1]
     prev = df.iloc[-2]
 
@@ -1497,7 +1560,13 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
     mtf_strict_bull_ok = mtf_bull_count >= MANDATORY_MTF_ALIGN_COUNT
     mtf_strict_bear_ok = mtf_bear_count >= MANDATORY_MTF_ALIGN_COUNT
 
-    option_metrics = option_metrics or {"pcr": None, "oi_bias": "Neutral", "long_unwinding": False, "short_covering": False}
+    option_metrics = option_metrics or {
+        "pcr": None,
+        "oi_bias": "Neutral",
+        "long_unwinding": False,
+        "short_covering": False
+    }
+
     pcr = option_metrics.get("pcr")
     oi_bias = option_metrics.get("oi_bias")
     long_unwinding = option_metrics.get("long_unwinding", False)
@@ -1591,6 +1660,7 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
             partial_exit = target1
             trailing_stop = close_price - (0.5 * atr)
             rr_ratio = round(buy_rr, 2)
+
         elif bearish >= 10 and (bearish - bullish) >= 4 and rsi < 45 and macd < macd_signal and sell_mandatory_ok and sell_rr is not None and sell_rr >= MIN_RR_REQUIRED:
             signal_text = "STRONG SELL"
             signal_type = "sell"
@@ -1602,6 +1672,7 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
             partial_exit = target1
             trailing_stop = close_price + (0.5 * atr)
             rr_ratio = round(sell_rr, 2)
+
         elif not STRICT_TRADE_ONLY_STRONG:
             if bullish > bearish and bullish >= 7 and supertrend_dir == 1 and not DISABLE_BUY_BIAS_TRADING:
                 signal_text = "BUY BIAS"
@@ -1743,6 +1814,9 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
     }
 
 
+# =========================================================
+# SIGNAL AUDIT / DUPLICATE / EXPIRY
+# =========================================================
 def add_signal_audit(symbol, timeframe, analysis):
     try:
         audit = load_signal_audit()
@@ -1810,6 +1884,9 @@ def get_signal_expiry_remaining(symbol, timeframe, signal_text):
         return None
 
 
+# =========================================================
+# RISK / PAPER TRADING
+# =========================================================
 def get_today_closed_trades():
     journal = load_journal()
     if journal.empty:
@@ -2042,7 +2119,7 @@ def auto_paper_trade_exit(current_price):
             exit_price = None
             result = None
 
-            if "BUY" in signal or "CALL" in signal:
+            if "BUY" in signal:
                 if t1 is not None and current_price >= t1:
                     t1_hit = True
                 if t2 is not None and current_price >= t2:
@@ -2062,6 +2139,7 @@ def auto_paper_trade_exit(current_price):
                 elif t1 is not None and current_price >= t1:
                     exit_price = t1
                     result = "WIN"
+
             else:
                 if t1 is not None and current_price <= t1:
                     t1_hit = True
@@ -2084,7 +2162,7 @@ def auto_paper_trade_exit(current_price):
                     result = "WIN"
 
             if exit_price is not None:
-                paper_trade_exit(entry, exit_price, qty, signal)
+                pnl = paper_trade_exit(entry, exit_price, qty, signal)
                 close_trade_in_journal(idx, exit_price, result=result, t1_hit=t1_hit, t2_hit=t2_hit, t3_hit=t3_hit)
                 closed_count += 1
 
@@ -2094,6 +2172,9 @@ def auto_paper_trade_exit(current_price):
         return 0
 
 
+# =========================================================
+# BACKTEST / WALK FORWARD / SHARPE
+# =========================================================
 def compute_equity_curve_from_trades(trades_df, initial_capital=100000):
     if trades_df.empty or "PnL" not in trades_df.columns:
         return pd.DataFrame(columns=["TradeNo", "Equity", "DrawdownPct", "ReturnPct"]), 0.0
@@ -2368,7 +2449,16 @@ def walk_forward_validation(df, symbol="", timeframe_label="", option_metrics=No
         start = 0
         fold_no = 1
         while (start + train_size + test_size) <= total_len:
+            train_df = df.iloc[start:start + train_size].copy()
             test_df = df.iloc[start + train_size:start + train_size + test_size].copy()
+
+            _, _, _, _, _ = simple_backtest(
+                train_df,
+                symbol=symbol,
+                timeframe_label=timeframe_label,
+                option_metrics=option_metrics,
+                news_info=news_info
+            )
 
             wins, losses, total, win_rate, trades_df = simple_backtest(
                 test_df,
@@ -2408,6 +2498,9 @@ def walk_forward_validation(df, symbol="", timeframe_label="", option_metrics=No
         return {"folds": 0, "avg_win_rate": 0.0, "avg_profit_factor": 0.0, "avg_expectancy": 0.0, "table": pd.DataFrame()}
 
 
+# =========================================================
+# REPORTS / ANALYTICS
+# =========================================================
 def update_daily_summary():
     init_daily_summary()
     journal = load_journal()
@@ -2558,6 +2651,9 @@ def best_worst_time_of_day(backtest_trades_df):
     return best, worst, grp
 
 
+# =========================================================
+# TELEGRAM
+# =========================================================
 def send_telegram_alert(token, chat_id, message):
     try:
         url = f"https://api.telegram.org/bot{token}/sendMessage"
@@ -2569,6 +2665,9 @@ def send_telegram_alert(token, chat_id, message):
         return False
 
 
+# =========================================================
+# MTF HELPERS
+# =========================================================
 def get_data_for_timeframe(data_source, selected, ticker, tf, angel_creds):
     if data_source == "Yahoo":
         if tf == "1m":
@@ -2621,6 +2720,9 @@ def get_mtf_signal(data_source, selected, ticker, tf, angel_creds):
     return "⚪ Neutral"
 
 
+# =========================================================
+# OPTION STRIKE
+# =========================================================
 def suggest_option_strike(symbol, spot_price, signal_type):
     if symbol == "NIFTY":
         step = 50
@@ -2637,6 +2739,9 @@ def suggest_option_strike(symbol, spot_price, signal_type):
     return {"type": "NONE", "atm": None, "otm": None, "text": "No option strike suggestion"}
 
 
+# =========================================================
+# APP INIT
+# =========================================================
 login_panel()
 init_journal()
 init_paper_state()
@@ -2736,6 +2841,7 @@ else:
     yf_interval, yf_period = "1d", "1y"
 
 data = pd.DataFrame()
+
 if "last_good_candles" not in st.session_state:
     st.session_state["last_good_candles"] = None
 
@@ -2889,6 +2995,7 @@ elif data_source == "Angel" and ws_enable:
     live_price = st.session_state.get("live_price")
 
 current_display_price = live_price if live_price else analysis["close_price"]
+
 closed_auto = auto_paper_trade_exit(current_display_price)
 
 option_suggestion = suggest_option_strike(selected, analysis["close_price"], analysis["signal_type"])
@@ -3005,11 +3112,7 @@ a1, a2, a3, a4, a5, a6 = st.columns(6)
 with a1:
     st.metric("ADX", round(analysis["adx"], 2))
 with a2:
-    st.metric(
-        "EMA200 Confirm",
-        "Yes" if ((analysis["signal_type"] == "buy" and analysis["close_price"] > analysis["ema200"]) or
-                  (analysis["signal_type"] == "sell" and analysis["close_price"] < analysis["ema200"])) else "No"
-    )
+    st.metric("EMA200 Confirm", "Yes" if ((analysis["signal_type"] == "buy" and analysis["close_price"] > analysis["ema200"]) or (analysis["signal_type"] == "sell" and analysis["close_price"] < analysis["ema200"])) else "No")
 with a3:
     st.metric("SuperTrend", "Bullish" if analysis["supertrend_direction"] == 1 else "Bearish" if analysis["supertrend_direction"] == -1 else "Neutral")
 with a4:
@@ -3067,5 +3170,179 @@ with rk1:
 with rk2:
     st.metric("Daily Lock", "Yes" if bool(risk_state.loc[0, "DailyLock"]) else "No")
 with rk3:
-    st.metric("Weekly Lock", "Yes" if
+    st.metric("Weekly Lock", "Yes" if bool(weekly_risk.loc[0, "WeeklyLock"]) else "No")
+with rk4:
+    st.metric("Monthly Lock", "Yes" if bool(monthly_risk.loc[0, "MonthlyLock"]) else "No")
+with rk5:
+    st.metric("Risk Status", risk_msg)
 
+if analysis["signal_type"] in ["buy", "sell"] and analysis["stop_loss"] is not None:
+    qty = calculate_position_size(analysis["close_price"], analysis["stop_loss"], paper_balance)
+    t1c, t2c, t3c, t4c, t5c, t6c = st.columns(6)
+    with t1c:
+        st.metric("Stop Loss", round(analysis["stop_loss"], 2))
+    with t2c:
+        st.metric("Partial Exit", round(analysis["partial_exit"], 2) if analysis["partial_exit"] else "-")
+    with t3c:
+        st.metric("Target 1", round(analysis["target1"], 2) if analysis["target1"] else "-")
+    with t4c:
+        st.metric("Target 2", round(analysis["target2"], 2) if analysis["target2"] else "-")
+    with t5c:
+        st.metric("Target 3", round(analysis["target3"], 2) if analysis["target3"] else "-")
+    with t6c:
+        st.metric("Auto Position Size", qty)
+
+    if st.button("Paper Trade Entry"):
+        if not risk_ok:
+            st.error(risk_msg)
+        else:
+            ok_entry = paper_trade_entry(analysis["close_price"], qty)
+            if ok_entry:
+                add_trade_to_journal(
+                    selected, timeframe, analysis["signal_text"], analysis["close_price"], qty,
+                    analysis["stop_loss"], analysis["target1"], analysis["target2"], analysis["target3"],
+                    analysis["trailing_stop"], analysis, notes="Paper trade entry from dashboard"
+                )
+                st.success("Paper trade entered")
+            else:
+                st.error("Insufficient paper balance")
+
+with st.expander("Why this signal?"):
+    for reason in analysis["reasons"]:
+        st.write("-", reason)
+
+if news_filter_enabled:
+    st.subheader("News Filter Events")
+    if news_info["events"]:
+        st.dataframe(pd.DataFrame(news_info["events"]), use_container_width=True)
+    else:
+        st.info(news_info["message"])
+
+st.subheader("Backtest Analytics")
+ba1, ba2, ba3, ba4, ba5, ba6 = st.columns(6)
+with ba1:
+    st.metric("Backtest Wins", wins)
+with ba2:
+    st.metric("Backtest Losses", losses)
+with ba3:
+    st.metric("Total Trades", total_trades)
+with ba4:
+    st.metric("Backtest Win Rate", f"{backtest_win_rate:.1f}%")
+with ba5:
+    st.metric("Profit Factor", stats["profit_factor"])
+with ba6:
+    st.metric("Max Drawdown %", max_drawdown)
+
+bb1, bb2, bb3, bb4, bb5, bb6 = st.columns(6)
+with bb1:
+    st.metric("Winning Streak", stats["winning_streak"])
+with bb2:
+    st.metric("Losing Streak", stats["losing_streak"])
+with bb3:
+    st.metric("Average Win", stats["avg_win"])
+with bb4:
+    st.metric("Average Loss", stats["avg_loss"])
+with bb5:
+    st.metric("Expectancy", stats["expectancy"])
+with bb6:
+    st.metric("Sharpe Ratio", stats["sharpe_ratio"])
+
+bc1, bc2, bc3, bc4 = st.columns(4)
+with bc1:
+    st.metric("T1 Hit Rate %", stats["t1_hit_rate"])
+with bc2:
+    st.metric("T2 Hit Rate %", stats["t2_hit_rate"])
+with bc3:
+    st.metric("T3 Hit Rate %", stats["t3_hit_rate"])
+with bc4:
+    st.metric("Profitability Score", stats["profitability_score"])
+
+st.subheader("Walk Forward Validation")
+wf1, wf2, wf3, wf4 = st.columns(4)
+with wf1:
+    st.metric("Folds", walk_forward_result["folds"])
+with wf2:
+    st.metric("Avg Win Rate", walk_forward_result["avg_win_rate"])
+with wf3:
+    st.metric("Avg Profit Factor", walk_forward_result["avg_profit_factor"])
+with wf4:
+    st.metric("Avg Expectancy", walk_forward_result["avg_expectancy"])
+
+if not walk_forward_result["table"].empty:
+    st.dataframe(walk_forward_result["table"], use_container_width=True)
+else:
+    st.info("Walk forward validation data unavailable.")
+
+st.subheader("Equity Curve")
+if not equity_curve_df.empty:
+    eq_fig = go.Figure()
+    eq_fig.add_trace(go.Scatter(x=equity_curve_df["TradeNo"], y=equity_curve_df["Equity"], mode="lines", name="Equity"))
+    eq_fig.update_layout(height=320, template="plotly_dark", title="Equity Curve")
+    st.plotly_chart(eq_fig, use_container_width=True)
+else:
+    st.info("No equity curve data available.")
+
+st.subheader("Best / Worst Time of Day")
+if best_hour is not None and worst_hour is not None:
+    bt1, bt2 = st.columns(2)
+    with bt1:
+        st.success(f"Best Hour: {int(best_hour['Hour'])}:00 | AvgPnL: {round(best_hour['AvgPnL'], 2)}")
+    with bt2:
+        st.error(f"Worst Hour: {int(worst_hour['Hour'])}:00 | AvgPnL: {round(worst_hour['AvgPnL'], 2)}")
+    st.dataframe(hour_perf_df, use_container_width=True)
+else:
+    st.info("Time of day analysis unavailable.")
+
+st.subheader("Backtest Trade Log")
+if not backtest_trades_df.empty:
+    st.dataframe(backtest_trades_df, use_container_width=True)
+else:
+    st.info("No backtest trades found.")
+
+journal = load_journal()
+update_daily_summary()
+update_weekly_summary()
+update_monthly_summary()
+
+st.subheader("Journal Analytics Dashboard")
+closed_journal = journal[journal["Status"] == "CLOSED"].copy() if not journal.empty else pd.DataFrame()
+if not closed_journal.empty:
+    sym_perf = symbol_wise_performance(journal)
+    tf_perf = timeframe_wise_performance(journal)
+
+    j1, j2 = st.columns(2)
+    with j1:
+        st.markdown("**Symbol-wise Performance**")
+        st.dataframe(sym_perf, use_container_width=True)
+    with j2:
+        st.markdown("**Timeframe-wise Performance**")
+        st.dataframe(tf_perf, use_container_width=True)
+
+    st.markdown("**Closed Trade Journal**")
+    st.dataframe(closed_journal, use_container_width=True)
+else:
+    st.info("No closed trades in journal yet.")
+
+st.subheader("Daily / Weekly / Monthly Reports")
+rep1, rep2, rep3 = st.columns(3)
+with rep1:
+    st.markdown("**Daily Summary**")
+    st.dataframe(safe_read_csv(DAILY_SUMMARY_FILE), use_container_width=True)
+with rep2:
+    st.markdown("**Weekly Summary**")
+    st.dataframe(safe_read_csv(WEEKLY_SUMMARY_FILE), use_container_width=True)
+with rep3:
+    st.markdown("**Monthly Summary**")
+    st.dataframe(safe_read_csv(MONTHLY_SUMMARY_FILE), use_container_width=True)
+
+st.subheader("Option Suggestion")
+if option_suggestion["type"] == "CALL":
+    st.success(option_suggestion["text"])
+elif option_suggestion["type"] == "PUT":
+    st.error(option_suggestion["text"])
+else:
+    st.warning(option_suggestion["text"])
+
+if debug_mode:
+    st.subheader("Debug Panel")
+   
