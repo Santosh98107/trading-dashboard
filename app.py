@@ -533,11 +533,102 @@ def compute_vwap(df):
     return df
 
 
+def convert_to_heikin_ashi(df):
+    ha = df.copy()
+    if ha.empty:
+        return ha
+
+    ha["HA_Close"] = (ha["Open"] + ha["High"] + ha["Low"] + ha["Close"]) / 4
+
+    ha_open = [(ha["Open"].iloc[0] + ha["Close"].iloc[0]) / 2]
+    for i in range(1, len(ha)):
+        ha_open.append((ha_open[i - 1] + ha["HA_Close"].iloc[i - 1]) / 2)
+
+    ha["HA_Open"] = ha_open
+    ha["HA_High"] = ha[["High", "HA_Open", "HA_Close"]].max(axis=1)
+    ha["HA_Low"] = ha[["Low", "HA_Open", "HA_Close"]].min(axis=1)
+    return ha
+
+
+def compute_supertrend(df, period=10, multiplier=3):
+    data = df.copy()
+    if data.empty:
+        data["SuperTrend"] = np.nan
+        data["SuperTrendDirection"] = 0
+        return data
+
+    high = data["High"]
+    low = data["Low"]
+    close = data["Close"]
+
+    tr1 = high - low
+    tr2 = (high - close.shift(1)).abs()
+    tr3 = (low - close.shift(1)).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+    atr = tr.rolling(period).mean()
+
+    hl2 = (high + low) / 2
+    upperband = hl2 + (multiplier * atr)
+    lowerband = hl2 - (multiplier * atr)
+
+    final_upperband = upperband.copy()
+    final_lowerband = lowerband.copy()
+
+    for i in range(1, len(data)):
+        if pd.notna(close.iloc[i - 1]) and pd.notna(final_upperband.iloc[i - 1]):
+            if close.iloc[i - 1] <= final_upperband.iloc[i - 1]:
+                final_upperband.iloc[i] = min(upperband.iloc[i], final_upperband.iloc[i - 1])
+            else:
+                final_upperband.iloc[i] = upperband.iloc[i]
+
+        if pd.notna(close.iloc[i - 1]) and pd.notna(final_lowerband.iloc[i - 1]):
+            if close.iloc[i - 1] >= final_lowerband.iloc[i - 1]:
+                final_lowerband.iloc[i] = max(lowerband.iloc[i], final_lowerband.iloc[i - 1])
+            else:
+                final_lowerband.iloc[i] = lowerband.iloc[i]
+
+    supertrend = pd.Series(index=data.index, dtype=float)
+    direction = pd.Series(index=data.index, dtype=float)
+
+    for i in range(len(data)):
+        if i == 0:
+            supertrend.iloc[i] = final_upperband.iloc[i] if pd.notna(final_upperband.iloc[i]) else np.nan
+            direction.iloc[i] = -1
+            continue
+
+        prev_upper = final_upperband.iloc[i - 1]
+        prev_lower = final_lowerband.iloc[i - 1]
+        curr_close = close.iloc[i]
+
+        if pd.notna(prev_upper) and curr_close > prev_upper:
+            direction.iloc[i] = 1
+        elif pd.notna(prev_lower) and curr_close < prev_lower:
+            direction.iloc[i] = -1
+        else:
+            direction.iloc[i] = direction.iloc[i - 1]
+
+            if direction.iloc[i] == 1 and pd.notna(final_lowerband.iloc[i - 1]) and pd.notna(final_lowerband.iloc[i]):
+                if final_lowerband.iloc[i] < final_lowerband.iloc[i - 1]:
+                    final_lowerband.iloc[i] = final_lowerband.iloc[i - 1]
+
+            if direction.iloc[i] == -1 and pd.notna(final_upperband.iloc[i - 1]) and pd.notna(final_upperband.iloc[i]):
+                if final_upperband.iloc[i] > final_upperband.iloc[i - 1]:
+                    final_upperband.iloc[i] = final_upperband.iloc[i - 1]
+
+        supertrend.iloc[i] = final_lowerband.iloc[i] if direction.iloc[i] == 1 else final_upperband.iloc[i]
+
+    data["SuperTrend"] = supertrend
+    data["SuperTrendDirection"] = direction.fillna(0).astype(int)
+    return data
+
+
 def add_indicators(df):
     df = df.copy()
 
     df["EMA20"] = df["Close"].ewm(span=20, adjust=False).mean()
     df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
+    df["EMA200"] = df["Close"].ewm(span=200, adjust=False).mean()
 
     df = compute_vwap(df)
 
@@ -554,6 +645,8 @@ def add_indicators(df):
     low_close = (df["Low"] - df["Close"].shift(1)).abs()
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     df["ATR"] = tr.rolling(14).mean()
+
+    df = compute_supertrend(df, period=10, multiplier=3)
 
     df["SMA20"] = df["Close"].rolling(20).mean()
     std20 = df["Close"].rolling(20).std()
@@ -730,6 +823,20 @@ def add_indicators(df):
         np.nan
     )
 
+    df["BullishPA"] = np.where(
+        (df["BullishEngulfing"]) | (df["Hammer"]) | (df["MorningStar"]) | (df["ThreeWhiteSoldiers"]) |
+        (df["BullishHarami"]) | (df["PiercingPattern"]) | (df["InvertedHammer"]) | (df["DragonflyDoji"]),
+        df["Low"] * 0.995,
+        np.nan
+    )
+
+    df["BearishPA"] = np.where(
+        (df["BearishEngulfing"]) | (df["ShootingStar"]) | (df["EveningStar"]) | (df["ThreeBlackCrows"]) |
+        (df["BearishHarami"]) | (df["DarkCloudCover"]) | (df["HangingMan"]) | (df["GravestoneDoji"]),
+        df["High"] * 1.005,
+        np.nan
+    )
+
     return df
 
 
@@ -889,9 +996,27 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
     latest = df.iloc[-1]
     prev = df.iloc[-2]
 
+    ha_df = convert_to_heikin_ashi(df.tail(10))
+    ha_latest = ha_df.iloc[-1]
+    ha_prev = ha_df.iloc[-2]
+
+    ha_bullish = ha_latest["HA_Close"] > ha_latest["HA_Open"]
+    ha_bearish = ha_latest["HA_Close"] < ha_latest["HA_Open"]
+
+    ha_trend_up = (
+        ha_latest["HA_Close"] > ha_latest["HA_Open"] and
+        ha_prev["HA_Close"] > ha_prev["HA_Open"]
+    )
+
+    ha_trend_down = (
+        ha_latest["HA_Close"] < ha_latest["HA_Open"] and
+        ha_prev["HA_Close"] < ha_prev["HA_Open"]
+    )
+
     close_price = float(latest["Close"])
     ema20 = float(latest["EMA20"])
     ema50 = float(latest["EMA50"])
+    ema200 = float(latest["EMA200"]) if pd.notna(latest.get("EMA200", np.nan)) else close_price
     ema20_slope = ema20 - float(prev["EMA20"])
     vwap = float(latest["VWAP"]) if pd.notna(latest["VWAP"]) else float(close_price)
     rsi = float(latest["RSI"])
@@ -903,6 +1028,7 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
     adx = float(latest["ADX"]) if pd.notna(latest["ADX"]) else 0.0
     support = float(latest["PivotLow"]) if pd.notna(latest["PivotLow"]) else close_price
     resistance = float(latest["PivotHigh"]) if pd.notna(latest["PivotHigh"]) else close_price
+    supertrend_dir = int(latest["SuperTrendDirection"]) if "SuperTrendDirection" in df.columns and pd.notna(latest["SuperTrendDirection"]) else 0
 
     distance_to_resistance = ((resistance - close_price) / close_price) * 100 if close_price else 0
     distance_to_support = ((close_price - support) / close_price) * 100 if close_price else 0
@@ -924,6 +1050,34 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
     retest_bear = bool(latest.get("RetestBear", False))
     plus_di = float(latest["PlusDI"]) if pd.notna(latest["PlusDI"]) else 0
     minus_di = float(latest["MinusDI"]) if pd.notna(latest["MinusDI"]) else 0
+
+    bullish_price_action = any([
+        hammer,
+        bull_maru,
+        bull_engulf,
+        bool(latest.get("MorningStar", False)),
+        bool(latest.get("ThreeWhiteSoldiers", False)),
+        bool(latest.get("PiercingPattern", False)),
+        bool(latest.get("BullishHarami", False)),
+        bool(latest.get("TweezerBottom", False)),
+        bool(latest.get("InvertedHammer", False)),
+        bool(latest.get("DragonflyDoji", False)),
+        retest_bull
+    ])
+
+    bearish_price_action = any([
+        shooting_star,
+        bear_maru,
+        bear_engulf,
+        bool(latest.get("EveningStar", False)),
+        bool(latest.get("ThreeBlackCrows", False)),
+        bool(latest.get("DarkCloudCover", False)),
+        bool(latest.get("BearishHarami", False)),
+        bool(latest.get("TweezerTop", False)),
+        bool(latest.get("HangingMan", False)),
+        bool(latest.get("GravestoneDoji", False)),
+        retest_bear
+    ])
 
     bullish = 0
     bearish = 0
@@ -959,6 +1113,13 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
     else:
         bearish += 1
         reasons.append("Price below EMA20")
+
+    if close_price > ema200:
+        bullish += 2
+        reasons.append("Price above EMA200 long-term bullish")
+    elif close_price < ema200:
+        bearish += 2
+        reasons.append("Price below EMA200 long-term bearish")
 
     if pd.notna(vwap):
         if close_price > vwap:
@@ -1037,9 +1198,35 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
         bearish += 2
         reasons.append("Fresh bearish EMA crossover")
 
+    if supertrend_dir == 1:
+        bullish += 3
+        reasons.append("SuperTrend bullish")
+    elif supertrend_dir == -1:
+        bearish += 3
+        reasons.append("SuperTrend bearish")
+
+    if ha_bullish:
+        bullish += 1
+        reasons.append("Heikin Ashi bullish candle")
+
+    if ha_bearish:
+        bearish += 1
+        reasons.append("Heikin Ashi bearish candle")
+
+    if ha_trend_up:
+        bullish += 2
+        reasons.append("Heikin Ashi bullish continuation")
+
+    if ha_trend_down:
+        bearish += 2
+        reasons.append("Heikin Ashi bearish continuation")
+
     if breakout:
         bullish += 2
         reasons.append("Resistance breakout")
+        if volume_spike:
+            bullish += 2
+            reasons.append("Breakout with volume")
         if volume_spike and htf_bias == "bullish":
             bullish += 3
             reasons.append("High quality breakout")
@@ -1047,6 +1234,9 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
     if breakdown:
         bearish += 2
         reasons.append("Support breakdown")
+        if volume_spike:
+            bearish += 2
+            reasons.append("Breakdown with volume")
         if volume_spike and htf_bias == "bearish":
             bearish += 3
             reasons.append("High quality breakdown")
@@ -1144,6 +1334,14 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
         bearish += 4
         reasons.append("Evening Star detected")
 
+    if bullish_price_action:
+        bullish += 2
+        reasons.append("Bullish price action confirmation")
+
+    if bearish_price_action:
+        bearish += 2
+        reasons.append("Bearish price action confirmation")
+
     if bull_engulf and volume_spike:
         bullish += 2
         reasons.append("Bullish Engulfing with Volume Confirmation")
@@ -1177,10 +1375,10 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
         reasons.append("Too close to support")
 
     if htf_bias == "bullish":
-        bullish += 2
+        bullish += 3
         reasons.append("Higher timeframe bullish confirmation")
     elif htf_bias == "bearish":
-        bearish += 2
+        bearish += 3
         reasons.append("Higher timeframe bearish confirmation")
 
     if bullish > bearish and htf_bias == "bearish":
@@ -1208,7 +1406,16 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
         rr_ratio = 2.0
 
     if not sideways and session_info["valid"] and atr > 0:
-        if bullish >= 8 and (bullish - bearish) >= 3 and rsi > 55 and macd > macd_signal and adx > 25:
+        if (
+            bullish >= 10 and
+            (bullish - bearish) >= 4 and
+            rsi > 55 and
+            macd > macd_signal and
+            adx > 20 and
+            supertrend_dir == 1 and
+            ha_trend_up and
+            close_price > ema200
+        ):
             signal_text = "STRONG BUY"
             signal_type = "buy"
             strength = "High"
@@ -1218,7 +1425,16 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
             target2 = close_price + (2 * atr)
             trailing_stop = close_price - (0.5 * atr)
 
-        elif bearish >= 8 and (bearish - bullish) >= 3 and rsi < 45 and macd < macd_signal and adx > 25:
+        elif (
+            bearish >= 10 and
+            (bearish - bullish) >= 4 and
+            rsi < 45 and
+            macd < macd_signal and
+            adx > 20 and
+            supertrend_dir == -1 and
+            ha_trend_down and
+            close_price < ema200
+        ):
             signal_text = "STRONG SELL"
             signal_type = "sell"
             strength = "High"
@@ -1228,7 +1444,7 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
             target2 = close_price - (2 * atr)
             trailing_stop = close_price + (0.5 * atr)
 
-        elif bullish > bearish and bullish >= 6:
+        elif bullish > bearish and bullish >= 7 and supertrend_dir == 1:
             signal_text = "BUY BIAS"
             signal_type = "buy"
             strength = "Medium"
@@ -1237,7 +1453,7 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
             target1 = close_price + atr
             trailing_stop = close_price - (0.4 * atr)
 
-        elif bearish > bullish and bearish >= 6:
+        elif bearish > bullish and bearish >= 7 and supertrend_dir == -1:
             signal_text = "SELL BIAS"
             signal_type = "sell"
             strength = "Medium"
@@ -1246,7 +1462,24 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
             target1 = close_price - atr
             trailing_stop = close_price + (0.4 * atr)
 
-    confidence = min(100, max(40, int((max(bullish, bearish) / 15) * 100)))
+    confidence = min(100, max(40, int((max(bullish, bearish) / 18) * 100)))
+
+    if supertrend_dir == 1 and bullish > bearish:
+        confidence += 3
+    elif supertrend_dir == -1 and bearish > bullish:
+        confidence += 3
+
+    if ha_trend_up and bullish > bearish:
+        confidence += 3
+    elif ha_trend_down and bearish > bullish:
+        confidence += 3
+
+    if bullish_price_action and bullish > bearish:
+        confidence += 2
+    if bearish_price_action and bearish > bullish:
+        confidence += 2
+
+    confidence = min(100, confidence)
 
     win_chance = calculate_win_chance(
         bullish, bearish, adx, volume_spike, breakout, breakdown,
@@ -1262,6 +1495,7 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
         "close_price": close_price,
         "ema20": ema20,
         "ema50": ema50,
+        "ema200": ema200,
         "vwap": vwap,
         "rsi": rsi,
         "macd": macd,
@@ -1291,7 +1525,14 @@ def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50
         "reasons": reasons,
         "bullish_score": bullish,
         "bearish_score": bearish,
-        "session_message": session_info["message"]
+        "session_message": session_info["message"],
+        "supertrend_direction": supertrend_dir,
+        "ha_bullish": ha_bullish,
+        "ha_bearish": ha_bearish,
+        "ha_trend_up": ha_trend_up,
+        "ha_trend_down": ha_trend_down,
+        "bullish_price_action": bullish_price_action,
+        "bearish_price_action": bearish_price_action
     }
 
 
@@ -2551,9 +2792,11 @@ with m6:
     st.metric("Bullish Score", analysis["bullish_score"])
     st.metric("Bearish Score", analysis["bearish_score"])
 with m7:
+    st.metric("EMA200", round(analysis["ema200"], 2))
     st.metric("Signal Quality", signal_quality)
 with m8:
     st.metric("PCR", pcr if pcr is not None else "Unavailable")
+    st.metric("SuperTrend", "Bullish" if analysis["supertrend_direction"] == 1 else "Bearish" if analysis["supertrend_direction"] == -1 else "Neutral")
 
 a1, a2, a3, a4, a5, a6 = st.columns(6)
 with a1:
@@ -2778,9 +3021,30 @@ fig.add_trace(go.Candlestick(
 ))
 fig.add_trace(go.Scatter(x=data.index, y=data["EMA20"], mode="lines", name="EMA20", line=dict(color="orange", width=1.5)))
 fig.add_trace(go.Scatter(x=data.index, y=data["EMA50"], mode="lines", name="EMA50", line=dict(color="blue", width=1.5)))
+fig.add_trace(go.Scatter(x=data.index, y=data["EMA200"], mode="lines", name="EMA200", line=dict(color="white", width=1.2, dash="dot")))
 fig.add_trace(go.Scatter(x=data.index, y=data["VWAP"], mode="lines", name="VWAP", line=dict(color="purple", width=1.3, dash="dot")))
 fig.add_trace(go.Scatter(x=data.index, y=data["BB_Upper"], mode="lines", name="BB Upper", line=dict(color="gray", width=1, dash="dash")))
 fig.add_trace(go.Scatter(x=data.index, y=data["BB_Lower"], mode="lines", name="BB Lower", line=dict(color="gray", width=1, dash="dash")))
+
+if "SuperTrend" in data.columns:
+    supertrend_up_main = data["SuperTrend"].where(data["SuperTrendDirection"] == 1, np.nan)
+    supertrend_down_main = data["SuperTrend"].where(data["SuperTrendDirection"] == -1, np.nan)
+
+    fig.add_trace(go.Scatter(
+        x=data.index,
+        y=supertrend_up_main,
+        mode="lines",
+        name="SuperTrend Up",
+        line=dict(color="lime", width=2)
+    ))
+
+    fig.add_trace(go.Scatter(
+        x=data.index,
+        y=supertrend_down_main,
+        mode="lines",
+        name="SuperTrend Down",
+        line=dict(color="red", width=2)
+    ))
 
 fig.add_trace(go.Scatter(
     x=data.index,
@@ -2797,6 +3061,24 @@ fig.add_trace(go.Scatter(
     marker=dict(symbol="triangle-down", color="red", size=12)
 ))
 
+if "BullishPA" in data.columns:
+    fig.add_trace(go.Scatter(
+        x=data.index,
+        y=data["BullishPA"],
+        mode="markers",
+        name="Bullish Price Action",
+        marker=dict(symbol="star", color="lime", size=10)
+    ))
+
+if "BearishPA" in data.columns:
+    fig.add_trace(go.Scatter(
+        x=data.index,
+        y=data["BearishPA"],
+        mode="markers",
+        name="Bearish Price Action",
+        marker=dict(symbol="star", color="red", size=10)
+    ))
+
 fig.add_hline(y=analysis["support"], line_dash="dot", line_color="green", annotation_text="Support")
 fig.add_hline(y=analysis["resistance"], line_dash="dot", line_color="red", annotation_text="Resistance")
 
@@ -2807,6 +3089,111 @@ fig.update_layout(
     title=f"{selected} Candlestick Chart ({timeframe})"
 )
 st.plotly_chart(fig, use_container_width=True)
+
+st.subheader("Heikin Ashi Chart with EMA + EMA200 + SuperTrend + Price Action")
+
+ha_data = convert_to_heikin_ashi(data)
+
+ha_fig = go.Figure()
+
+ha_fig.add_trace(go.Candlestick(
+    x=ha_data.index,
+    open=ha_data["HA_Open"],
+    high=ha_data["HA_High"],
+    low=ha_data["HA_Low"],
+    close=ha_data["HA_Close"],
+    name="Heikin Ashi"
+))
+
+ha_fig.add_trace(go.Scatter(
+    x=data.index,
+    y=data["EMA20"],
+    mode="lines",
+    name="EMA20",
+    line=dict(color="orange", width=1.8)
+))
+
+ha_fig.add_trace(go.Scatter(
+    x=data.index,
+    y=data["EMA50"],
+    mode="lines",
+    name="EMA50",
+    line=dict(color="blue", width=1.8)
+))
+
+ha_fig.add_trace(go.Scatter(
+    x=data.index,
+    y=data["EMA200"],
+    mode="lines",
+    name="EMA200",
+    line=dict(color="white", width=1.5, dash="dot")
+))
+
+if "SuperTrend" in data.columns:
+    supertrend_up = data["SuperTrend"].where(data["SuperTrendDirection"] == 1, np.nan)
+    supertrend_down = data["SuperTrend"].where(data["SuperTrendDirection"] == -1, np.nan)
+
+    ha_fig.add_trace(go.Scatter(
+        x=data.index,
+        y=supertrend_up,
+        mode="lines",
+        name="SuperTrend Up",
+        line=dict(color="lime", width=2)
+    ))
+
+    ha_fig.add_trace(go.Scatter(
+        x=data.index,
+        y=supertrend_down,
+        mode="lines",
+        name="SuperTrend Down",
+        line=dict(color="red", width=2)
+    ))
+
+ha_fig.add_trace(go.Scatter(
+    x=data.index,
+    y=data["BuyMarker"],
+    mode="markers",
+    name="EMA Buy",
+    marker=dict(symbol="triangle-up", color="green", size=11)
+))
+
+ha_fig.add_trace(go.Scatter(
+    x=data.index,
+    y=data["SellMarker"],
+    mode="markers",
+    name="EMA Sell",
+    marker=dict(symbol="triangle-down", color="red", size=11)
+))
+
+if "BullishPA" in data.columns:
+    ha_fig.add_trace(go.Scatter(
+        x=data.index,
+        y=data["BullishPA"],
+        mode="markers",
+        name="Bullish Price Action",
+        marker=dict(symbol="star", color="lime", size=12)
+    ))
+
+if "BearishPA" in data.columns:
+    ha_fig.add_trace(go.Scatter(
+        x=data.index,
+        y=data["BearishPA"],
+        mode="markers",
+        name="Bearish Price Action",
+        marker=dict(symbol="star", color="red", size=12)
+    ))
+
+ha_fig.add_hline(y=analysis["support"], line_dash="dot", line_color="green", annotation_text="Support")
+ha_fig.add_hline(y=analysis["resistance"], line_dash="dot", line_color="red", annotation_text="Resistance")
+
+ha_fig.update_layout(
+    height=750,
+    xaxis_rangeslider_visible=False,
+    template="plotly_dark",
+    title=f"{selected} Heikin Ashi + EMA + EMA200 + SuperTrend + Price Action ({timeframe})"
+)
+
+st.plotly_chart(ha_fig, use_container_width=True)
 
 st.subheader("MACD Chart")
 macd_fig = go.Figure()
@@ -2956,6 +3343,10 @@ if debug_mode:
         st.dataframe(data[["Close", "Volume", "VWAP"]].tail(10), use_container_width=True)
     if "Volume" in data.columns:
         st.write("Volume Sum:", float(data["Volume"].fillna(0).sum()))
+    if "EMA200" in data.columns:
+        st.write("EMA200 Latest:", float(data["EMA200"].iloc[-1]))
+    if "SuperTrendDirection" in data.columns:
+        st.write("SuperTrend Direction Latest:", int(data["SuperTrendDirection"].iloc[-1]))
     if all(col in backtest_data.columns for col in ["EMA20", "EMA50", "VWAP", "RSI", "MACD", "SignalLine", "ATR"]):
         st.write("Backtest Required Nulls:")
         st.write(backtest_data[["EMA20", "EMA50", "VWAP", "RSI", "MACD", "SignalLine", "ATR"]].isna().sum())
