@@ -1,4 +1,3 @@
-```python
 import os
 from datetime import datetime, time, timedelta, timezone
 import threading
@@ -2203,4 +2202,719 @@ if data_source == "Angel" and ws_enable:
     effective_refresh_seconds = max(refresh_seconds, 20)
 
 if auto_refresh:
-    st_autorefresh(interval=effective_refresh_seconds * 
+    st_autorefresh(interval=effective_refresh_seconds * 1000, key="ultimate_refresh")
+
+ticker = stocks[selected]
+
+if timeframe == "1m":
+    yf_interval, yf_period = "1m", "7d"
+elif timeframe == "3m":
+    yf_interval, yf_period = "1m", "7d"
+elif timeframe == "5m":
+    yf_interval, yf_period = "5m", "30d"
+elif timeframe == "10m":
+    yf_interval, yf_period = "5m", "30d"
+elif timeframe == "15m":
+    yf_interval, yf_period = "15m", "30d"
+elif timeframe == "30m":
+    yf_interval, yf_period = "30m", "60d"
+elif timeframe == "1h":
+    yf_interval, yf_period = "60m", "90d"
+else:
+    yf_interval, yf_period = "1d", "1y"
+
+data = pd.DataFrame()
+
+if "last_good_candles" not in st.session_state:
+    st.session_state["last_good_candles"] = None
+
+if data_source == "Angel":
+    if not (angel_api_key and angel_client_code and angel_pin and angel_totp_secret):
+        st.warning("Please fill Angel credentials to use Angel data source.")
+        st.stop()
+
+    angel_interval = map_angel_interval(timeframe)
+    candles = get_angel_candles(
+        angel_api_key,
+        angel_client_code,
+        angel_pin,
+        angel_totp_secret,
+        selected,
+        angel_interval
+    )
+
+    data = candles_to_df(candles)
+
+    if data.empty:
+        last_good = st.session_state.get("last_good_candles")
+        data = candles_to_df(last_good)
+        if not data.empty:
+            st.warning("Using last successful Angel candle data.")
+    else:
+        st.session_state["last_good_candles"] = candles
+
+    if ws_enable:
+        start_angel_websocket(
+            angel_api_key,
+            angel_client_code,
+            angel_pin,
+            angel_totp_secret,
+            selected
+        )
+else:
+    data = fetch_data(ticker, yf_interval, yf_period)
+
+if data.empty:
+    st.error("No data found")
+    st.stop()
+
+if timeframe == "3m":
+    data = resample_ohlcv(data, "3min")
+elif timeframe == "10m":
+    data = resample_ohlcv(data, "10min")
+
+data = add_indicators(data)
+backtest_data = data.copy()
+data = data.bfill().ffill()
+
+if len(data) < 30:
+    st.warning(f"Only {len(data)} rows available after indicator calculation.")
+    st.stop()
+
+htf_interval, htf_period = get_higher_timeframe(timeframe)
+angel_creds = (angel_api_key, angel_client_code, angel_pin, angel_totp_secret)
+
+htf_data = get_data_for_timeframe(data_source, selected, ticker, htf_interval, angel_creds)
+
+if not htf_data.empty:
+    htf_data = add_indicators(htf_data).bfill().ffill()
+    if len(htf_data) > 20:
+        htf_latest = htf_data.iloc[-1]
+        htf_bias = "bullish" if htf_latest["EMA20"] > htf_latest["EMA50"] else "bearish"
+    else:
+        htf_bias = None
+else:
+    htf_bias = None
+
+wins, losses, total_trades, backtest_win_rate, backtest_trades_df = simple_backtest(backtest_data, symbol=selected)
+
+analysis = analyze_signal(
+    data,
+    htf_bias=htf_bias,
+    timeframe_label=timeframe,
+    backtest_win_rate=backtest_win_rate
+)
+
+pcr = get_pcr()
+latest = data.iloc[-1]
+
+mtf_table = pd.DataFrame({
+    "Timeframe": ["1m", "3m", "5m", "15m"],
+    "Trend": [
+        get_mtf_signal(data_source, selected, ticker, "1m", angel_creds),
+        get_mtf_signal(data_source, selected, ticker, "3m", angel_creds),
+        get_mtf_signal(data_source, selected, ticker, "5m", angel_creds),
+        get_mtf_signal(data_source, selected, ticker, "15m", angel_creds)
+    ]
+})
+
+bull_count = sum("Bullish" in sig for sig in mtf_table["Trend"])
+bear_count = sum("Bearish" in sig for sig in mtf_table["Trend"])
+
+if bull_count >= 3:
+    mtf_grade = "🔥 Strong Bullish Alignment"
+elif bear_count >= 3:
+    mtf_grade = "🔥 Strong Bearish Alignment"
+else:
+    mtf_grade = "⚠️ Mixed Timeframes"
+
+mtf_confirmation = "➖ Neutral"
+if analysis["signal_type"] == "buy" and htf_bias == "bullish":
+    mtf_confirmation = "✅ Bullish Alignment"
+elif analysis["signal_type"] == "sell" and htf_bias == "bearish":
+    mtf_confirmation = "✅ Bearish Alignment"
+elif analysis["signal_type"] in ["buy", "sell"]:
+    mtf_confirmation = "⚠️ Timeframe Conflict"
+
+quality_score = (analysis["win_chance"] + analysis["confidence"]) / 2
+if quality_score >= 85:
+    signal_quality = "🔥 Excellent"
+elif quality_score >= 70:
+    signal_quality = "✅ Strong"
+elif quality_score >= 55:
+    signal_quality = "⚠️ Moderate"
+else:
+    signal_quality = "❌ Weak"
+
+patterns = []
+pattern_map = {
+    "InvertedHammer": "🟢 Inverted Hammer",
+    "HangingMan": "🔴 Hanging Man",
+    "DragonflyDoji": "🟢 Dragonfly Doji",
+    "GravestoneDoji": "🔴 Gravestone Doji",
+    "ThreeWhiteSoldiers": "🟢 Three White Soldiers",
+    "ThreeBlackCrows": "🔴 Three Black Crows",
+    "Hammer": "🟢 Hammer",
+    "ShootingStar": "🔴 Shooting Star",
+    "BullishMarubozu": "🟢 Bullish Marubozu",
+    "BearishMarubozu": "🔴 Bearish Marubozu",
+    "Doji": "🟡 Doji",
+    "BullishEngulfing": "🟢 Bullish Engulfing",
+    "BearishEngulfing": "🔴 Bearish Engulfing",
+    "PiercingPattern": "🟢 Piercing Pattern",
+    "DarkCloudCover": "🔴 Dark Cloud Cover",
+    "TweezerBottom": "🟢 Tweezer Bottom",
+    "TweezerTop": "🔴 Tweezer Top",
+    "MorningStar": "🟢 Morning Star",
+    "EveningStar": "🔴 Evening Star",
+    "BullishHarami": "🟢 Bullish Harami",
+    "BearishHarami": "🔴 Bearish Harami"
+}
+
+for key, label in pattern_map.items():
+    if bool(latest.get(key, False)):
+        patterns.append(label)
+
+if bool(latest.get("RetestBull", False)):
+    patterns.append("🚀 Bullish Retest")
+if bool(latest.get("RetestBear", False)):
+    patterns.append("🔻 Bearish Retest")
+
+option_suggestion = suggest_option_strike(selected, analysis["close_price"], analysis["signal_type"])
+
+alert_text = (
+    f"{selected} | {timeframe} | {analysis['signal_text']} | "
+    f"Strength: {analysis['strength']} | Confidence: {analysis['confidence']}% | "
+    f"Win Chance: {analysis['win_chance']}% | Price: {round(analysis['close_price'], 2)} | "
+    f"{option_suggestion['text']}"
+)
+
+current_signal_key = f"{selected}|{timeframe}|{analysis['signal_text']}|{round(analysis['close_price'], 2)}"
+last_signal_key = ""
+if os.path.exists(SIGNAL_STATE_FILE):
+    with open(SIGNAL_STATE_FILE, "r") as f:
+        last_signal_key = f.read().strip()
+
+if telegram_enabled and telegram_bot_token and telegram_chat_id:
+    if st.button("Send Telegram Alert Now"):
+        sent = send_telegram_alert(telegram_bot_token, telegram_chat_id, alert_text)
+        if sent:
+            st.success("Telegram alert sent successfully.")
+        else:
+            st.error("Failed to send Telegram alert.")
+
+    if auto_send_telegram and current_signal_key != last_signal_key and analysis["signal_type"] != "neutral":
+        sent = send_telegram_alert(telegram_bot_token, telegram_chat_id, alert_text)
+        if sent:
+            with open(SIGNAL_STATE_FILE, "w") as f:
+                f.write(current_signal_key)
+
+# ----------------------------
+# DASHBOARD
+# ----------------------------
+sync_ws_state_to_session()
+
+st.subheader("🚨 Live Signal Analytics")
+
+if data_source == "Angel" and ws_enable:
+    ws_col1, ws_col2, ws_col3, ws_col4 = st.columns(4)
+    with ws_col1:
+        st.metric("WebSocket Status", "Connected" if st.session_state.get("ws_connected") else "Disconnected")
+    with ws_col2:
+        live_price = st.session_state.get("live_price")
+        st.metric("Live Price", round(live_price, 2) if live_price else "-")
+    with ws_col3:
+        st.metric("WS Available", "Yes" if SMART_WS_AVAILABLE else "No")
+    with ws_col4:
+        st.metric("WS Retries", st.session_state.get("ws_retries", 0))
+
+    if st.session_state.get("ws_error"):
+        st.warning(f"WebSocket: {st.session_state['ws_error']}")
+
+st.subheader("📊 Multi Timeframe Alignment")
+st.dataframe(mtf_table, use_container_width=True)
+
+col1, col2 = st.columns(2)
+with col1:
+    st.metric("Bullish TF", bull_count)
+with col2:
+    st.metric("Bearish TF", bear_count)
+
+if "Strong Bullish" in mtf_grade:
+    st.success(mtf_grade)
+elif "Strong Bearish" in mtf_grade:
+    st.error(mtf_grade)
+else:
+    st.warning(mtf_grade)
+
+st.subheader("🕯 Candlestick Patterns")
+if patterns:
+    st.success(" | ".join(patterns))
+else:
+    st.info("No major candlestick pattern detected")
+
+if analysis["signal_type"] == "buy":
+    st.success(alert_text)
+elif analysis["signal_type"] == "sell":
+    st.error(alert_text)
+else:
+    st.warning(alert_text)
+
+if analysis["signal_type"] == "buy" and bear_count >= 3:
+    st.error("⚠️ BUY signal hai lekin MTF Alignment Bearish hai")
+if analysis["signal_type"] == "sell" and bull_count >= 3:
+    st.error("⚠️ SELL signal hai lekin MTF Alignment Bullish hai")
+
+m1, m2, m3, m4, m5, m6, m7, m8 = st.columns(8)
+with m1:
+    st.metric("Current Price", round(analysis["close_price"], 2))
+    st.metric("VWAP", round(float(analysis["vwap"]), 2) if analysis["vwap"] is not None else "N/A")
+with m2:
+    st.metric("EMA20", round(analysis["ema20"], 2))
+    st.metric("EMA50", round(analysis["ema50"], 2))
+with m3:
+    st.metric("RSI", round(analysis["rsi"], 2))
+    st.metric("ATR", round(analysis["atr"], 2))
+with m4:
+    st.metric("MACD", round(analysis["macd"], 2))
+    st.metric("ADX", round(analysis["adx"], 2))
+with m5:
+    st.metric("Win Chance %", analysis["win_chance"])
+    st.metric("Confidence %", analysis["confidence"])
+with m6:
+    st.metric("Bullish Score", analysis["bullish_score"])
+    st.metric("Bearish Score", analysis["bearish_score"])
+with m7:
+    st.metric("Signal Quality", signal_quality)
+with m8:
+    st.metric("PCR", pcr if pcr is not None else "Unavailable")
+
+a1, a2, a3, a4, a5, a6 = st.columns(6)
+with a1:
+    st.metric("Support", round(analysis["support"], 2))
+with a2:
+    st.metric("Resistance", round(analysis["resistance"], 2))
+with a3:
+    st.metric("Backtest Wins", wins)
+with a4:
+    st.metric("Backtest Losses", losses)
+with a5:
+    st.metric("Backtest Win Rate", f"{backtest_win_rate:.1f}%")
+with a6:
+    st.metric("MTF Status", mtf_confirmation)
+
+with st.expander("📘 Backtest Trade Log", expanded=False):
+    if not backtest_trades_df.empty:
+        st.dataframe(backtest_trades_df, use_container_width=True)
+    else:
+        st.info("No backtest trades found for current symbol/timeframe.")
+
+st.subheader("📋 F&O Style Stocks Table")
+st.caption("Yahoo Mode shows underlying spot % change, not futures % change. For genuine futures % change, a valid Angel One futures contract/quote is required.")
+
+fno_scanner_df = fetch_fno_style_scanner(major_stocks)
+
+if not fno_scanner_df.empty:
+    def highlight_trend(val):
+        if val == "BULLISH":
+            return "background-color: #163d1a; color: #7CFC00; font-weight: bold;"
+        elif val == "BEARISH":
+            return "background-color: #4a1515; color: #ff6b6b; font-weight: bold;"
+        elif val == "NEUTRAL":
+            return "background-color: #3a3a3a; color: #f2c94c; font-weight: bold;"
+        return ""
+
+    styled_fno_df = (
+        fno_scanner_df.style
+        .map(highlight_trend, subset=["1m", "2m", "3m", "Direction"])
+    )
+
+    st.dataframe(styled_fno_df, use_container_width=True, hide_index=True)
+
+    fno_summary = summarize_fno_bias(fno_scanner_df)
+
+    st.markdown(
+        f"""
+**Overall Bias:** {fno_summary['overall_bias']}
+
+**Bullish = {fno_summary['bullish_pct']}%**  
+**Bearish = {fno_summary['bearish_pct']}%**
+
+**Strongest Gainer :** {fno_summary['strongest_gainer']}  
+**Strongest Loser  :** {fno_summary['strongest_loser']}
+"""
+    )
+else:
+    st.info("F&O style scanner data unavailable.")
+
+st.subheader("🎯 Option CALL/PUT Suggestion")
+if option_suggestion["type"] == "CALL":
+    st.success(option_suggestion["text"])
+elif option_suggestion["type"] == "PUT":
+    st.error(option_suggestion["text"])
+else:
+    st.warning(option_suggestion["text"])
+
+if analysis["stop_loss"] is not None:
+    t1, t2, t3, t4, t5 = st.columns(5)
+    with t1:
+        st.metric("Stop Loss", round(analysis["stop_loss"], 2))
+    with t2:
+        st.metric("Partial Exit", round(analysis["partial_exit"], 2) if analysis["partial_exit"] else "-")
+    with t3:
+        st.metric("Target 1", round(analysis["target1"], 2) if analysis["target1"] else "-")
+    with t4:
+        st.metric("Target 2", round(analysis["target2"], 2) if analysis["target2"] else "-")
+    with t5:
+        st.metric("Trailing Stop", round(analysis["trailing_stop"], 2) if analysis["trailing_stop"] else "-")
+
+with st.expander("Why this signal?"):
+    for reason in analysis["reasons"]:
+        st.write("-", reason)
+
+st.subheader("🌍 Global / Macro Performance (Latest Daily Close)")
+global_df = fetch_market_snapshot(global_indices)
+if not global_df.empty:
+    st.dataframe(global_df, use_container_width=True)
+else:
+    st.info("Global / macro data unavailable.")
+
+st.subheader("🇮🇳 Indian Market Performance (Latest Daily Close)")
+india_df = fetch_market_snapshot(indian_indices)
+if not india_df.empty:
+    st.dataframe(india_df, use_container_width=True)
+else:
+    st.info("Indian market data unavailable.")
+
+st.subheader("🛡 Risk Management Module")
+
+risk_state = load_risk_state()
+today_closed = get_today_closed_trades()
+today_realized_pnl = pd.to_numeric(today_closed.get("PnL", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()
+today_trade_count = len(today_closed)
+
+r1, r2, r3 = st.columns(3)
+with r1:
+    daily_loss_limit = st.number_input(
+        "Daily Loss Limit",
+        min_value=100.0,
+        value=float(risk_state.loc[0, "DailyLossLimit"]),
+        step=100.0
+    )
+with r2:
+    max_trades_per_day = st.number_input(
+        "Max Trades Per Day",
+        min_value=1,
+        value=int(risk_state.loc[0, "MaxTradesPerDay"]),
+        step=1
+    )
+with r3:
+    risk_per_trade_pct = st.number_input(
+        "Risk Per Trade (%)",
+        min_value=0.1,
+        value=float(risk_state.loc[0, "RiskPerTradePct"]),
+        step=0.1
+    )
+
+trading_enabled = st.checkbox(
+    "Enable Trading",
+    value=bool(risk_state.loc[0, "TradingEnabled"])
+)
+
+if st.button("Save Risk Settings"):
+    risk_state.loc[0, "DailyLossLimit"] = daily_loss_limit
+    risk_state.loc[0, "MaxTradesPerDay"] = int(max_trades_per_day)
+    risk_state.loc[0, "RiskPerTradePct"] = float(risk_per_trade_pct)
+    risk_state.loc[0, "TradingEnabled"] = bool(trading_enabled)
+    save_risk_state(risk_state)
+    st.success("Risk settings saved.")
+    st.rerun()
+
+rr1, rr2, rr3 = st.columns(3)
+with rr1:
+    st.metric("Today Closed Trades", today_trade_count)
+with rr2:
+    st.metric("Today Realized PnL", round(today_realized_pnl, 2))
+with rr3:
+    paper_state_for_risk = load_paper_state()
+    suggested_qty = calculate_position_size(
+        analysis["close_price"],
+        analysis["stop_loss"],
+        float(paper_state_for_risk.loc[0, "Balance"])
+    ) if analysis["stop_loss"] is not None else 1
+    st.metric("Suggested Qty", suggested_qty)
+
+risk_ok, risk_msg = risk_check_before_trade()
+if risk_ok:
+    st.success(risk_msg)
+else:
+    st.error(risk_msg)
+
+st.subheader("💼 Paper Trading")
+paper_state = load_paper_state()
+
+p1, p2, p3 = st.columns(3)
+with p1:
+    st.metric("Paper Balance", round(float(paper_state.loc[0, "Balance"]), 2))
+with p2:
+    st.metric("Used Margin", round(float(paper_state.loc[0, "UsedMargin"]), 2))
+with p3:
+    st.metric("Open Positions", int(paper_state.loc[0, "OpenPositions"]))
+
+paper_qty = st.number_input("Paper Trade Quantity (Manual Override)", min_value=1, value=1, step=1)
+
+if st.button("Take Paper Trade"):
+    risk_ok, risk_msg = risk_check_before_trade()
+
+    if not risk_ok:
+        st.error(risk_msg)
+
+    elif analysis["signal_type"] in ["buy", "sell"]:
+        final_qty = paper_qty
+        if analysis["stop_loss"] is not None:
+            final_qty = calculate_position_size(
+                analysis["close_price"],
+                analysis["stop_loss"],
+                float(paper_state.loc[0, "Balance"])
+            )
+
+        success = paper_trade_entry(analysis["close_price"], final_qty)
+        if success:
+            add_trade_to_journal(
+                symbol=selected,
+                timeframe=timeframe,
+                signal=analysis["signal_text"],
+                entry_price=analysis["close_price"],
+                quantity=final_qty,
+                stop_loss=analysis["stop_loss"],
+                target1=analysis["target1"],
+                target2=analysis["target2"],
+                trailing_stop=analysis["trailing_stop"],
+                notes="Paper Trade"
+            )
+            st.success(f"Paper trade entered and journal updated. Qty used: {final_qty}")
+            st.rerun()
+        else:
+            st.error("Insufficient paper balance.")
+    else:
+        st.warning("No valid signal for paper trade.")
+
+st.subheader("Candlestick Chart")
+fig = go.Figure()
+
+fig.add_trace(go.Candlestick(
+    x=data.index,
+    open=data["Open"],
+    high=data["High"],
+    low=data["Low"],
+    close=data["Close"],
+    name="Candles"
+))
+fig.add_trace(go.Scatter(x=data.index, y=data["EMA20"], mode="lines", name="EMA20", line=dict(color="orange", width=1.5)))
+fig.add_trace(go.Scatter(x=data.index, y=data["EMA50"], mode="lines", name="EMA50", line=dict(color="blue", width=1.5)))
+fig.add_trace(go.Scatter(x=data.index, y=data["VWAP"], mode="lines", name="VWAP", line=dict(color="purple", width=1.3, dash="dot")))
+fig.add_trace(go.Scatter(x=data.index, y=data["BB_Upper"], mode="lines", name="BB Upper", line=dict(color="gray", width=1, dash="dash")))
+fig.add_trace(go.Scatter(x=data.index, y=data["BB_Lower"], mode="lines", name="BB Lower", line=dict(color="gray", width=1, dash="dash")))
+
+fig.add_trace(go.Scatter(
+    x=data.index,
+    y=data["BuyMarker"],
+    mode="markers",
+    name="Buy Signal",
+    marker=dict(symbol="triangle-up", color="green", size=12)
+))
+fig.add_trace(go.Scatter(
+    x=data.index,
+    y=data["SellMarker"],
+    mode="markers",
+    name="Sell Signal",
+    marker=dict(symbol="triangle-down", color="red", size=12)
+))
+
+fig.add_hline(y=analysis["support"], line_dash="dot", line_color="green", annotation_text="Support")
+fig.add_hline(y=analysis["resistance"], line_dash="dot", line_color="red", annotation_text="Resistance")
+
+fig.update_layout(
+    height=700,
+    xaxis_rangeslider_visible=False,
+    template="plotly_dark",
+    title=f"{selected} Candlestick Chart ({timeframe})"
+)
+st.plotly_chart(fig, use_container_width=True)
+
+st.subheader("MACD Chart")
+macd_fig = go.Figure()
+macd_fig.add_trace(go.Scatter(x=data.index, y=data["MACD"], mode="lines", name="MACD", line=dict(color="cyan")))
+macd_fig.add_trace(go.Scatter(x=data.index, y=data["SignalLine"], mode="lines", name="Signal", line=dict(color="orange")))
+macd_fig.add_trace(go.Bar(x=data.index, y=data["MACD_Hist"], name="Histogram"))
+macd_fig.update_layout(height=300, template="plotly_dark", title="MACD")
+st.plotly_chart(macd_fig, use_container_width=True)
+
+st.subheader("RSI / Stochastic / ADX Chart")
+multi_fig = go.Figure()
+multi_fig.add_trace(go.Scatter(x=data.index, y=data["RSI"], mode="lines", name="RSI", line=dict(color="yellow")))
+multi_fig.add_trace(go.Scatter(x=data.index, y=data["StochK"], mode="lines", name="Stoch K", line=dict(color="lime")))
+multi_fig.add_trace(go.Scatter(x=data.index, y=data["StochD"], mode="lines", name="Stoch D", line=dict(color="red")))
+multi_fig.add_trace(go.Scatter(x=data.index, y=data["ADX"], mode="lines", name="ADX", line=dict(color="white")))
+multi_fig.update_layout(height=350, template="plotly_dark", title="Momentum + Trend Strength")
+st.plotly_chart(multi_fig, use_container_width=True)
+
+st.subheader("📝 Trade Journal")
+
+col_j1, col_j2 = st.columns(2)
+with col_j1:
+    qty = st.number_input("Manual Journal Quantity", min_value=1, value=1, step=1, key="journal_qty")
+    note_text = st.text_input("Trade Notes", value="", key="journal_note")
+    if st.button("Add Current Signal to Journal"):
+        if analysis["signal_type"] in ["buy", "sell"]:
+            add_trade_to_journal(
+                symbol=selected,
+                timeframe=timeframe,
+                signal=analysis["signal_text"],
+                entry_price=analysis["close_price"],
+                quantity=qty,
+                stop_loss=analysis["stop_loss"],
+                target1=analysis["target1"],
+                target2=analysis["target2"],
+                trailing_stop=analysis["trailing_stop"],
+                notes=note_text
+            )
+            st.success("Trade added to journal.")
+            st.rerun()
+        else:
+            st.warning("No valid trade signal to add.")
+
+journal_df = load_journal()
+st.dataframe(journal_df, use_container_width=True)
+
+st.subheader("📌 Entry / Exit History")
+
+open_trades = journal_df[journal_df["Status"] == "OPEN"]
+if not open_trades.empty:
+    st.write("Open Trades")
+    st.dataframe(open_trades, use_container_width=True)
+
+    open_indices = open_trades.index.tolist()
+    selected_trade_index = st.selectbox("Select Open Trade Row to Exit", open_indices)
+    exit_price_input = st.number_input("Exit Price", min_value=0.0, value=float(analysis["close_price"]), step=0.1)
+
+    if st.button("Close Selected Trade"):
+        row = journal_df.loc[selected_trade_index]
+        pnl = paper_trade_exit(
+            entry_price=float(row["EntryPrice"]),
+            exit_price=exit_price_input,
+            quantity=float(row["Quantity"]),
+            signal=str(row["Signal"])
+        )
+        close_trade_in_journal(selected_trade_index, exit_price_input)
+        update_daily_summary()
+        st.success(f"Trade closed. Paper PnL: {round(pnl, 2)}")
+        st.rerun()
+else:
+    st.info("No open trades available.")
+
+closed_trades = journal_df[journal_df["Status"] == "CLOSED"]
+if not closed_trades.empty:
+    st.write("Closed Trades")
+    st.dataframe(closed_trades, use_container_width=True)
+
+    total_pnl = pd.to_numeric(closed_trades["PnL"], errors="coerce").fillna(0).sum()
+    avg_pnl_pct = pd.to_numeric(closed_trades["PnLPercent"], errors="coerce").fillna(0).mean()
+
+    rp1, rp2 = st.columns(2)
+    with rp1:
+        st.metric("Total Realized PnL", round(total_pnl, 2))
+    with rp2:
+        st.metric("Average PnL %", round(avg_pnl_pct, 2))
+
+st.subheader("📊 Daily Summary Report")
+summary_df = pd.read_csv(SESSION_SUMMARY_FILE)
+st.dataframe(summary_df, use_container_width=True)
+
+st.subheader("Downloads")
+market_csv = data.to_csv().encode("utf-8")
+st.download_button(
+    label="📥 Download Market Data CSV",
+    data=market_csv,
+    file_name=f"{selected}_{timeframe}_market_data.csv",
+    mime="text/csv"
+)
+
+journal_csv = journal_df.to_csv(index=False).encode("utf-8")
+st.download_button(
+    label="📥 Download Trade Journal CSV",
+    data=journal_csv,
+    file_name="trade_journal.csv",
+    mime="text/csv"
+)
+
+summary_csv = summary_df.to_csv(index=False).encode("utf-8")
+st.download_button(
+    label="📥 Download Daily Summary CSV",
+    data=summary_csv,
+    file_name="daily_summary.csv",
+    mime="text/csv"
+)
+
+backtest_csv = backtest_trades_df.to_csv(index=False).encode("utf-8")
+st.download_button(
+    label="📥 Download Backtest CSV",
+    data=backtest_csv,
+    file_name=f"{selected}_{timeframe}_backtest_trades.csv",
+    mime="text/csv"
+)
+
+fno_csv = fno_scanner_df.to_csv(index=False).encode("utf-8")
+st.download_button(
+    label="📥 Download F&O Style Stocks CSV",
+    data=fno_csv,
+    file_name="fno_style_stocks.csv",
+    mime="text/csv"
+)
+
+if debug_mode:
+    st.subheader("🐞 Debug")
+    st.write("Data Source:", data_source)
+    st.write("Selected:", selected)
+    st.write("Timeframe:", timeframe)
+    st.write("Rows Loaded:", len(data))
+    st.write("Columns:", list(data.columns))
+    st.write("Latest Row:")
+    st.dataframe(data.tail(5), use_container_width=True)
+    st.write("PCR Debug:", pcr)
+    st.write("Angel Token:", ANGEL_TOKENS.get(selected))
+    st.write("Backtest Rows:", len(backtest_data))
+    st.write("Backtest Trades:", len(backtest_trades_df))
+    if "VWAP" in data.columns:
+        st.write("VWAP Null Count:", int(data["VWAP"].isna().sum()))
+        st.dataframe(data[["Close", "Volume", "VWAP"]].tail(10), use_container_width=True)
+    if "Volume" in data.columns:
+        st.write("Volume Sum:", float(data["Volume"].fillna(0).sum()))
+    if all(col in backtest_data.columns for col in ["EMA20", "EMA50", "VWAP", "RSI", "MACD", "SignalLine", "ATR"]):
+        st.write("Backtest Required Nulls:")
+        st.write(backtest_data[["EMA20", "EMA50", "VWAP", "RSI", "MACD", "SignalLine", "ATR"]].isna().sum())
+
+        buy_debug = (
+            (backtest_data["EMA20"] > backtest_data["EMA50"]) &
+            (backtest_data["RSI"] > 52) &
+            (backtest_data["MACD"] > backtest_data["SignalLine"])
+        )
+        sell_debug = (
+            (backtest_data["EMA20"] < backtest_data["EMA50"]) &
+            (backtest_data["RSI"] < 48) &
+            (backtest_data["MACD"] < backtest_data["SignalLine"])
+        )
+        st.write("Possible Buy Signals:", int(buy_debug.sum()))
+        st.write("Possible Sell Signals:", int(sell_debug.sum()))
+
+    if data_source == "Angel":
+        sync_ws_state_to_session()
+        st.write("WebSocket Available:", SMART_WS_AVAILABLE)
+        st.write("WS Connected:", st.session_state.get("ws_connected"))
+        st.write("WS Running:", st.session_state.get("ws_running"))
+        st.write("WS Error:", st.session_state.get("ws_error"))
+        st.write("WS Retries:", st.session_state.get("ws_retries"))
+        st.write("WS Should Run:", st.session_state.get("ws_should_run"))
+        st.write("WS Thread Started:", st.session_state.get("ws_thread_started"))
+        st.write("Live Price:", st.session_state.get("live_price"))
+        st.write("Last Tick:", st.session_state.get("ws_last_tick"))
