@@ -1437,4 +1437,770 @@ def simple_backtest(df, symbol=""):
     losses = len(trades_df[trades_df["Result"] == "LOSS"])
     win_rate = (wins / total * 100) if total else 0.0
 
-    return wins, losses,
+    return wins, losses, total, round(win_rate, 2), trades_df
+
+
+# ----------------------------
+# ANGEL ONE
+# ----------------------------
+def map_angel_interval(timeframe):
+    mapping = {
+        "1m": "ONE_MINUTE",
+        "3m": "ONE_MINUTE",
+        "5m": "FIVE_MINUTE",
+        "10m": "FIVE_MINUTE",
+        "15m": "FIFTEEN_MINUTE",
+        "30m": "THIRTY_MINUTE",
+        "1h": "ONE_HOUR",
+        "1d": "ONE_DAY"
+    }
+    return mapping.get(timeframe, "FIVE_MINUTE")
+
+
+def angel_login(api_key, client_code, pin, totp_secret, force_refresh=False):
+    try:
+        cache_key = f"{client_code}_{api_key}"
+
+        if (
+            not force_refresh
+            and "angel_api" in st.session_state
+            and "angel_session" in st.session_state
+            and st.session_state.get("angel_cache_key") == cache_key
+        ):
+            return st.session_state["angel_api"], st.session_state["angel_session"]
+
+        smart_api = SmartConnect(api_key=api_key)
+        totp = pyotp.TOTP(totp_secret).now()
+        session = smart_api.generateSession(client_code, pin, totp)
+
+        if session and session.get("status"):
+            st.session_state["angel_api"] = smart_api
+            st.session_state["angel_session"] = session
+            st.session_state["angel_cache_key"] = cache_key
+            return smart_api, session
+
+        return None, None
+
+    except Exception as e:
+        st.error(f"Angel Login Failed: {e}")
+        return None, None
+
+
+def get_angel_profile(api_key, client_code, pin, totp_secret):
+    try:
+        angel, session = angel_login(api_key, client_code, pin, totp_secret)
+        if angel is None or session is None:
+            return None
+
+        refresh_token = session["data"].get("refreshToken")
+        if not refresh_token:
+            return None
+
+        return angel.getProfile(refresh_token)
+    except Exception as e:
+        return {"status": False, "message": str(e)}
+
+
+def get_angel_candles(api_key, client_code, pin, totp_secret, symbol_name, interval="FIVE_MINUTE"):
+    try:
+        angel, session = angel_login(api_key, client_code, pin, totp_secret)
+        if angel is None or not session or not session.get("data"):
+            return None
+
+        symbol_token = ANGEL_TOKENS.get(symbol_name)
+        if not symbol_token:
+            return {"status": False, "message": f"Missing Angel token for {symbol_name}"}
+
+        ist = timezone(timedelta(hours=5, minutes=30))
+        to_date = datetime.now(ist)
+        from_date = to_date - timedelta(days=7)
+
+        params = {
+            "exchange": "NSE",
+            "symboltoken": symbol_token,
+            "interval": interval,
+            "fromdate": from_date.strftime("%Y-%m-%d %H:%M"),
+            "todate": to_date.strftime("%Y-%m-%d %H:%M")
+        }
+
+        candles = angel.getCandleData(params)
+        return candles
+
+    except Exception as e:
+        return {"status": False, "message": str(e)}
+
+
+def candles_to_df(candles):
+    if not isinstance(candles, dict) or not candles.get("data"):
+        return pd.DataFrame()
+
+    df = pd.DataFrame(
+        candles["data"],
+        columns=["Datetime", "Open", "High", "Low", "Close", "Volume"]
+    )
+
+    df["Datetime"] = pd.to_datetime(df["Datetime"], errors="coerce")
+    df = df.dropna(subset=["Datetime"]).set_index("Datetime")
+
+    for col in ["Open", "High", "Low", "Close", "Volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df = df.dropna(subset=["Open", "High", "Low", "Close"])
+    df["Volume"] = df["Volume"].fillna(0)
+    return df
+
+
+# ----------------------------
+# ANGEL WEBSOCKET - STABLE VERSION
+# ----------------------------
+def ws_set_state(**kwargs):
+    with WS_STATE_LOCK:
+        for k, v in kwargs.items():
+            WS_SHARED_STATE[k] = v
+
+
+def ws_get_state():
+    with WS_STATE_LOCK:
+        return dict(WS_SHARED_STATE)
+
+
+def sync_ws_state_to_session():
+    state = ws_get_state()
+    st.session_state["ws_running"] = state["running"]
+    st.session_state["ws_connected"] = state["connected"]
+    st.session_state["ws_error"] = state["error"]
+    st.session_state["ws_last_tick"] = state["last_tick"]
+    st.session_state["live_price"] = state["live_price"]
+    st.session_state["ws_retries"] = state["retries"]
+    st.session_state["ws_should_run"] = state["should_run"]
+    st.session_state["ws_thread_started"] = state["thread_started"]
+
+
+def init_ws_state():
+    defaults = {
+        "ws_running": False,
+        "ws_connected": False,
+        "ws_error": "",
+        "ws_last_tick": None,
+        "ws_thread_started": False,
+        "live_price": None,
+        "ws_retries": 0,
+        "ws_should_run": False
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+    sync_ws_state_to_session()
+
+
+def stop_angel_websocket():
+    try:
+        ws_set_state(
+            should_run=False,
+            connected=False,
+            running=False,
+            error="WebSocket stop requested by user."
+        )
+
+        state = ws_get_state()
+        sws = state.get("socket")
+
+        if sws is not None:
+            try:
+                if hasattr(sws, "close_connection"):
+                    sws.close_connection()
+                elif hasattr(sws, "close"):
+                    sws.close()
+            except Exception:
+                pass
+
+        ws_set_state(
+            socket=None,
+            thread_started=False
+        )
+
+    except Exception as e:
+        ws_set_state(error=f"Stop error: {e}")
+
+
+def extract_ltp_from_message(message):
+    ltp = None
+
+    if not isinstance(message, dict):
+        return None
+
+    possible_keys = [
+        "last_traded_price",
+        "ltp",
+        "lastTradedPrice",
+        "last_traded_price_int",
+        "close"
+    ]
+
+    for key in possible_keys:
+        if key in message and message.get(key) is not None:
+            ltp = message.get(key)
+            break
+
+    if ltp is None:
+        return None
+
+    try:
+        ltp_f = float(ltp)
+        if ltp_f > 10000:
+            ltp_f = ltp_f / 100.0
+        return ltp_f
+    except Exception:
+        return None
+
+
+def start_angel_websocket(api_key, client_code, pin, totp_secret, symbol_name):
+    init_ws_state()
+
+    if not SMART_WS_AVAILABLE:
+        ws_set_state(error="SmartWebSocketV2 not available in installed SmartApi package.")
+        sync_ws_state_to_session()
+        return
+
+    symbol_token = ANGEL_TOKENS.get(symbol_name)
+    if not symbol_token:
+        ws_set_state(error=f"Missing token for {symbol_name}")
+        sync_ws_state_to_session()
+        return
+
+    state = ws_get_state()
+
+    if state.get("thread_started") and state.get("symbol") == symbol_name and state.get("should_run"):
+        sync_ws_state_to_session()
+        return
+
+    if state.get("thread_started") and state.get("symbol") != symbol_name:
+        stop_angel_websocket()
+        pytime.sleep(1)
+
+    ws_set_state(
+        should_run=True,
+        thread_started=True,
+        symbol=symbol_name,
+        error=""
+    )
+
+    def run_socket():
+        retry_count = 0
+
+        while True:
+            state_now = ws_get_state()
+            if not state_now.get("should_run"):
+                break
+
+            if retry_count >= MAX_WS_RETRIES:
+                ws_set_state(
+                    error="Max WebSocket reconnect attempts reached.",
+                    running=False,
+                    connected=False,
+                    retries=retry_count,
+                    thread_started=False,
+                    socket=None
+                )
+                break
+
+            try:
+                angel, session = angel_login(
+                    api_key,
+                    client_code,
+                    pin,
+                    totp_secret,
+                    force_refresh=True
+                )
+
+                if angel is None or session is None or not session.get("data"):
+                    raise Exception("Angel login failed during WebSocket reconnect")
+
+                auth_token = session["data"]["jwtToken"]
+                feed_token_resp = angel.getfeedToken()
+
+                if isinstance(feed_token_resp, dict):
+                    feed_token = feed_token_resp.get("data", {}).get("feedToken")
+                    if not feed_token:
+                        feed_token = feed_token_resp.get("feedToken")
+                else:
+                    feed_token = feed_token_resp
+
+                if not feed_token:
+                    raise Exception("Feed token not received")
+
+                sws = SmartWebSocketV2(auth_token, api_key, client_code, feed_token)
+                ws_set_state(
+                    socket=sws,
+                    running=True,
+                    connected=False,
+                    retries=retry_count,
+                    error=""
+                )
+
+                correlation_id = f"elite_dashboard_feed_{symbol_name}"
+                mode = 1
+                token_list = [{"exchangeType": 1, "tokens": [str(symbol_token)]}]
+
+                def on_data(wsapp, message):
+                    ltp = extract_ltp_from_message(message)
+                    current_state = ws_get_state()
+                    ws_set_state(
+                        last_tick=message,
+                        connected=True,
+                        error="",
+                        live_price=ltp if ltp is not None else current_state.get("live_price"),
+                        last_data_time=datetime.now().strftime("%d-%m-%Y %H:%M:%S")
+                    )
+
+                def on_open(wsapp):
+                    try:
+                        ws_set_state(
+                            connected=True,
+                            running=True,
+                            error=""
+                        )
+                        sws.subscribe(correlation_id, mode, token_list)
+                    except Exception as e:
+                        ws_set_state(
+                            error=f"Subscribe error: {e}",
+                            connected=False
+                        )
+
+                def on_error(wsapp, error):
+                    ws_set_state(
+                        error=f"WS error: {error}",
+                        connected=False,
+                        running=False
+                    )
+
+                def on_close(wsapp, *args):
+                    reason = ""
+                    if args:
+                        reason = " | ".join([str(x) for x in args if x is not None])
+                    ws_set_state(
+                        connected=False,
+                        running=False,
+                        error=f"WS closed{': ' + reason if reason else ''}"
+                    )
+
+                sws.on_open = on_open
+                sws.on_data = on_data
+                sws.on_error = on_error
+                sws.on_close = on_close
+
+                try:
+                    sws.connect()
+                finally:
+                    ws_set_state(
+                        connected=False,
+                        running=False,
+                        socket=None
+                    )
+
+            except Exception as e:
+                ws_set_state(
+                    error=f"Reconnect attempt {retry_count + 1}/{MAX_WS_RETRIES}: {e}",
+                    connected=False,
+                    running=False,
+                    socket=None
+                )
+
+            retry_count += 1
+            ws_set_state(retries=retry_count)
+
+            state_after = ws_get_state()
+            if not state_after.get("should_run"):
+                break
+
+            pytime.sleep(WS_RETRY_DELAY_SEC)
+
+        ws_set_state(
+            running=False,
+            connected=False,
+            socket=None,
+            thread_started=False
+        )
+
+    thread = threading.Thread(target=run_socket, daemon=True)
+    thread.start()
+
+    sync_ws_state_to_session()
+
+
+# ----------------------------
+# TELEGRAM
+# ----------------------------
+def send_telegram_alert(token, chat_id, message):
+    try:
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        payload = {"chat_id": chat_id, "text": message}
+        response = requests.post(url, data=payload, timeout=10)
+        return response.status_code == 200
+    except Exception:
+        return False
+
+
+# ----------------------------
+# SNAPSHOT TABLES
+# ----------------------------
+@st.cache_data(ttl=300)
+def fetch_market_snapshot(symbol_map):
+    rows = []
+    for name, ticker in symbol_map.items():
+        try:
+            df = yf.download(ticker, period="5d", interval="1d", progress=False, auto_adjust=False)
+            if df.empty or len(df) < 2:
+                continue
+
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+
+            close = float(df["Close"].iloc[-1])
+            prev_close = float(df["Close"].iloc[-2])
+            change_pct = ((close - prev_close) / prev_close) * 100 if prev_close else 0.0
+
+            rows.append({
+                "Name": name,
+                "CMP": round(close, 2),
+                "% Change": round(change_pct, 2)
+            })
+        except Exception:
+            continue
+
+    return pd.DataFrame(rows)
+
+
+def get_intraday_trend_label(df):
+    if df.empty or len(df) < 20:
+        return "----"
+
+    df = add_indicators(df).bfill().ffill()
+    if df.empty:
+        return "----"
+
+    latest = df.iloc[-1]
+
+    if latest["EMA20"] > latest["EMA50"]:
+        return "BULLISH"
+    elif latest["EMA20"] < latest["EMA50"]:
+        return "BEARISH"
+    return "NEUTRAL"
+
+
+def safe_fetch_intraday_trend(ticker, minutes="1m"):
+    try:
+        df = fetch_data(ticker, "1m", "7d")
+        if df.empty:
+            return "----"
+
+        if minutes == "2m":
+            df = resample_ohlcv(df, "2min")
+        elif minutes == "3m":
+            df = resample_ohlcv(df, "3min")
+
+        return get_intraday_trend_label(df)
+    except Exception:
+        return "----"
+
+
+@st.cache_data(ttl=300)
+def fetch_fno_style_scanner(symbol_map):
+    rows = []
+    sno = 1
+
+    for name, ticker in symbol_map.items():
+        try:
+            df = yf.download(
+                ticker,
+                period="5d",
+                interval="1d",
+                progress=False,
+                auto_adjust=False
+            )
+
+            cmp_value = "----"
+            change_str = "----"
+            direction = "----"
+
+            if not df.empty and len(df) >= 2:
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = df.columns.get_level_values(0)
+
+                if "Close" in df.columns:
+                    close = float(df["Close"].iloc[-1])
+                    prev_close = float(df["Close"].iloc[-2])
+
+                    cmp_value = f"{close:.2f}"
+
+                    if prev_close:
+                        change_pct = ((close - prev_close) / prev_close) * 100
+                        change_str = f"{change_pct:+.2f}%"
+                        direction = "BULLISH" if change_pct >= 0 else "BEARISH"
+
+            trend_1m = safe_fetch_intraday_trend(ticker, "1m")
+            trend_2m = safe_fetch_intraday_trend(ticker, "2m")
+            trend_3m = safe_fetch_intraday_trend(ticker, "3m")
+
+            rows.append({
+                "S.NO": sno,
+                "STOCKS": name,
+                "CMP": cmp_value,
+                "% Change": change_str,
+                "1m": trend_1m,
+                "2m": trend_2m,
+                "3m": trend_3m,
+                "Direction": direction
+            })
+            sno += 1
+
+        except Exception:
+            rows.append({
+                "S.NO": sno,
+                "STOCKS": name,
+                "CMP": "----",
+                "% Change": "----",
+                "1m": "----",
+                "2m": "----",
+                "3m": "----",
+                "Direction": "----"
+            })
+            sno += 1
+
+    return pd.DataFrame(rows, columns=[
+        "S.NO", "STOCKS", "CMP", "% Change", "1m", "2m", "3m", "Direction"
+    ])
+
+
+def summarize_fno_bias(fno_df):
+    valid = fno_df[fno_df["Direction"].isin(["BULLISH", "BEARISH"])].copy()
+
+    if valid.empty:
+        return {
+            "overall_bias": "N/A",
+            "bullish_pct": 0,
+            "bearish_pct": 0,
+            "strongest_gainer": "N/A",
+            "strongest_loser": "N/A"
+        }
+
+    bullish_count = (valid["Direction"] == "BULLISH").sum()
+    bearish_count = (valid["Direction"] == "BEARISH").sum()
+    total = len(valid)
+
+    bullish_pct = round((bullish_count / total) * 100)
+    bearish_pct = round((bearish_count / total) * 100)
+
+    overall_bias = "BULLISH" if bullish_count >= bearish_count else "BEARISH"
+
+    valid["ChangeNum"] = valid["% Change"].astype(str).str.replace("%", "", regex=False)
+    valid["ChangeNum"] = pd.to_numeric(valid["ChangeNum"], errors="coerce")
+
+    gainers = valid.dropna(subset=["ChangeNum"]).sort_values("ChangeNum", ascending=False)
+    losers = valid.dropna(subset=["ChangeNum"]).sort_values("ChangeNum", ascending=True)
+
+    strongest_gainer = "N/A"
+    strongest_loser = "N/A"
+
+    if not gainers.empty:
+        strongest_gainer = f"{gainers.iloc[0]['STOCKS']} ({gainers.iloc[0]['% Change']})"
+
+    if not losers.empty:
+        strongest_loser = f"{losers.iloc[0]['STOCKS']} ({losers.iloc[0]['% Change']})"
+
+    return {
+        "overall_bias": overall_bias,
+        "bullish_pct": bullish_pct,
+        "bearish_pct": bearish_pct,
+        "strongest_gainer": strongest_gainer,
+        "strongest_loser": strongest_loser
+    }
+
+
+# ----------------------------
+# MTF SIGNAL
+# ----------------------------
+def get_data_for_timeframe(data_source, selected, ticker, tf, angel_creds):
+    if data_source == "Yahoo":
+        if tf == "1m":
+            data = fetch_data(ticker, "1m", "7d")
+        elif tf == "3m":
+            data = fetch_data(ticker, "1m", "7d")
+            if not data.empty:
+                data = resample_ohlcv(data, "3min")
+        elif tf == "5m":
+            data = fetch_data(ticker, "5m", "30d")
+        elif tf == "10m":
+            data = fetch_data(ticker, "5m", "30d")
+            if not data.empty:
+                data = resample_ohlcv(data, "10min")
+        elif tf == "15m":
+            data = fetch_data(ticker, "15m", "30d")
+        elif tf == "30m":
+            data = fetch_data(ticker, "30m", "60d")
+        elif tf == "1h":
+            data = fetch_data(ticker, "60m", "90d")
+        else:
+            data = fetch_data(ticker, "1d", "1y")
+        return data
+
+    api_key, client_code, pin, totp_secret = angel_creds
+    interval = map_angel_interval(tf)
+    candles = get_angel_candles(api_key, client_code, pin, totp_secret, selected, interval)
+    data = candles_to_df(candles)
+
+    if data.empty:
+        return data
+
+    if tf == "3m":
+        data = resample_ohlcv(data, "3min")
+    elif tf == "10m":
+        data = resample_ohlcv(data, "10min")
+
+    return data
+
+
+def get_mtf_signal(data_source, selected, ticker, tf, angel_creds):
+    data = get_data_for_timeframe(data_source, selected, ticker, tf, angel_creds)
+    if data.empty:
+        return "⚪ N/A"
+
+    data = add_indicators(data)
+    data = data.bfill().ffill()
+
+    if len(data) < 5:
+        return "⚪ N/A"
+
+    latest = data.iloc[-1]
+    if latest["EMA20"] > latest["EMA50"]:
+        return "🟢 Bullish"
+    elif latest["EMA20"] < latest["EMA50"]:
+        return "🔴 Bearish"
+    return "⚪ Neutral"
+
+
+# ----------------------------
+# APP START
+# ----------------------------
+login_panel()
+init_journal()
+init_paper_state()
+init_daily_summary()
+init_risk_state()
+init_ws_state()
+
+stocks = {
+    "NIFTY": "^NSEI",
+    "BANKNIFTY": "^NSEBANK",
+    "RELIANCE": "RELIANCE.NS",
+    "TCS": "TCS.NS",
+    "INFY": "INFY.NS",
+    "HDFCBANK": "HDFCBANK.NS",
+    "SBIN": "SBIN.NS",
+    "ICICIBANK": "ICICIBANK.NS",
+    "ITC": "ITC.NS"
+}
+
+ANGEL_TOKENS = {
+    "SBIN": "3045",
+    "RELIANCE": "2885",
+    "INFY": "1594",
+    "TCS": "11536",
+    "NIFTY": "99926000",
+    "BANKNIFTY": "99926009",
+    "HDFCBANK": "1333",
+    "ICICIBANK": "4963",
+    "ITC": "1660"
+}
+
+global_indices = {
+    "S&P 500": "^GSPC",
+    "Dow Jones": "^DJI",
+    "Nasdaq": "^IXIC",
+    "FTSE 100": "^FTSE",
+    "DAX": "^GDAXI",
+    "Nikkei 225": "^N225",
+    "Hang Seng": "^HSI",
+    "Crude Oil": "CL=F",
+    "Gold": "GC=F",
+    "USD/INR": "INR=X"
+}
+
+indian_indices = {
+    "NIFTY 50": "^NSEI",
+    "BANKNIFTY": "^NSEBANK",
+    "SENSEX": "^BSESN",
+    "NIFTY IT": "^CNXIT",
+    "NIFTY AUTO": "^CNXAUTO",
+    "NIFTY PHARMA": "^CNXPHARMA"
+}
+
+major_stocks = {
+    "RELIANCE": "RELIANCE.NS",
+    "HDFC BANK": "HDFCBANK.NS",
+    "ICICI BANK": "ICICIBANK.NS",
+    "INFY": "INFY.NS",
+    "TCS": "TCS.NS",
+    "ITC": "ITC.NS",
+    "LT": "LT.NS",
+    "SBI": "SBIN.NS",
+    "AXIS BANK": "AXISBANK.NS",
+    "BHARTI AIRTEL": "BHARTIARTL.NS",
+    "KOTAK BANK": "KOTAKBANK.NS",
+    "HCLTECH": "HCLTECH.NS",
+    "ASIAN PAINTS": "ASIANPAINT.NS",
+    "MARUTI": "MARUTI.NS",
+    "SUN PHARMA": "SUNPHARMA.NS",
+    "TITAN": "TITAN.NS",
+    "ULTRATECH CEMENT": "ULTRACEMCO.NS",
+    "NESTLE INDIA": "NESTLEIND.NS",
+    "BAJAJ FINANCE": "BAJFINANCE.NS",
+    "POWER GRID": "POWERGRID.NS"
+}
+
+st.title("📈 Elite Trading Dashboard Ultimate V6")
+st.caption("Journal + Paper Trading + Alerts + MTF + Backtest + Global/India Market Snapshot + Angel Ready")
+
+debug_mode = st.sidebar.checkbox("Debug Mode", value=False)
+
+selected = st.selectbox("Select Stock / Index", list(stocks.keys()))
+data_source = st.radio("Data Source", ["Yahoo", "Angel"], horizontal=True)
+timeframe = st.selectbox("Select Time Frame", ["1m", "3m", "5m", "10m", "15m", "30m", "1h", "1d"])
+auto_refresh = st.checkbox("Enable Auto Refresh", value=True)
+refresh_seconds = st.selectbox("Refresh Every (seconds)", [10, 20, 30, 60], index=2)
+
+with st.expander("Telegram Alert Settings"):
+    telegram_enabled = st.checkbox("Enable Telegram Alerts", value=False)
+    telegram_bot_token = st.text_input("Telegram Bot Token", type="password")
+    telegram_chat_id = st.text_input("Telegram Chat ID")
+    auto_send_telegram = st.checkbox("Auto-send on New Signal", value=False)
+
+with st.expander("Angel One API Settings"):
+    angel_enabled = st.checkbox("Enable Angel One API", value=(data_source == "Angel"))
+    angel_api_key = st.text_input("Angel API Key", type="password")
+    angel_client_code = st.text_input("Angel Client Code")
+    angel_pin = st.text_input("Angel PIN", type="password")
+    angel_totp_secret = st.text_input("Angel TOTP Secret", type="password")
+    ws_enable = st.checkbox("Enable Angel WebSocket", value=False)
+
+    if st.button("Test Angel Login"):
+        angel, session = angel_login(
+            angel_api_key, angel_client_code, angel_pin, angel_totp_secret, force_refresh=True
+        )
+        if angel and session:
+            st.success("✅ Angel One Login Successful")
+        else:
+            st.error("❌ Angel login failed")
+
+    if st.button("Stop WebSocket"):
+        stop_angel_websocket()
+        sync_ws_state_to_session()
+        st.warning("WebSocket stop requested.")
+
+effective_refresh_seconds = refresh_seconds
+if data_source == "Angel" and ws_enable:
+    effective_refresh_seconds = max(refresh_seconds, 20)
+
+if auto_refresh:
+    st_autorefresh(interval=effective_refresh_seconds * 
