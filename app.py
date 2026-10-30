@@ -50,7 +50,8 @@ WS_SHARED_STATE = {
     "thread_started": False,
     "symbol": None,
     "socket": None,
-    "last_data_time": None
+    "last_data_time": None,
+    "log": []
 }
 
 
@@ -1550,8 +1551,15 @@ def candles_to_df(candles):
 
 
 # ----------------------------
-# ANGEL WEBSOCKET - STABLE VERSION
+# ANGEL WEBSOCKET - DEBUG + STABLE VERSION
 # ----------------------------
+def ws_log(msg):
+    with WS_STATE_LOCK:
+        ts = datetime.now().strftime("%H:%M:%S")
+        WS_SHARED_STATE["log"].append(f"[{ts}] {msg}")
+        WS_SHARED_STATE["log"] = WS_SHARED_STATE["log"][-50:]
+
+
 def ws_set_state(**kwargs):
     with WS_STATE_LOCK:
         for k, v in kwargs.items():
@@ -1573,6 +1581,7 @@ def sync_ws_state_to_session():
     st.session_state["ws_retries"] = state["retries"]
     st.session_state["ws_should_run"] = state["should_run"]
     st.session_state["ws_thread_started"] = state["thread_started"]
+    st.session_state["ws_log"] = state["log"]
 
 
 def init_ws_state():
@@ -1584,7 +1593,8 @@ def init_ws_state():
         "ws_thread_started": False,
         "live_price": None,
         "ws_retries": 0,
-        "ws_should_run": False
+        "ws_should_run": False,
+        "ws_log": []
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -1595,6 +1605,7 @@ def init_ws_state():
 
 def stop_angel_websocket():
     try:
+        ws_log("Stop requested by user")
         ws_set_state(
             should_run=False,
             connected=False,
@@ -1609,10 +1620,12 @@ def stop_angel_websocket():
             try:
                 if hasattr(sws, "close_connection"):
                     sws.close_connection()
+                    ws_log("close_connection() called")
                 elif hasattr(sws, "close"):
                     sws.close()
-            except Exception:
-                pass
+                    ws_log("close() called")
+            except Exception as e:
+                ws_log(f"Socket close error: {e}")
 
         ws_set_state(
             socket=None,
@@ -1621,11 +1634,10 @@ def stop_angel_websocket():
 
     except Exception as e:
         ws_set_state(error=f"Stop error: {e}")
+        ws_log(f"Stop error: {e}")
 
 
 def extract_ltp_from_message(message):
-    ltp = None
-
     if not isinstance(message, dict):
         return None
 
@@ -1639,19 +1651,15 @@ def extract_ltp_from_message(message):
 
     for key in possible_keys:
         if key in message and message.get(key) is not None:
-            ltp = message.get(key)
-            break
+            try:
+                ltp_f = float(message.get(key))
+                if ltp_f > 10000:
+                    ltp_f = ltp_f / 100.0
+                return ltp_f
+            except Exception:
+                return None
 
-    if ltp is None:
-        return None
-
-    try:
-        ltp_f = float(ltp)
-        if ltp_f > 10000:
-            ltp_f = ltp_f / 100.0
-        return ltp_f
-    except Exception:
-        return None
+    return None
 
 
 def start_angel_websocket(api_key, client_code, pin, totp_secret, symbol_name):
@@ -1659,22 +1667,26 @@ def start_angel_websocket(api_key, client_code, pin, totp_secret, symbol_name):
 
     if not SMART_WS_AVAILABLE:
         ws_set_state(error="SmartWebSocketV2 not available in installed SmartApi package.")
+        ws_log("SmartWebSocketV2 import failed")
         sync_ws_state_to_session()
         return
 
     symbol_token = ANGEL_TOKENS.get(symbol_name)
     if not symbol_token:
         ws_set_state(error=f"Missing token for {symbol_name}")
+        ws_log(f"Missing token for {symbol_name}")
         sync_ws_state_to_session()
         return
 
     state = ws_get_state()
 
     if state.get("thread_started") and state.get("symbol") == symbol_name and state.get("should_run"):
+        ws_log(f"WS already running for {symbol_name}")
         sync_ws_state_to_session()
         return
 
     if state.get("thread_started") and state.get("symbol") != symbol_name:
+        ws_log(f"Symbol changed from {state.get('symbol')} to {symbol_name}, stopping old socket")
         stop_angel_websocket()
         pytime.sleep(1)
 
@@ -1682,8 +1694,10 @@ def start_angel_websocket(api_key, client_code, pin, totp_secret, symbol_name):
         should_run=True,
         thread_started=True,
         symbol=symbol_name,
-        error=""
+        error="",
+        retries=0
     )
+    ws_log(f"Starting WS for {symbol_name} token={symbol_token}")
 
     def run_socket():
         retry_count = 0
@@ -1691,6 +1705,7 @@ def start_angel_websocket(api_key, client_code, pin, totp_secret, symbol_name):
         while True:
             state_now = ws_get_state()
             if not state_now.get("should_run"):
+                ws_log("WS loop exiting because should_run=False")
                 break
 
             if retry_count >= MAX_WS_RETRIES:
@@ -1702,9 +1717,11 @@ def start_angel_websocket(api_key, client_code, pin, totp_secret, symbol_name):
                     thread_started=False,
                     socket=None
                 )
+                ws_log("Max retries reached")
                 break
 
             try:
+                ws_log(f"WS login attempt {retry_count + 1}")
                 angel, session = angel_login(
                     api_key,
                     client_code,
@@ -1716,8 +1733,17 @@ def start_angel_websocket(api_key, client_code, pin, totp_secret, symbol_name):
                 if angel is None or session is None or not session.get("data"):
                     raise Exception("Angel login failed during WebSocket reconnect")
 
-                auth_token = session["data"]["jwtToken"]
-                feed_token_resp = angel.getfeedToken()
+                auth_token = session["data"].get("jwtToken")
+                if not auth_token:
+                    raise Exception("JWT token missing in session")
+
+                ws_log("JWT token received")
+
+                try:
+                    feed_token_resp = angel.getfeedToken()
+                    ws_log(f"Feed token response type: {type(feed_token_resp).__name__}")
+                except Exception as e:
+                    raise Exception(f"getfeedToken failed: {e}")
 
                 if isinstance(feed_token_resp, dict):
                     feed_token = feed_token_resp.get("data", {}).get("feedToken")
@@ -1729,7 +1755,11 @@ def start_angel_websocket(api_key, client_code, pin, totp_secret, symbol_name):
                 if not feed_token:
                     raise Exception("Feed token not received")
 
+                ws_log("Feed token received")
+                ws_log("Creating SmartWebSocketV2 instance")
+
                 sws = SmartWebSocketV2(auth_token, api_key, client_code, feed_token)
+
                 ws_set_state(
                     socket=sws,
                     running=True,
@@ -1740,7 +1770,13 @@ def start_angel_websocket(api_key, client_code, pin, totp_secret, symbol_name):
 
                 correlation_id = f"elite_dashboard_feed_{symbol_name}"
                 mode = 1
-                token_list = [{"exchangeType": 1, "tokens": [str(symbol_token)]}]
+
+                if symbol_name in ["NIFTY", "BANKNIFTY"]:
+                    token_list = [{"exchangeType": 1, "tokens": [str(symbol_token)]}]
+                else:
+                    token_list = [{"exchangeType": 1, "tokens": [str(symbol_token)]}]
+
+                ws_log(f"Prepared subscribe payload: {token_list}")
 
                 def on_data(wsapp, message):
                     ltp = extract_ltp_from_message(message)
@@ -1748,12 +1784,15 @@ def start_angel_websocket(api_key, client_code, pin, totp_secret, symbol_name):
                     ws_set_state(
                         last_tick=message,
                         connected=True,
+                        running=True,
                         error="",
                         live_price=ltp if ltp is not None else current_state.get("live_price"),
                         last_data_time=datetime.now().strftime("%d-%m-%Y %H:%M:%S")
                     )
+                    ws_log(f"Tick received: {message}")
 
                 def on_open(wsapp):
+                    ws_log("WS on_open triggered")
                     try:
                         ws_set_state(
                             connected=True,
@@ -1761,11 +1800,13 @@ def start_angel_websocket(api_key, client_code, pin, totp_secret, symbol_name):
                             error=""
                         )
                         sws.subscribe(correlation_id, mode, token_list)
+                        ws_log("Subscribe call sent")
                     except Exception as e:
                         ws_set_state(
                             error=f"Subscribe error: {e}",
                             connected=False
                         )
+                        ws_log(f"Subscribe error: {e}")
 
                 def on_error(wsapp, error):
                     ws_set_state(
@@ -1773,30 +1814,36 @@ def start_angel_websocket(api_key, client_code, pin, totp_secret, symbol_name):
                         connected=False,
                         running=False
                     )
+                    ws_log(f"on_error: {error}")
 
                 def on_close(wsapp, *args):
                     reason = ""
                     if args:
                         reason = " | ".join([str(x) for x in args if x is not None])
+
                     ws_set_state(
                         connected=False,
                         running=False,
                         error=f"WS closed{': ' + reason if reason else ''}"
                     )
+                    ws_log(f"on_close: {reason if reason else 'no reason'}")
 
                 sws.on_open = on_open
                 sws.on_data = on_data
                 sws.on_error = on_error
                 sws.on_close = on_close
 
+                ws_log("Calling sws.connect()")
                 try:
                     sws.connect()
+                    ws_log("sws.connect() returned")
                 finally:
                     ws_set_state(
                         connected=False,
                         running=False,
                         socket=None
                     )
+                    ws_log("Socket finalized after connect return")
 
             except Exception as e:
                 ws_set_state(
@@ -1805,14 +1852,17 @@ def start_angel_websocket(api_key, client_code, pin, totp_secret, symbol_name):
                     running=False,
                     socket=None
                 )
+                ws_log(f"Exception in WS loop: {e}")
 
             retry_count += 1
             ws_set_state(retries=retry_count)
 
             state_after = ws_get_state()
             if not state_after.get("should_run"):
+                ws_log("Exiting before retry sleep because should_run=False")
                 break
 
+            ws_log(f"Sleeping {WS_RETRY_DELAY_SEC}s before retry")
             pytime.sleep(WS_RETRY_DELAY_SEC)
 
         ws_set_state(
@@ -1821,9 +1871,11 @@ def start_angel_websocket(api_key, client_code, pin, totp_secret, symbol_name):
             socket=None,
             thread_started=False
         )
+        ws_log("WS thread fully exited")
 
     thread = threading.Thread(target=run_socket, daemon=True)
     thread.start()
+    ws_log("WS thread started")
 
     sync_ws_state_to_session()
 
@@ -2431,6 +2483,9 @@ if data_source == "Angel" and ws_enable:
     if st.session_state.get("ws_error"):
         st.warning(f"WebSocket: {st.session_state['ws_error']}")
 
+    if st.session_state.get("ws_last_tick") is None:
+        st.info("WebSocket connected nahi hua ya abhi tak koi tick receive nahi hua.")
+
 st.subheader("📊 Multi Timeframe Alignment")
 st.dataframe(mtf_table, use_container_width=True)
 
@@ -2918,3 +2973,5 @@ if debug_mode:
         st.write("WS Thread Started:", st.session_state.get("ws_thread_started"))
         st.write("Live Price:", st.session_state.get("live_price"))
         st.write("Last Tick:", st.session_state.get("ws_last_tick"))
+        st.write("WS Log:")
+        st.code("\n".join(st.session_state.get("ws_log", [])) if st.session_state.get("ws_log") else "No WS logs yet")
