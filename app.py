@@ -3171,24 +3171,42 @@ with st.expander("News Filter API"):
     news_filter_enabled = st.checkbox("Enable News Filter", value=False)
 
 with st.expander("Angel One API Settings"):
-    angel_api_key = st.text_input("Angel API Key", type="password")
-    angel_client_code = st.text_input("Angel Client Code")
-    angel_pin = st.text_input("Angel PIN", type="password")
-    angel_totp_secret = st.text_input("Angel TOTP Secret", type="password")
-    polling_mode = st.checkbox("Use Angel LTP Polling Mode", value=True)
-    ws_enable = st.checkbox("Enable Angel WebSocket (Optional)", value=False)
+    # Explicit widget keys keep credentials available across Streamlit reruns
+    # (including auto-refresh) instead of relying on regenerated widget IDs.
+    angel_api_key = st.text_input("Angel API Key", type="password", key="angel_api_key_input")
+    angel_client_code = st.text_input("Angel Client Code", key="angel_client_code_input")
+    angel_pin = st.text_input("Angel PIN", type="password", key="angel_pin_input")
+    angel_totp_secret = st.text_input("Angel TOTP Secret", type="password", key="angel_totp_secret_input")
+    polling_mode = st.checkbox("Use Angel LTP Polling Mode", value=True, key="angel_polling_mode")
+    ws_enable = st.checkbox("Enable Angel WebSocket (Optional)", value=False, key="angel_ws_enable")
 
-    if st.button("Test Angel Login"):
-        angel, session = angel_login(angel_api_key, angel_client_code, angel_pin, angel_totp_secret, force_refresh=True)
-        if angel and session:
-            st.success("Angel One Login Successful")
+    if st.button("Test Angel Login", key="test_angel_login_button"):
+        # Read directly from keyed widget state at the moment the user tests login.
+        angel_api_key = str(st.session_state.get("angel_api_key_input", "")).strip()
+        angel_client_code = str(st.session_state.get("angel_client_code_input", "")).strip()
+        angel_pin = str(st.session_state.get("angel_pin_input", "")).strip()
+        angel_totp_secret = str(st.session_state.get("angel_totp_secret_input", "")).strip()
+        if not all((angel_api_key, angel_client_code, angel_pin, angel_totp_secret)):
+            st.error("Please fill all four Angel One fields before testing login.")
         else:
-            st.error("Angel login failed")
+            angel, session = angel_login(angel_api_key, angel_client_code, angel_pin, angel_totp_secret, force_refresh=True)
+            if angel and session:
+                st.session_state["angel_credentials_login_ok"] = True
+                st.success("Angel One Login Successful. Credentials retained for this app session.")
+            else:
+                st.session_state["angel_credentials_login_ok"] = False
+                st.error("Angel login failed. Check API key, Client Code, PIN and TOTP Secret.")
 
     if st.button("Stop WebSocket"):
         stop_angel_websocket()
         sync_ws_state_to_session()
         st.warning("WebSocket stop requested.")
+
+# Always retrieve credentials from the stable keyed widgets after the expander.
+angel_api_key = str(st.session_state.get("angel_api_key_input", angel_api_key or "")).strip()
+angel_client_code = str(st.session_state.get("angel_client_code_input", angel_client_code or "")).strip()
+angel_pin = str(st.session_state.get("angel_pin_input", angel_pin or "")).strip()
+angel_totp_secret = str(st.session_state.get("angel_totp_secret_input", angel_totp_secret or "")).strip()
 
 ticker = stocks[selected]
 
@@ -3221,8 +3239,9 @@ if "last_good_candles" not in st.session_state:
     st.session_state["last_good_candles"] = None
 
 if data_source == "Angel":
-    if not (angel_api_key and angel_client_code and angel_pin and angel_totp_secret):
-        st.warning("Angel One selected, but API Key / Client Code / PIN / TOTP are incomplete. Enter credentials in Angel One API Settings, or switch to Yahoo Finance.")
+    if not all((angel_api_key.strip(), angel_client_code.strip(), angel_pin.strip(), angel_totp_secret.strip())):
+        missing_angel_fields = [name for name, value in (("API Key", angel_api_key), ("Client Code", angel_client_code), ("PIN", angel_pin), ("TOTP Secret", angel_totp_secret)) if not str(value).strip()]
+        st.error("Angel One credentials are not available to the data loader. Missing fields: " + ", ".join(missing_angel_fields) + ". Re-enter them in Angel One API Settings.")
         data = pd.DataFrame()
     else:
         angel_interval = map_angel_interval(timeframe)
