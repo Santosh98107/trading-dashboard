@@ -1,9 +1,17 @@
-streamlit
-pandas
-numpy
-plotly
-requests
-yfinance
-pyotp
-smartapi-python
-streamlit-autorefresh
+# Streamlit dashboard core
+streamlit>=1.36.0,<2.0
+streamlit-autorefresh>=1.0.1,<2.0
+
+# Data and charts
+numpy>=1.26.0,<3.0
+pandas>=2.0.0,<3.0
+yfinance>=0.2.54
+plotly>=5.20.0,<7.0
+requests>=2.31.0,<3.0
+
+# Angel One SmartAPI + optional WebSocket support
+smartapi-python==1.5.5
+pyotp>=2.9.0,<3.0
+logzero>=1.7.0,<2.0
+pycryptodome>=3.20.0
+websocket-client>=1.8.0,<2.0
