@@ -16,7 +16,7 @@ import streamlit as st
 import yfinance as yf
 
 # Visible deployment marker: confirms which source file Streamlit Cloud is running.
-APP_BUILD_ID = "2026-11-01-MARKETAUX-NEWS-INTEGRATION-14"
+APP_BUILD_ID = "2026-11-01-NEWS-API-TEST-CONNECTION-15"
 # Optional integrations: Yahoo mode must still start if Angel SDK/TOTP or
 # the auto-refresh helper is not installed.
 try:
@@ -2173,6 +2173,152 @@ def _news_parse_datetime(value):
         return parsed.to_pydatetime()
     except Exception:
         return None
+
+
+def test_news_provider_connection(api_key, provider="Marketaux"):
+    """Make one uncached, minimal authenticated request to verify a news API token.
+
+    A successful HTTP 200 with the expected response shape means the token was
+    accepted even when the provider currently has zero matching articles.
+    Never return or log the token or a request URL containing it.
+    """
+    provider_name = str(provider or "Marketaux").strip()
+    provider_key = provider_name.lower()
+    token = str(api_key or "").strip()
+    if not token:
+        return {
+            "ok": False,
+            "provider": provider_name,
+            "http_status": None,
+            "message": "Enter the API token first, then press Test API Connection.",
+            "articles": None,
+        }
+
+    try:
+        if provider_key == "marketaux":
+            response = requests.get(
+                MARKETAUX_NEWS_URL,
+                params={
+                    "api_token": token,
+                    "search": "NIFTY",
+                    "language": "en",
+                    "limit": 1,
+                },
+                timeout=10,
+            )
+            expected_list_key = "data"
+        elif provider_key in ("newsapi", "newsapi (legacy)"):
+            response = requests.get(
+                "https://newsapi.org/v2/everything",
+                params={
+                    "apiKey": token,
+                    "q": "NIFTY",
+                    "language": "en",
+                    "sortBy": "publishedAt",
+                    "pageSize": 1,
+                },
+                timeout=10,
+            )
+            expected_list_key = "articles"
+        else:
+            return {
+                "ok": False,
+                "provider": provider_name,
+                "http_status": None,
+                "message": "Unsupported news provider selected.",
+                "articles": None,
+            }
+
+        status_code = int(response.status_code)
+        try:
+            payload = response.json()
+        except Exception:
+            payload = None
+
+        if status_code == 200:
+            if not isinstance(payload, dict):
+                return {
+                    "ok": False, "provider": provider_name,
+                    "http_status": status_code,
+                    "message": "Provider returned HTTP 200 but the response was not valid JSON.",
+                    "articles": None,
+                }
+            if provider_key == "marketaux":
+                items = payload.get("data")
+                valid_shape = isinstance(items, list)
+            else:
+                valid_shape = payload.get("status") == "ok" and isinstance(payload.get("articles"), list)
+                items = payload.get("articles") if isinstance(payload.get("articles"), list) else None
+            if not valid_shape:
+                return {
+                    "ok": False, "provider": provider_name,
+                    "http_status": status_code,
+                    "message": "Provider accepted the HTTP request but returned an unexpected response format.",
+                    "articles": None,
+                }
+            count = len(items or [])
+            return {
+                "ok": True,
+                "provider": provider_name,
+                "http_status": status_code,
+                "message": (
+                    f"{provider_name} connection successful — API token accepted (HTTP 200). "
+                    f"Test query returned {count} article(s). Zero articles can still mean the token is valid."
+                ),
+                "articles": count,
+            }
+
+        if status_code == 401:
+            message = "HTTP 401 — API token is invalid or not authorized. Check the token in your provider account."
+        elif status_code == 402:
+            message = "HTTP 402 — provider usage limit or plan quota reached. Check your account plan/usage."
+        elif status_code == 403:
+            message = "HTTP 403 — this endpoint or feature is not allowed by the current provider plan."
+        elif status_code == 429:
+            message = "HTTP 429 — provider rate limit reached. Wait before testing again."
+        elif status_code == 400:
+            message = "HTTP 400 — provider rejected the test query parameters. Check the API response and plan."
+        elif status_code >= 500:
+            message = f"HTTP {status_code} — provider server is temporarily unavailable. Try again later."
+        else:
+            message = f"Provider returned HTTP {status_code}. Check the API token, plan and provider status."
+
+        # Include only a short provider message; redact the token defensively.
+        if isinstance(payload, dict):
+            err = payload.get("error") or payload.get("message")
+            if isinstance(err, dict):
+                detail = str(err.get("message") or err.get("code") or "")
+            else:
+                detail = str(err or "")
+            detail = detail.replace(token, "[redacted]").strip()[:180]
+            if detail:
+                message += " Provider detail: " + detail
+        return {
+            "ok": False,
+            "provider": provider_name,
+            "http_status": status_code,
+            "message": message,
+            "articles": None,
+        }
+    except requests.Timeout:
+        return {
+            "ok": False, "provider": provider_name, "http_status": None,
+            "message": "Connection test timed out. Check hosting network access and try again.",
+            "articles": None,
+        }
+    except requests.RequestException as exc:
+        # Do not display str(exc): request exceptions may contain the full URL/token.
+        return {
+            "ok": False, "provider": provider_name, "http_status": None,
+            "message": f"Network error during connection test ({type(exc).__name__}). Check internet access and retry.",
+            "articles": None,
+        }
+    except Exception as exc:
+        return {
+            "ok": False, "provider": provider_name, "http_status": None,
+            "message": f"Connection test could not be completed ({type(exc).__name__}).",
+            "articles": None,
+        }
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -4620,6 +4766,10 @@ with st.expander("News Filter API"):
         key="news_provider_selection",
         help="Marketaux is the primary financial-news provider. NewsAPI is retained as a legacy fallback option."
     )
+    st.caption(
+        "There is no separate provider login popup inside this dashboard. "
+        "Marketaux authenticates with the API token from your Marketaux account dashboard."
+    )
     if news_provider == "Marketaux":
         if "marketaux_api_token_input" not in st.session_state:
             st.session_state["marketaux_api_token_input"] = (
@@ -4627,7 +4777,7 @@ with st.expander("News Filter API"):
             )
         marketaux_api_token = st.text_input(
             "Marketaux API Token", type="password", key="marketaux_api_token_input",
-            help="Paste the API token from your Marketaux account. It is kept in this Streamlit session only."
+            help="Paste the API token from your Marketaux account dashboard. It stays in this app session only."
         )
         news_api_key = str(
             marketaux_api_token or st.session_state.get("marketaux_api_token_saved") or ""
@@ -4647,6 +4797,34 @@ with st.expander("News Filter API"):
         ).strip()
         if newsapi_legacy_key:
             st.session_state["newsapi_legacy_key_saved"] = news_api_key
+
+    # Bind the visible test result to a hash of the token, so changing the token
+    # automatically invalidates an old green success indicator without exposing it.
+    _news_token_fingerprint = hashlib.sha256(news_api_key.encode("utf-8")).hexdigest() if news_api_key else ""
+    _stored_news_test_fingerprint = st.session_state.get("news_api_test_token_fingerprint", "")
+    if _stored_news_test_fingerprint and _stored_news_test_fingerprint != _news_token_fingerprint:
+        st.session_state.pop("news_api_test_result", None)
+        st.session_state.pop("news_api_test_token_fingerprint", None)
+
+    if st.button(
+        f"Test {news_provider} API Connection",
+        key="test_news_api_connection_button",
+        use_container_width=True,
+        disabled=not bool(news_api_key),
+    ):
+        with st.spinner(f"Checking {news_provider} API token…"):
+            _test_result = test_news_provider_connection(news_api_key, news_provider)
+        st.session_state["news_api_test_result"] = _test_result
+        st.session_state["news_api_test_token_fingerprint"] = _news_token_fingerprint
+
+    _visible_news_test = st.session_state.get("news_api_test_result")
+    if _visible_news_test and st.session_state.get("news_api_test_token_fingerprint") == _news_token_fingerprint:
+        if _visible_news_test.get("ok"):
+            st.success(_visible_news_test.get("message", "News API connection successful."))
+        else:
+            st.error(_visible_news_test.get("message", "News API connection failed."))
+    else:
+        st.info("Enter your API token and press Test API Connection. The result will show whether the provider accepted the token.")
 
     news_filter_enabled = st.checkbox(
         "Enable News Filter", value=False, key="news_filter_enabled"
