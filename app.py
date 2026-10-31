@@ -384,7 +384,7 @@ def norm(raw):
 
     x = raw.copy()
 
-if isinstance(x
+    if isinstance
     def patterns(d):
     """Identify common Japanese candlestick patterns."""
     if len(d) < 3:
