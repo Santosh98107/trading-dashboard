@@ -13,9 +13,25 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 import yfinance as yf
-import pyotp
-from SmartApi import SmartConnect
-from streamlit_autorefresh import st_autorefresh
+# Optional integrations: Yahoo mode must still start if Angel SDK/TOTP or
+# the auto-refresh helper is not installed.
+try:
+    import pyotp
+except ImportError:
+    pyotp = None
+
+try:
+    from SmartApi import SmartConnect
+except ImportError:
+    SmartConnect = None
+
+try:
+    from streamlit_autorefresh import st_autorefresh
+except ImportError:
+    st_autorefresh = None
+
+SMART_API_AVAILABLE = SmartConnect is not None and pyotp is not None
+AUTO_REFRESH_AVAILABLE = st_autorefresh is not None
 
 SMART_WS_AVAILABLE = False
 try:
@@ -417,7 +433,7 @@ def login_panel():
 # =========================================================
 # DATA FETCH
 # =========================================================
-@st.cache_data(ttl=30)
+@st.cache_data(ttl=10)
 def fetch_data(ticker, interval, period):
     try:
         df = yf.download(ticker, interval=interval, period=period, progress=False, auto_adjust=False)
@@ -477,6 +493,9 @@ def map_angel_interval(timeframe):
 
 def angel_login(api_key, client_code, pin, totp_secret, force_refresh=False):
     try:
+        if not SMART_API_AVAILABLE:
+            log_app_error("angel_login", "Angel One SDK/pyotp missing. Install smartapi-python and pyotp.")
+            return None, None
         cache_key = f"{client_code}_{api_key}"
         if (
             not force_refresh and
@@ -546,12 +565,26 @@ def candles_to_df(candles):
 
 
 def get_angel_ltp_polling(api_key, client_code, pin, totp_secret, symbol_name):
+    """Fetch the latest quote through Angel One REST LTP API (not candle history)."""
     try:
-        candles = get_angel_candles(api_key, client_code, pin, totp_secret, symbol_name, "ONE_MINUTE")
-        df = candles_to_df(candles)
-        if not df.empty:
-            return float(df["Close"].iloc[-1])
-        return None
+        angel, session = angel_login(api_key, client_code, pin, totp_secret)
+        if angel is None or not session or not session.get("data"):
+            return None
+
+        token = ANGEL_TOKENS.get(symbol_name)
+        trading_symbol = ANGEL_TRADING_SYMBOLS.get(symbol_name)
+        if not token or not trading_symbol:
+            log_app_error("get_angel_ltp_polling", f"Missing Angel symbol/token mapping for {symbol_name}")
+            return None
+
+        response = angel.getLTPData("NSE", trading_symbol, str(token))
+        if not isinstance(response, dict) or response.get("status") is False:
+            log_app_error("get_angel_ltp_polling", response)
+            return None
+        quote = response.get("data") or {}
+        value = quote.get("ltp") or quote.get("LTP")
+        price = float(value) if value is not None else None
+        return price if price and price > 0 else None
     except Exception as e:
         log_app_error("get_angel_ltp_polling", e)
         return None
@@ -2778,6 +2811,13 @@ ANGEL_TOKENS = {
     "ITC": "1660"
 }
 
+# SmartAPI quote endpoint requires the exchange trading symbol as well as token.
+ANGEL_TRADING_SYMBOLS = {
+    "SBIN": "SBIN-EQ", "RELIANCE": "RELIANCE-EQ", "INFY": "INFY-EQ",
+    "TCS": "TCS-EQ", "NIFTY": "Nifty 50", "BANKNIFTY": "Nifty Bank",
+    "HDFCBANK": "HDFCBANK-EQ", "ICICIBANK": "ICICIBANK-EQ", "ITC": "ITC-EQ"
+}
+
 st.title("Elite Trading Dashboard Final Ultimate")
 st.caption("Polling First | Walk Forward | Auto Exit | News Filter | Dynamic Option Chain")
 
@@ -2786,7 +2826,7 @@ selected = st.selectbox("Select Stock / Index", list(stocks.keys()))
 data_source = st.radio("Data Source", ["Yahoo", "Angel"], horizontal=True)
 timeframe = st.selectbox("Select Time Frame", ["1m", "3m", "5m", "10m", "15m", "30m", "1h", "1d"])
 auto_refresh = st.checkbox("Enable Auto Refresh", value=True)
-refresh_seconds = st.selectbox("Refresh Every (seconds)", [10, 20, 30, 60], index=2)
+refresh_seconds = st.selectbox("Refresh Every (seconds)", [5, 10, 15, 30, 60], index=1)
 
 with st.expander("Telegram Alert Settings"):
     telegram_enabled = st.checkbox("Enable Telegram Alerts", value=False)
@@ -2821,7 +2861,10 @@ with st.expander("Angel One API Settings"):
 ticker = stocks[selected]
 
 if auto_refresh:
-    st_autorefresh(interval=refresh_seconds * 1000, key="elite_ultimate_refresh")
+    if AUTO_REFRESH_AVAILABLE:
+        st_autorefresh(interval=refresh_seconds * 1000, key="elite_ultimate_refresh")
+    else:
+        st.caption("Auto-refresh helper is not installed; use the manual browser refresh or install streamlit-autorefresh.")
 
 if timeframe == "1m":
     yf_interval, yf_period = "1m", "7d"
@@ -2862,7 +2905,7 @@ if data_source == "Angel":
     else:
         st.session_state["last_good_candles"] = candles
 
-    if ws_enable and not USE_POLLING_AS_PRIMARY:
+    if ws_enable:
         start_angel_websocket(angel_api_key, angel_client_code, angel_pin, angel_totp_secret, selected)
         sync_ws_state_to_session()
 else:
@@ -3345,4 +3388,13 @@ else:
 
 if debug_mode:
     st.subheader("Debug Panel")
-   
+    st.write("Angel SDK available:", SMART_API_AVAILABLE)
+    st.write("Auto-refresh helper available:", AUTO_REFRESH_AVAILABLE)
+    st.write("Data source:", data_source)
+    st.write("Selected instrument:", selected)
+    st.write("Selected timeframe:", timeframe)
+    st.write("Candle rows:", len(data))
+    st.write("Last candle timestamp:", str(data.index[-1]) if not data.empty else "N/A")
+    st.write("Live price:", current_display_price)
+    st.write("WebSocket state:", st.session_state.get("ws_connected", False))
+    st.write("Last WebSocket tick:", st.session_state.get("ws_last_tick"))
