@@ -15,7 +15,7 @@ import streamlit as st
 import yfinance as yf
 
 # Visible deployment marker: confirms which source file Streamlit Cloud is running.
-APP_BUILD_ID = "2026-11-01-ANGEL-REQUEST-GATE-DIAGNOSTIC-03"
+APP_BUILD_ID = "2026-11-01-ANGEL-TOTP-FORM-FIX-04"
 # Optional integrations: Yahoo mode must still start if Angel SDK/TOTP or
 # the auto-refresh helper is not installed.
 try:
@@ -3222,38 +3222,63 @@ with st.expander("News Filter API"):
     news_filter_enabled = st.checkbox("Enable News Filter", value=False)
 
 with st.expander("Angel One API Settings"):
-    # Explicit widget keys keep credentials available across Streamlit reruns
-    # (including auto-refresh) instead of relying on regenerated widget IDs.
-    angel_api_key = st.text_input("Angel API Key", type="password", key="angel_api_key_input")
-    angel_client_code = st.text_input("Angel Client Code", key="angel_client_code_input")
-    angel_pin = st.text_input("Angel PIN", type="password", key="angel_pin_input")
-    angel_totp_secret = st.text_input("Angel TOTP Secret", type="password", key="angel_totp_secret_input")
+    # Submit the four credentials together. A Streamlit form prevents partial
+    # reruns while a password field is being edited and avoids stale widget reads.
+    with st.form("angel_connect_form", clear_on_submit=False):
+        angel_api_key = st.text_input(
+            "Angel API Key", type="password", key="angel_api_key_input"
+        )
+        angel_client_code = st.text_input(
+            "Angel Client Code", key="angel_client_code_input"
+        )
+        angel_pin = st.text_input(
+            "Angel PIN", type="password", key="angel_pin_input"
+        )
+        angel_totp_secret = st.text_input(
+            "Angel TOTP Secret", type="password", key="angel_totp_secret_input"
+        )
+        connect_angel = st.form_submit_button("Test Angel Login", use_container_width=True)
+
     polling_mode = st.checkbox("Use Angel LTP Polling Mode", value=True, key="angel_polling_mode")
     ws_enable = st.checkbox("Enable Angel WebSocket (Optional)", value=False, key="angel_ws_enable")
 
-    if st.button("Test Angel Login", key="test_angel_login_button"):
-        # Read directly from keyed widget state at the moment the user tests login.
-        angel_api_key = str(st.session_state.get("angel_api_key_input", "")).strip()
-        angel_client_code = str(st.session_state.get("angel_client_code_input", "")).strip()
-        angel_pin = str(st.session_state.get("angel_pin_input", "")).strip()
-        angel_totp_secret = str(st.session_state.get("angel_totp_secret_input", "")).strip()
-        if not all((angel_api_key, angel_client_code, angel_pin, angel_totp_secret)):
-            st.error("Please fill all four Angel One fields before testing login.")
+    if connect_angel:
+        # Use the values submitted by the form directly; do not depend on a
+        # subsequent rerun to populate password-widget session state.
+        _submitted_api = str(angel_api_key or "").strip()
+        _submitted_client = str(angel_client_code or "").strip()
+        _submitted_pin = str(angel_pin or "").strip()
+        _submitted_totp = str(angel_totp_secret or "").strip()
+        _submitted_missing = []
+        if not _submitted_api:
+            _submitted_missing.append("API Key")
+        if not _submitted_client:
+            _submitted_missing.append("Client Code")
+        if not _submitted_pin:
+            _submitted_missing.append("PIN")
+        if not _submitted_totp:
+            _submitted_missing.append("TOTP Secret")
+
+        if _submitted_missing:
+            st.session_state["angel_credentials_login_ok"] = False
+            st.error("Angel login was not attempted. Missing: " + ", ".join(_submitted_missing))
         else:
-            # Keep a server-session copy separate from widget state. Streamlit can
-            # clean up widget keys during reruns; the data loader must not depend
-            # exclusively on those UI keys after a successful login.
-            st.session_state["angel_saved_api_key"] = angel_api_key
-            st.session_state["angel_saved_client_code"] = angel_client_code
-            st.session_state["angel_saved_pin"] = angel_pin
-            st.session_state["angel_saved_totp_secret"] = angel_totp_secret
-            angel, session = angel_login(angel_api_key, angel_client_code, angel_pin, angel_totp_secret, force_refresh=True)
+            # Keep the credentials only in this Streamlit server session.
+            # They are never written to CSV, logs, or displayed in diagnostics.
+            st.session_state["angel_saved_api_key"] = _submitted_api
+            st.session_state["angel_saved_client_code"] = _submitted_client
+            st.session_state["angel_saved_pin"] = _submitted_pin
+            st.session_state["angel_saved_totp_secret"] = _submitted_totp
+            angel, session = angel_login(
+                _submitted_api, _submitted_client, _submitted_pin,
+                _submitted_totp, force_refresh=True
+            )
             if angel and session:
                 st.session_state["angel_credentials_login_ok"] = True
-                st.success("Angel One Login Successful. Credentials retained in this app session.")
+                st.success("Angel One Login Successful. Authenticated session is ready.")
             else:
                 st.session_state["angel_credentials_login_ok"] = False
-                st.error("Angel login failed. Check API key, Client Code, PIN and TOTP Secret.")
+                st.error("Angel login failed. Check API key, Client Code, PIN and TOTP Secret, and review the app error log.")
 
     if st.button("Stop WebSocket"):
         stop_angel_websocket()
@@ -3317,6 +3342,8 @@ if debug_mode:
         "PIN present in current/session values": bool(_debug_pin),
         "PIN saved in app session": bool(st.session_state.get("angel_saved_pin")),
         "TOTP Secret present": bool(_debug_totp),
+        "TOTP widget state present": bool(str(st.session_state.get("angel_totp_secret_input", "") or "").strip()),
+        "TOTP saved session present": bool(str(st.session_state.get("angel_saved_totp_secret", "") or "").strip()),
         "Authenticated Angel session present": bool(_debug_cached_session_data),
         "Session matches API Key + Client Code": _debug_cache_match,
     })
