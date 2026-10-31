@@ -3272,9 +3272,26 @@ if "last_good_candles" not in st.session_state:
     st.session_state["last_good_candles"] = None
 
 if data_source == "Angel":
-    if not all((angel_api_key.strip(), angel_client_code.strip(), angel_pin.strip(), angel_totp_secret.strip())):
-        missing_angel_fields = [name for name, value in (("API Key", angel_api_key), ("Client Code", angel_client_code), ("PIN", angel_pin), ("TOTP Secret", angel_totp_secret)) if not str(value).strip()]
-        st.error("Angel One credentials are not available to the data loader. Missing fields: " + ", ".join(missing_angel_fields) + ". Re-enter them in Angel One API Settings.")
+    # A successful login already stores the authenticated SmartAPI session in
+    # Streamlit session_state. Password widgets may be blanked on a later rerun;
+    # in that case a matching authenticated session is sufficient and the PIN
+    # is not needed again until a fresh login is required.
+    _angel_cache_key = f"{angel_client_code}_{angel_api_key}"
+    _angel_cached_session = st.session_state.get("angel_session")
+    _angel_session_ready = bool(
+        st.session_state.get("angel_api") is not None
+        and isinstance(_angel_cached_session, dict)
+        and _angel_cached_session.get("status")
+        and st.session_state.get("angel_cache_key") == _angel_cache_key
+    )
+    _angel_required_missing = [
+        name for name, value in (("API Key", angel_api_key), ("Client Code", angel_client_code), ("TOTP Secret", angel_totp_secret))
+        if not str(value).strip()
+    ]
+    if not angel_pin.strip() and not _angel_session_ready:
+        _angel_required_missing.append("PIN (required for a fresh login)")
+    if _angel_required_missing:
+        st.error("Angel One data session is not ready. Missing fields: " + ", ".join(_angel_required_missing) + ". Enter the fields and use Test Angel Login.")
         data = pd.DataFrame()
     else:
         angel_interval = map_angel_interval(timeframe)
