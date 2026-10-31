@@ -2326,6 +2326,87 @@ def compute_trade_statistics(trades_df, initial_capital=100000):
     }
 
 
+def fallback_ema_backtest(df, symbol="", timeframe_label="", cost_bps=5.0):
+    """Transparent fallback when the strict signal engine produces no trades.
+
+    Uses closed-bar EMA trend/pullback signals with ATR-based exits. This is
+    explicitly labelled as a fallback in the trade log; it never fabricates data.
+    """
+    if df is None or df.empty or not {"Open", "High", "Low", "Close"}.issubset(df.columns):
+        return pd.DataFrame()
+    work = df.copy()
+    if not {"EMA20", "EMA50", "RSI", "ATR"}.issubset(work.columns):
+        work = add_indicators(work)
+    work.index = pd.to_datetime(work.index, errors="coerce")
+    work = work[~work.index.isna()].replace([np.inf, -np.inf], np.nan)
+    needed = ["Open", "High", "Low", "Close", "EMA20", "EMA50", "RSI", "ATR"]
+    work = work.dropna(subset=needed)
+    if len(work) < 35:
+        return pd.DataFrame()
+
+    trades = []
+    i = 1
+    while i < len(work) - 2:
+        prev, cur = work.iloc[i - 1], work.iloc[i]
+        bullish_cross = prev["EMA20"] <= prev["EMA50"] and cur["EMA20"] > cur["EMA50"]
+        bearish_cross = prev["EMA20"] >= prev["EMA50"] and cur["EMA20"] < cur["EMA50"]
+        bullish_pullback = (cur["EMA20"] > cur["EMA50"] and prev["Close"] < prev["EMA20"] and cur["Close"] >= cur["EMA20"] and 45 <= cur["RSI"] <= 70)
+        bearish_pullback = (cur["EMA20"] < cur["EMA50"] and prev["Close"] > prev["EMA20"] and cur["Close"] <= cur["EMA20"] and 30 <= cur["RSI"] <= 55)
+        side = "BUY" if (bullish_cross or bullish_pullback) else ("SELL" if (bearish_cross or bearish_pullback) else None)
+        if side is None:
+            i += 1
+            continue
+
+        entry_i = i + 1
+        entry = float(work.iloc[entry_i]["Open"])
+        atr = float(cur["ATR"])
+        if not np.isfinite(atr) or atr <= 0 or not np.isfinite(entry):
+            i += 1
+            continue
+        risk = 1.5 * atr
+        target = 2.0 * atr
+        sl = entry - risk if side == "BUY" else entry + risk
+        tp = entry + target if side == "BUY" else entry - target
+        future = work.iloc[entry_i:min(entry_i + 11, len(work))]
+        if future.empty:
+            break
+        exit_price, result, exit_i = None, "TIME EXIT", entry_i
+        for j, (_, bar) in enumerate(future.iterrows()):
+            exit_i = entry_i + j
+            if side == "BUY":
+                if float(bar["Low"]) <= sl:
+                    exit_price, result = sl, "LOSS"
+                    break
+                if float(bar["High"]) >= tp:
+                    exit_price, result = tp, "WIN"
+                    break
+            else:
+                if float(bar["High"]) >= sl:
+                    exit_price, result = sl, "LOSS"
+                    break
+                if float(bar["Low"]) <= tp:
+                    exit_price, result = tp, "WIN"
+                    break
+        if exit_price is None:
+            exit_price = float(future.iloc[-1]["Close"])
+            result = "WIN" if ((exit_price > entry) if side == "BUY" else (exit_price < entry)) else "LOSS"
+        gross = (exit_price - entry) if side == "BUY" else (entry - exit_price)
+        cost = (abs(entry) + abs(exit_price)) * (float(cost_bps) / 10000.0)
+        pnl = round(gross - cost, 2)
+        trades.append({
+            "Date": pd.to_datetime(work.index[i]).strftime("%d-%m-%Y"),
+            "Time": pd.to_datetime(work.index[i]).strftime("%H:%M:%S"),
+            "Symbol": symbol, "Timeframe": timeframe_label,
+            "Signal": side, "Entry": round(entry, 2), "SL": round(sl, 2),
+            "T1": round(tp, 2), "T2": np.nan, "T3": np.nan,
+            "Exit": round(exit_price, 2), "Result": result, "PnL": pnl,
+            "T1_Hit": result == "WIN", "T2_Hit": False, "T3_Hit": False,
+            "Method": "EMA trend/pullback fallback"
+        })
+        i = max(i + 1, exit_i + 1)
+    return pd.DataFrame(trades)
+
+
 def simple_backtest(df, symbol="", timeframe_label="", option_metrics=None, news_info=None):
     trades = []
     df = df.copy()
@@ -2333,6 +2414,15 @@ def simple_backtest(df, symbol="", timeframe_label="", option_metrics=None, news
         "Open", "High", "Low", "Close", "EMA20", "EMA50", "EMA200", "VWAP", "RSI",
         "MACD", "SignalLine", "ATR", "ADX", "SuperTrendDirection", "Volume_Spike"
     ]
+    # Rebuild indicators if the incoming feed contains OHLC only or a partial set.
+    if not {"Open", "High", "Low", "Close"}.issubset(df.columns):
+        return 0, 0, 0, 0.0, pd.DataFrame()
+    if any(col not in df.columns for col in required_cols):
+        try:
+            df = add_indicators(df)
+        except Exception as e:
+            log_app_error("backtest_indicator_rebuild", e)
+
     for col in required_cols:
         if col not in df.columns:
             return 0, 0, 0, 0.0, pd.DataFrame()
@@ -2342,7 +2432,7 @@ def simple_backtest(df, symbol="", timeframe_label="", option_metrics=None, news
     df = df.replace([np.inf, -np.inf], np.nan)
     df = df.dropna(subset=["Open", "High", "Low", "Close", "EMA20", "EMA50", "EMA200", "RSI", "MACD", "SignalLine", "ATR", "ADX"]).copy()
 
-    if len(df) < 50:
+    if len(df) < 35:
         return 0, 0, 0, 0.0, pd.DataFrame()
 
     for i in range(30, len(df) - 10):
@@ -2462,6 +2552,11 @@ def simple_backtest(df, symbol="", timeframe_label="", option_metrics=None, news
         })
 
     trades_df = pd.DataFrame(trades)
+    # The strict composite signal can be very selective on short intraday history.
+    # If it yields no completed trades, run a clearly-labelled EMA fallback so
+    # the analytics can report measured historical results instead of all zeros.
+    if trades_df.empty:
+        trades_df = fallback_ema_backtest(df, symbol, timeframe_label)
     total = len(trades_df)
     wins = len(trades_df[trades_df["Result"] == "WIN"]) if total else 0
     losses = len(trades_df[trades_df["Result"] == "LOSS"]) if total else 0
@@ -3262,6 +3357,12 @@ if news_filter_enabled:
         st.info(news_info["message"])
 
 st.subheader("Backtest Analytics")
+st.caption(f"Backtest input: {len(backtest_data):,} candles | {backtest_data.index.min()} to {backtest_data.index.max()} | {selected} | {timeframe}")
+if backtest_trades_df.empty:
+    st.warning("No completed backtest trades were generated. Check the selected data source, date/history range and candle count. At least 35 valid candles are required; the fallback also needs valid EMA/RSI/ATR values.")
+else:
+    method_note = "EMA trend/pullback fallback" if ("Method" in backtest_trades_df.columns and backtest_trades_df["Method"].eq("EMA trend/pullback fallback").any()) else "Composite signal engine"
+    st.caption(f"Trades generated: {len(backtest_trades_df)} | Engine: {method_note}. Results are historical simulations, not guaranteed future performance.")
 ba1, ba2, ba3, ba4, ba5, ba6 = st.columns(6)
 with ba1:
     st.metric("Backtest Wins", wins)
