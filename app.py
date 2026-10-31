@@ -525,27 +525,43 @@ def map_angel_interval(timeframe):
 
 
 def angel_login(api_key, client_code, pin, totp_secret, force_refresh=False):
+    """Return a matching authenticated session; only request PIN/TOTP for fresh login."""
     try:
         if not SMART_API_AVAILABLE:
             log_app_error("angel_login", "Angel One SDK/pyotp missing. Install smartapi-python and pyotp.")
             return None, None
+        api_key = str(api_key or "").strip()
+        client_code = str(client_code or "").strip()
+        pin = str(pin or "").strip()
+        totp_secret = str(totp_secret or "").strip()
         cache_key = f"{client_code}_{api_key}"
-        if (
-            not force_refresh and
-            "angel_api" in st.session_state and
-            "angel_session" in st.session_state and
-            st.session_state.get("angel_cache_key") == cache_key
-        ):
-            return st.session_state["angel_api"], st.session_state["angel_session"]
+
+        cached_api = st.session_state.get("angel_api")
+        cached_session = st.session_state.get("angel_session")
+        cached_data = (cached_session or {}).get("data") if isinstance(cached_session, dict) else None
+        cache_matches = (
+            cached_api is not None
+            and isinstance(cached_session, dict)
+            and bool(cached_data)
+            and st.session_state.get("angel_cache_key") == cache_key
+        )
+        # Password widgets can be empty after Streamlit reruns. Reuse only the
+        # authenticated session belonging to the same API key/client code.
+        if cache_matches and (not force_refresh or not pin):
+            return cached_api, cached_session
+
+        if not all((api_key, client_code, pin, totp_secret)):
+            return None, None
 
         smart_api = SmartConnect(api_key=api_key)
         totp = pyotp.TOTP(totp_secret).now()
         session = smart_api.generateSession(client_code, pin, totp)
 
-        if session and session.get("status"):
+        if session and session.get("status") and session.get("data"):
             st.session_state["angel_api"] = smart_api
             st.session_state["angel_session"] = session
             st.session_state["angel_cache_key"] = cache_key
+            st.session_state["angel_connected"] = True
             return smart_api, session
         return None, None
     except Exception as e:
@@ -3281,7 +3297,7 @@ if data_source == "Angel":
     _angel_session_ready = bool(
         st.session_state.get("angel_api") is not None
         and isinstance(_angel_cached_session, dict)
-        and _angel_cached_session.get("status")
+        and _angel_cached_session.get("data")
         and st.session_state.get("angel_cache_key") == _angel_cache_key
     )
     _angel_required_missing = [
