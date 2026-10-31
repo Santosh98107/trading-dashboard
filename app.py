@@ -13,18 +13,9 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 import yfinance as yf
-try:
-    import pyotp
-except Exception:
-    pyotp = None
-try:
-    from SmartApi import SmartConnect
-except Exception:
-    SmartConnect = None
-try:
-    from streamlit_autorefresh import st_autorefresh
-except Exception:
-    st_autorefresh = None
+import pyotp
+from SmartApi import SmartConnect
+from streamlit_autorefresh import st_autorefresh
 
 SMART_WS_AVAILABLE = False
 try:
@@ -219,8 +210,7 @@ def init_journal():
             "DateTime", "Symbol", "Timeframe", "Signal", "EntryPrice", "ExitPrice",
             "Quantity", "StopLoss", "Target1", "Target2", "Target3", "TrailingStop",
             "Status", "PnL", "PnLPercent", "Notes", "Result", "T1_Hit", "T2_Hit", "T3_Hit",
-            "TradeQualityScore", "ValidationScore", "StrategyGrade",
-            "RemainingQuantity", "RealizedPnL", "AvgExitPrice", "T1_Quantity", "T2_Quantity", "T3_Quantity"
+            "TradeQualityScore", "ValidationScore", "StrategyGrade"
         ]
         safe_write_csv(pd.DataFrame(columns=cols), JOURNAL_FILE)
 
@@ -487,9 +477,6 @@ def map_angel_interval(timeframe):
 
 def angel_login(api_key, client_code, pin, totp_secret, force_refresh=False):
     try:
-        if SmartConnect is None or pyotp is None:
-            log_app_error("angel_login", "smartapi-python and pyotp are required for Angel One")
-            return None, None
         cache_key = f"{client_code}_{api_key}"
         if (
             not force_refresh and
@@ -514,86 +501,22 @@ def angel_login(api_key, client_code, pin, totp_secret, force_refresh=False):
         return None, None
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
-def load_angel_instrument_master():
-    """Download Angel One's public instrument master and normalize token fields."""
-    urls = [
-        "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json",
-        "https://margincalculator.angelone.in/OpenAPI_File/files/OpenAPIScripMaster.json"
-    ]
-    for url in urls:
-        try:
-            r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
-            r.raise_for_status()
-            payload = r.json()
-            df = pd.DataFrame(payload)
-            if not df.empty:
-                return df
-        except Exception as exc:
-            log_app_error("load_angel_instrument_master", f"{url}: {exc}")
-    return pd.DataFrame()
-
-
-def resolve_angel_instrument(symbol_name, exchange="NSE"):
-    """Resolve exchange token/trading symbol from the current master; static map is fallback."""
-    if str(symbol_name).upper() == "SENSEX":
-        exchange = "BSE"
-    aliases = {
-        "NIFTY": ["NIFTY", "NIFTY 50"], "BANKNIFTY": ["BANKNIFTY", "NIFTY BANK"],
-        "SENSEX": ["SENSEX"], "HDFCBANK": ["HDFCBANK"], "ICICIBANK": ["ICICIBANK"],
-        "RELIANCE": ["RELIANCE"], "SBIN": ["SBIN"], "INFY": ["INFY"], "TCS": ["TCS"],
-        "ITC": ["ITC"], "AXISBANK": ["AXISBANK"], "KOTAKBANK": ["KOTAKBANK"],
-        "LT": ["LT"], "TATAMOTORS": ["TATAMOTORS"], "MARUTI": ["MARUTI"],
-        "HCLTECH": ["HCLTECH"], "WIPRO": ["WIPRO"], "TECHM": ["TECHM"],
-        "M&M": ["M&M"], "BAJAJ-AUTO": ["BAJAJ-AUTO"], "HEROMOTOCO": ["HEROMOTOCO"],
-        "BHARTIARTL": ["BHARTIARTL"], "SUNPHARMA": ["SUNPHARMA"]
-    }
-    candidates = aliases.get(str(symbol_name).upper(), [str(symbol_name).upper()])
-    master = load_angel_instrument_master()
-    if not master.empty:
-        cols = {str(c).lower(): c for c in master.columns}
-        token_col = cols.get("token") or cols.get("symboltoken")
-        symbol_col = cols.get("symbol")
-        exch_col = cols.get("exch_seg") or cols.get("exchange")
-        name_col = cols.get("name")
-        if token_col and symbol_col:
-            work = master.copy()
-            if exch_col:
-                work = work[work[exch_col].astype(str).str.upper().eq(exchange.upper())]
-            sym = work[symbol_col].astype(str).str.upper()
-            for candidate in candidates:
-                mask = sym.eq(candidate + "-EQ") | sym.eq(candidate)
-                if name_col and candidate in ("NIFTY", "BANKNIFTY", "SENSEX"):
-                    mask = mask | work[name_col].astype(str).str.upper().eq(candidate)
-                found = work[mask]
-                if not found.empty:
-                    row = found.iloc[0]
-                    return {"token": str(row[token_col]), "tradingsymbol": str(row[symbol_col]), "exchange": exchange}
-    token = ANGEL_TOKENS.get(symbol_name)
-    if token:
-        ts = {"NIFTY": "Nifty 50", "BANKNIFTY": "Nifty Bank", "SENSEX": "SENSEX"}.get(symbol_name, symbol_name + "-EQ")
-        exch = "BSE" if symbol_name == "SENSEX" else exchange
-        return {"token": str(token), "tradingsymbol": ts, "exchange": exch}
-    return None
-
-
 def get_angel_candles(api_key, client_code, pin, totp_secret, symbol_name, interval="FIVE_MINUTE"):
     try:
         angel, session = angel_login(api_key, client_code, pin, totp_secret)
         if angel is None or not session or not session.get("data"):
             return None
 
-        instrument = resolve_angel_instrument(symbol_name)
-        if not instrument:
-            return {"status": False, "message": f"Instrument token not found in Angel master for {symbol_name}"}
-        symbol_token = instrument["token"]
+        symbol_token = ANGEL_TOKENS.get(symbol_name)
+        if not symbol_token:
+            return {"status": False, "message": f"Missing Angel token for {symbol_name}"}
 
         ist = timezone(timedelta(hours=5, minutes=30))
         to_date = datetime.now(ist)
         from_date = to_date - timedelta(days=10)
 
         params = {
-            "exchange": instrument["exchange"],
+            "exchange": "NSE",
             "symboltoken": symbol_token,
             "interval": interval,
             "fromdate": from_date.strftime("%Y-%m-%d %H:%M"),
@@ -622,29 +545,8 @@ def candles_to_df(candles):
         return pd.DataFrame()
 
 
-def get_angel_ltp_quote(api_key, client_code, pin, totp_secret, symbol_name):
-    """Fetch the latest quote through Angel One's REST LTP endpoint (polling primary)."""
-    try:
-        angel, session = angel_login(api_key, client_code, pin, totp_secret)
-        instrument = resolve_angel_instrument(symbol_name)
-        if angel is None or not session or not instrument:
-            return None
-        result = angel.ltpData(instrument["exchange"], instrument["tradingsymbol"], instrument["token"])
-        if isinstance(result, dict) and result.get("status") and isinstance(result.get("data"), dict):
-            value = result["data"].get("ltp")
-            return float(value) if value is not None else None
-        return None
-    except Exception as e:
-        log_app_error("get_angel_ltp_quote", e)
-        return None
-
-
 def get_angel_ltp_polling(api_key, client_code, pin, totp_secret, symbol_name):
-    """Primary polling: REST LTP quote, then latest 1-minute candle close as fallback."""
     try:
-        quote = get_angel_ltp_quote(api_key, client_code, pin, totp_secret, symbol_name)
-        if quote is not None and quote > 0:
-            return quote
         candles = get_angel_candles(api_key, client_code, pin, totp_secret, symbol_name, "ONE_MINUTE")
         df = candles_to_df(candles)
         if not df.empty:
@@ -1033,18 +935,9 @@ def add_indicators(df):
     df = compute_supertrend(df, period=10, multiplier=3)
 
     df["SMA20"] = df["Close"].rolling(20).mean()
-    df["SMA50"] = df["Close"].rolling(50).mean()
-    df["SMA100"] = df["Close"].rolling(100).mean()
-    df["SMA200"] = df["Close"].rolling(200).mean()
-    df["ADR14"] = (df["High"] - df["Low"]).rolling(14).mean()
-    df["PrevHigh"] = df["High"].shift(1)
-    df["PrevLow"] = df["Low"].shift(1)
-    df["PrevClose"] = df["Close"].shift(1)
     std20 = df["Close"].rolling(20).std()
     df["BB_Upper"] = df["SMA20"] + 2 * std20
     df["BB_Lower"] = df["SMA20"] - 2 * std20
-    df["BB_Width_Pct"] = ((df["BB_Upper"] - df["BB_Lower"]) / df["SMA20"].replace(0, np.nan)) * 100
-    df["BB_Squeeze"] = df["BB_Width_Pct"] <= df["BB_Width_Pct"].rolling(50, min_periods=15).quantile(0.20)
 
     df["Volume_MA20"] = df["Volume"].rolling(20).mean()
     df["Volume_Spike"] = df["Volume"] > (1.5 * df["Volume_MA20"])
@@ -1075,48 +968,23 @@ def add_indicators(df):
     candle_range = (df["High"] - df["Low"]).replace(0, 1e-10)
     upper_shadow = df["High"] - df[["Open", "Close"]].max(axis=1)
     lower_shadow = df[["Open", "Close"]].min(axis=1) - df["Low"]
-    prev_body = (df["Close"].shift(1) - df["Open"].shift(1)).abs()
-    bullish = df["Close"] > df["Open"]
-    bearish = df["Close"] < df["Open"]
-    prev_bull = df["Close"].shift(1) > df["Open"].shift(1)
-    prev_bear = df["Close"].shift(1) < df["Open"].shift(1)
-    df["Hammer"] = (lower_shadow >= candle_body * 2) & (upper_shadow <= candle_body * 0.5) & (candle_body / candle_range <= 0.4)
-    df["HangingMan"] = df["Hammer"] & (df["Close"] > df["Close"].rolling(10).mean())
-    df["InvertedHammer"] = (upper_shadow >= candle_body * 2) & (lower_shadow <= candle_body * 0.5) & (candle_body / candle_range <= 0.4)
-    df["ShootingStar"] = df["InvertedHammer"] & (df["Close"] > df["Close"].rolling(10).mean())
-    df["BullishEngulfing"] = bullish & prev_bear & (df["Open"] <= df["Close"].shift(1)) & (df["Close"] >= df["Open"].shift(1))
-    df["BearishEngulfing"] = bearish & prev_bull & (df["Open"] >= df["Close"].shift(1)) & (df["Close"] <= df["Open"].shift(1))
-    df["Doji"] = candle_body <= candle_range * 0.1
-    df["SpinningTop"] = (candle_body / candle_range <= 0.3) & (upper_shadow > candle_body) & (lower_shadow > candle_body)
-    df["Marubozu"] = (candle_body / candle_range >= 0.9) & (upper_shadow / candle_range <= 0.05) & (lower_shadow / candle_range <= 0.05)
-    df["InsideBar"] = (df["High"] < df["High"].shift(1)) & (df["Low"] > df["Low"].shift(1))
-    df["OutsideBar"] = (df["High"] > df["High"].shift(1)) & (df["Low"] < df["Low"].shift(1))
-    df["TweezerTop"] = (abs(df["High"] - df["High"].shift(1)) <= candle_range * 0.05) & bearish & prev_bull
-    df["TweezerBottom"] = (abs(df["Low"] - df["Low"].shift(1)) <= candle_range * 0.05) & bullish & prev_bear
-    df["PiercingLine"] = prev_bear & bullish & (df["Open"] < df["Low"].shift(1)) & (df["Close"] > (df["Open"].shift(1) + df["Close"].shift(1)) / 2) & (df["Close"] < df["Open"].shift(1))
-    df["DarkCloudCover"] = prev_bull & bearish & (df["Open"] > df["High"].shift(1)) & (df["Close"] < (df["Open"].shift(1) + df["Close"].shift(1)) / 2) & (df["Close"] > df["Open"].shift(1))
-    df["MorningStar"] = prev_bear.shift(1).fillna(False) & (prev_body < candle_range.shift(1) * 0.35) & bullish & (df["Close"] > (df["Open"].shift(2) + df["Close"].shift(2)) / 2)
-    df["EveningStar"] = prev_bull.shift(1).fillna(False) & (prev_body < candle_range.shift(1) * 0.35) & bearish & (df["Close"] < (df["Open"].shift(2) + df["Close"].shift(2)) / 2)
-    df["ThreeWhiteSoldiers"] = bullish & bullish.shift(1) & bullish.shift(2) & (df["Close"] > df["Close"].shift(1)) & (df["Close"].shift(1) > df["Close"].shift(2))
-    df["ThreeBlackCrows"] = bearish & bearish.shift(1) & bearish.shift(2) & (df["Close"] < df["Close"].shift(1)) & (df["Close"].shift(1) < df["Close"].shift(2))
-    df["BodyStrength"] = candle_body / candle_range
-    # Transparent price-action labels; these describe the bar and do not forecast direction.
-    df["BullishRejection"] = (lower_shadow >= candle_body * 1.5) & (df["Close"] > df["Open"])
-    df["BearishRejection"] = (upper_shadow >= candle_body * 1.5) & (df["Close"] < df["Open"])
-    df["InsideBarBreakout"] = df["InsideBar"].shift(1).fillna(False) & (df["Close"] > df["High"].shift(1))
-    df["InsideBarBreakdown"] = df["InsideBar"].shift(1).fillna(False) & (df["Close"] < df["Low"].shift(1))
-    df["PriceAction"] = np.select(
-        [df["Breakout"], df["Breakdown"], df["BullishEngulfing"], df["BearishEngulfing"],
-         df["BullishRejection"], df["BearishRejection"], df["InsideBarBreakout"], df["InsideBarBreakdown"]],
-        ["Resistance breakout", "Support breakdown", "Bullish engulfing", "Bearish engulfing",
-         "Bullish rejection", "Bearish rejection", "Inside-bar upside break", "Inside-bar downside break"],
-        default="Range / no clear trigger"
+
+    df["Hammer"] = ((lower_shadow > candle_body * 2) & (upper_shadow < candle_body))
+    df["ShootingStar"] = ((upper_shadow > candle_body * 2) & (lower_shadow < candle_body))
+    df["BullishEngulfing"] = (
+        (df["Close"] > df["Open"]) &
+        (df["Close"].shift(1) < df["Open"].shift(1)) &
+        (df["Open"] <= df["Close"].shift(1)) &
+        (df["Close"] >= df["Open"].shift(1))
     )
-    pattern_cols = ["Hammer", "HangingMan", "InvertedHammer", "ShootingStar", "BullishEngulfing", "BearishEngulfing", "Doji", "SpinningTop", "Marubozu", "InsideBar", "OutsideBar", "TweezerTop", "TweezerBottom", "PiercingLine", "DarkCloudCover", "MorningStar", "EveningStar", "ThreeWhiteSoldiers", "ThreeBlackCrows"]
-    def _pattern_label(row):
-        found = [name for name in pattern_cols if bool(row.get(name, False))]
-        return ", ".join(found) if found else "No major pattern"
-    df["CandlestickPattern"] = df.apply(_pattern_label, axis=1)
+    df["BearishEngulfing"] = (
+        (df["Close"] < df["Open"]) &
+        (df["Close"].shift(1) > df["Open"].shift(1)) &
+        (df["Open"] >= df["Close"].shift(1)) &
+        (df["Close"] <= df["Open"].shift(1))
+    )
+    df["Doji"] = candle_body <= (candle_range * 0.1)
+    df["BodyStrength"] = candle_body / candle_range
     return df
 
 
@@ -1181,159 +1049,6 @@ def get_news_events(news_api_key, symbol):
 # OPTION CHAIN / PCR / OI
 # =========================================================
 @st.cache_data(ttl=120)
-
-# =========================================================
-# GLOBAL / INDIAN MARKET SNAPSHOTS + MAJOR STOCK SCANNER
-# =========================================================
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_market_snapshot(symbol_map):
-    """Latest daily close and previous-close percentage change."""
-    rows = []
-    for name, ticker in symbol_map.items():
-        try:
-            df = yf.download(ticker, period="5d", interval="1d", progress=False, auto_adjust=False, threads=False)
-            if df is None or df.empty or len(df) < 2:
-                continue
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
-            if "Close" not in df.columns:
-                continue
-            closes = pd.to_numeric(df["Close"], errors="coerce").dropna()
-            if len(closes) < 2:
-                continue
-            close, prev_close = float(closes.iloc[-1]), float(closes.iloc[-2])
-            pct = ((close - prev_close) / prev_close) * 100 if prev_close else 0.0
-            rows.append({"Name": name, "CMP": round(close, 2), "% Change": round(pct, 2),
-                         "Trend": "BULLISH" if pct > 0 else "BEARISH" if pct < 0 else "FLAT"})
-        except Exception as exc:
-            log_app_error("fetch_market_snapshot:" + str(name), exc)
-    return pd.DataFrame(rows, columns=["Name", "CMP", "% Change", "Trend"])
-
-
-def get_intraday_trend_label(df):
-    if df is None or df.empty or len(df) < 20:
-        return "N/A"
-    try:
-        work = add_indicators(df.copy()).ffill().bfill()
-        latest = work.iloc[-1]
-        if latest.get("EMA20", 0) > latest.get("EMA50", 0):
-            return "BULLISH"
-        if latest.get("EMA20", 0) < latest.get("EMA50", 0):
-            return "BEARISH"
-        return "NEUTRAL"
-    except Exception:
-        return "N/A"
-
-
-@st.cache_data(ttl=60, show_spinner=False)
-def fetch_fno_style_scanner(symbol_map):
-    """F&O-style scanner; Yahoo prices are spot, not live futures quotes."""
-    rows = []
-    for sno, (name, ticker) in enumerate(symbol_map.items(), start=1):
-        try:
-            intraday = fetch_data(ticker, "1m", "7d")
-            daily = yf.download(ticker, period="5d", interval="1d", progress=False, auto_adjust=False, threads=False)
-            if isinstance(daily.columns, pd.MultiIndex):
-                daily.columns = daily.columns.get_level_values(0)
-            closes = pd.to_numeric(daily["Close"], errors="coerce").dropna() if not daily.empty and "Close" in daily else pd.Series(dtype=float)
-            cmp_value, change_str, direction = "N/A", "N/A", "N/A"
-            if len(closes) >= 2:
-                cmp_value = f"{float(closes.iloc[-1]):.2f}"
-                pct = ((float(closes.iloc[-1]) / float(closes.iloc[-2])) - 1) * 100 if float(closes.iloc[-2]) else 0.0
-                change_str = f"{pct:+.2f}%"
-                direction = "BULLISH" if pct > 0 else "BEARISH" if pct < 0 else "NEUTRAL"
-            if intraday is None or intraday.empty:
-                t1 = t2 = t3 = "N/A"
-            else:
-                t1 = get_intraday_trend_label(intraday)
-                t2 = get_intraday_trend_label(resample_ohlcv(intraday, "2min"))
-                t3 = get_intraday_trend_label(resample_ohlcv(intraday, "3min"))
-            rows.append({"S.NO": sno, "STOCKS": name, "CMP": cmp_value, "% Change": change_str,
-                         "1m": t1, "2m": t2, "3m": t3, "Direction": direction})
-        except Exception as exc:
-            log_app_error("fetch_fno_style_scanner:" + str(name), exc)
-            rows.append({"S.NO": sno, "STOCKS": name, "CMP": "N/A", "% Change": "N/A",
-                         "1m": "N/A", "2m": "N/A", "3m": "N/A", "Direction": "N/A"})
-    return pd.DataFrame(rows, columns=["S.NO", "STOCKS", "CMP", "% Change", "1m", "2m", "3m", "Direction"])
-
-
-def summarize_fno_bias(fno_df):
-    result = {"overall_bias": "N/A", "bullish_pct": 0, "bearish_pct": 0,
-              "strongest_gainer": "N/A", "strongest_loser": "N/A"}
-    if fno_df is None or fno_df.empty or "Direction" not in fno_df:
-        return result
-    valid = fno_df[fno_df["Direction"].isin(["BULLISH", "BEARISH"])].copy()
-    if valid.empty:
-        return result
-    bulls = int((valid["Direction"] == "BULLISH").sum())
-    bears = int((valid["Direction"] == "BEARISH").sum())
-    valid["ChangeNum"] = pd.to_numeric(valid["% Change"].astype(str).str.replace("%", "", regex=False), errors="coerce")
-    gainers = valid.dropna(subset=["ChangeNum"]).sort_values("ChangeNum", ascending=False)
-    losers = valid.dropna(subset=["ChangeNum"]).sort_values("ChangeNum", ascending=True)
-    result.update({"overall_bias": "BULLISH" if bulls > bears else "BEARISH" if bears > bulls else "MIXED",
-                   "bullish_pct": round(bulls / len(valid) * 100), "bearish_pct": round(bears / len(valid) * 100),
-                   "strongest_gainer": (str(gainers.iloc[0]["STOCKS"]) + " " + str(gainers.iloc[0]["% Change"])) if not gainers.empty else "N/A",
-                   "strongest_loser": (str(losers.iloc[0]["STOCKS"]) + " " + str(losers.iloc[0]["% Change"])) if not losers.empty else "N/A"})
-    return result
-
-@st.cache_data(ttl=600, show_spinner=False)
-def get_macro_news_events():
-    """Public GDELT headline context for India policy, RBI and geopolitical developments."""
-    queries = [
-        '(India government OR RBI OR finance ministry OR SEBI) (policy OR announcement OR decision)',
-        '(India OR South Asia) (geopolitical OR border OR sanctions OR conflict OR trade disruption)'
-    ]
-    articles = []
-    try:
-        for query in queries:
-            params = {"query": query, "mode": "ArtList", "format": "json", "maxrecords": 10,
-                      "sort": "HybridRel", "timespan": "2d", "sourcelang": "English"}
-            response = requests.get("https://api.gdeltproject.org/api/v2/doc/doc", params=params, timeout=12)
-            response.raise_for_status()
-            payload = response.json()
-            for item in payload.get("articles", []):
-                url = item.get("url", "")
-                if url and all(existing.get("url") != url for existing in articles):
-                    articles.append({"Date": item.get("seendate", ""), "Headline": item.get("title", ""),
-                                     "Source": item.get("domain", ""), "URL": url})
-        return {"available": bool(articles), "articles": articles[:15], "source": "GDELT public news index",
-                "message": "Headlines are informational; verify material announcements with official releases."}
-    except Exception as exc:
-        log_app_error("get_macro_news_events", exc)
-        return {"available": False, "articles": [], "source": "GDELT", "message": f"News feed unavailable: {exc}"}
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def get_fii_dii_activity():
-    """Fetch NSE FII/DII activity. Returns unavailable status rather than fabricated values."""
-    url = "https://www.nseindia.com/api/fiidiiTradeReact"
-    headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json,text/plain,*/*",
-               "Referer": "https://www.nseindia.com/reports/fii-dii"}
-    try:
-        session = requests.Session()
-        session.get("https://www.nseindia.com", headers=headers, timeout=10)
-        response = session.get(url, headers=headers, timeout=12)
-        response.raise_for_status()
-        payload = response.json()
-        rows = payload if isinstance(payload, list) else payload.get("data", [])
-        out = []
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            category = str(row.get("category", row.get("clientType", row.get("type", ""))))
-            buy = row.get("buyValue", row.get("buy_value", row.get("buy", None)))
-            sell = row.get("sellValue", row.get("sell_value", row.get("sell", None)))
-            net = row.get("netValue", row.get("net_value", row.get("net", None)))
-            if buy is not None or sell is not None or net is not None:
-                out.append({"Category": category, "Buy": buy, "Sell": sell, "Net": net})
-        return {"available": bool(out), "rows": out, "source": "NSE India", "as_of": now_str(),
-                "message": "Live NSE response" if out else "NSE response format/data unavailable"}
-    except Exception as exc:
-        log_app_error("get_fii_dii_activity", exc)
-        return {"available": False, "rows": [], "source": "NSE India", "as_of": now_str(),
-                "message": f"FII/DII feed unavailable: {exc}"}
-
-
 def get_option_chain_snapshot(symbol="NIFTY"):
     try:
         url = f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}"
@@ -1349,18 +1064,8 @@ def get_option_chain_snapshot(symbol="NIFTY"):
         if resp.status_code != 200:
             return None
         data = resp.json()
-        existing = {}
-        try:
-            if os.path.exists(OPTION_CHAIN_FILE):
-                with open(OPTION_CHAIN_FILE, "r") as fh:
-                    existing = json.load(fh)
-        except Exception:
-            existing = {}
-        existing["symbol"] = symbol
-        existing["data"] = data
-        existing["last_fetch"] = now_str()
         with open(OPTION_CHAIN_FILE, "w") as f:
-            json.dump(existing, f)
+            json.dump({"symbol": symbol, "data": data}, f)
         return data
     except Exception as e:
         log_app_error("get_option_chain_snapshot", e)
@@ -1390,10 +1095,7 @@ def parse_option_chain_metrics(symbol="NIFTY"):
             "long_unwinding": False,
             "short_covering": False,
             "call_oi": 0,
-            "put_oi": 0,
-            "call_day_change_oi": 0, "put_day_change_oi": 0,
-            "call_snapshot_delta_oi": None, "put_snapshot_delta_oi": None,
-            "oi_snapshot_time": None
+            "put_oi": 0
         }
     try:
         total_ce, total_pe = 0, 0
@@ -1407,32 +1109,6 @@ def parse_option_chain_metrics(symbol="NIFTY"):
                 total_pe += item["PE"].get("openInterest", 0)
                 pe_change_oi += item["PE"].get("changeinOpenInterest", 0)
 
-        # Snapshot-to-snapshot OI delta is separate from NSE's day change-in-OI field.
-        snapshot_key = f"{symbol}_{datetime.now().strftime('%Y%m%d')}"
-        current_snapshot = {"call_oi": int(total_ce), "put_oi": int(total_pe),
-                            "call_day_change": int(ce_change_oi), "put_day_change": int(pe_change_oi),
-                            "timestamp": now_str()}
-        previous_snapshot = {}
-        try:
-            if os.path.exists(OPTION_CHAIN_FILE):
-                with open(OPTION_CHAIN_FILE, "r") as fh:
-                    cached = json.load(fh)
-                previous_snapshot = cached.get("metrics", {}).get(snapshot_key, {})
-        except Exception:
-            previous_snapshot = {}
-        call_oi_delta = int(total_ce) - int(previous_snapshot.get("call_oi", total_ce))
-        put_oi_delta = int(total_pe) - int(previous_snapshot.get("put_oi", total_pe))
-        try:
-            all_cache = {}
-            if os.path.exists(OPTION_CHAIN_FILE):
-                with open(OPTION_CHAIN_FILE, "r") as fh:
-                    all_cache = json.load(fh)
-            all_cache.setdefault("metrics", {})[snapshot_key] = current_snapshot
-            all_cache["metrics"][snapshot_key]["timestamp"] = now_str()
-            with open(OPTION_CHAIN_FILE, "w") as fh:
-                json.dump(all_cache, fh)
-        except Exception as cache_exc:
-            log_app_error("option_oi_delta_cache", cache_exc)
         pcr = round(total_pe / total_ce, 2) if total_ce > 0 else None
         oi_bias = "Bullish" if total_pe > total_ce else "Bearish" if total_ce > total_pe else "Neutral"
         long_unwinding = ce_change_oi < 0 and pe_change_oi > 0
@@ -1444,12 +1120,7 @@ def parse_option_chain_metrics(symbol="NIFTY"):
             "long_unwinding": long_unwinding,
             "short_covering": short_covering,
             "call_oi": total_ce,
-            "put_oi": total_pe,
-            "call_day_change_oi": ce_change_oi,
-            "put_day_change_oi": pe_change_oi,
-            "call_snapshot_delta_oi": call_oi_delta,
-            "put_snapshot_delta_oi": put_oi_delta,
-            "oi_snapshot_time": now_str()
+            "put_oi": total_pe
         }
     except Exception as e:
         log_app_error("parse_option_chain_metrics", e)
@@ -1866,26 +1537,6 @@ def analyze_signal(
         else:
             bearish += 1
 
-    # Volatility compression + range expansion confirmation.
-    bb_squeeze = bool(latest.get("BB_Squeeze", False))
-    bb_upper = float(latest.get("BB_Upper", close_price)) if pd.notna(latest.get("BB_Upper", np.nan)) else close_price
-    bb_lower = float(latest.get("BB_Lower", close_price)) if pd.notna(latest.get("BB_Lower", np.nan)) else close_price
-    if bb_squeeze:
-        reasons.append("Bollinger Band squeeze: volatility compression")
-        if close_price > bb_upper and volume_spike:
-            bullish += 2
-            reasons.append("Upside Bollinger expansion with volume")
-        elif close_price < bb_lower and volume_spike:
-            bearish += 2
-            reasons.append("Downside Bollinger expansion with volume")
-
-    if bool(latest.get("BullishRejection", False)):
-        bullish += 1
-        reasons.append("Bullish price-action rejection")
-    if bool(latest.get("BearishRejection", False)):
-        bearish += 1
-        reasons.append("Bearish price-action rejection")
-
     if bullish > bearish and distance_to_resistance < NO_TRADE_NEAR_SR_PCT:
         bullish -= 2
         reasons.append("Too close to resistance")
@@ -1904,17 +1555,6 @@ def analyze_signal(
     gap_info = detect_gap_filter(df)
     session_info = session_filter(df, timeframe_label)
     news_info = news_info or {"allow_trade": True, "message": "News filter unavailable", "events": []}
-    fii_dii_bias = news_info.get("fii_dii_bias", "Neutral")
-    if fii_dii_bias == "Bullish":
-        bullish += 1
-        reasons.append("FII/DII combined net flow positive")
-    elif fii_dii_bias == "Bearish":
-        bearish += 1
-        reasons.append("FII/DII combined net flow negative")
-    if news_info.get("macro_event_present", False):
-        reasons.append("Recent government/geopolitical headline detected; verify source and context")
-    if news_info.get("macro_risk_caution", False):
-        reasons.append("Macro/geopolitical risk caution: signal confidence reduced")
 
     sideways = bool(regime["sideways"])
     mtf_strict_bull_ok = mtf_bull_count >= MANDATORY_MTF_ALIGN_COUNT
@@ -1954,17 +1594,6 @@ def analyze_signal(
         bearish += 1
         reasons.append("Long unwinding detected")
 
-    # Snapshot-to-snapshot OI change is supplementary; first snapshot is a neutral baseline.
-    call_delta = option_metrics.get("call_snapshot_delta_oi")
-    put_delta = option_metrics.get("put_snapshot_delta_oi")
-    if call_delta is not None and put_delta is not None:
-        if int(put_delta) > int(call_delta) and (pcr is None or pcr >= 1.0):
-            bullish += 1
-            reasons.append("Snapshot OI change supports put-side buildup")
-        elif int(call_delta) > int(put_delta) and (pcr is None or pcr <= 1.0):
-            bearish += 1
-            reasons.append("Snapshot OI change supports call-side buildup")
-
     signal_text = "NO TRADE"
     signal_type = "neutral"
     strength = "Low"
@@ -1990,8 +1619,7 @@ def analyze_signal(
         not sideways,
         session_info["valid"],
         gap_info["allow_trade"],
-        news_info["allow_trade"],
-        not news_info.get("macro_risk_caution", False)
+        news_info["allow_trade"]
     ])
 
     sell_mandatory_ok = all([
@@ -2005,8 +1633,7 @@ def analyze_signal(
         not sideways,
         session_info["valid"],
         gap_info["allow_trade"],
-        news_info["allow_trade"],
-        not news_info.get("macro_risk_caution", False)
+        news_info["allow_trade"]
     ])
 
     if atr and atr > 0:
@@ -2066,10 +1693,6 @@ def analyze_signal(
     elif ha_trend_down and bearish > bullish:
         confidence += 3
     confidence = min(100, confidence)
-    if news_info.get("macro_event_present", False):
-        confidence = max(40, confidence - 3)
-    if news_info.get("macro_risk_caution", False):
-        confidence = max(40, confidence - 7)
 
     validation_score = 0
     validation_score += min(25, max(0, (max(bullish, bearish) * 2)))
@@ -2392,7 +2015,7 @@ def paper_trade_entry(price, quantity):
     return False
 
 
-def paper_trade_exit(entry_price, exit_price, quantity, signal, final_exit=True):
+def paper_trade_exit(entry_price, exit_price, quantity, signal):
     state = load_paper_state()
     bal = float(state.loc[0, "Balance"])
     used = float(state.loc[0, "UsedMargin"])
@@ -2405,8 +2028,7 @@ def paper_trade_exit(entry_price, exit_price, quantity, signal, final_exit=True)
 
     state.loc[0, "Balance"] = bal + invested + pnl
     state.loc[0, "UsedMargin"] = max(0.0, used - invested)
-    if final_exit:
-        state.loc[0, "OpenPositions"] = max(0, int(state.loc[0, "OpenPositions"]) - 1)
+    state.loc[0, "OpenPositions"] = max(0, int(state.loc[0, "OpenPositions"]) - 1)
     save_paper_state(state)
     return pnl
 
@@ -2436,9 +2058,7 @@ def add_trade_to_journal(symbol, timeframe, signal, entry_price, quantity, stop_
         "T3_Hit": False,
         "TradeQualityScore": analysis.get("trade_quality_score", 0),
         "ValidationScore": analysis.get("validation_score", 0),
-        "StrategyGrade": analysis.get("strategy_grade", "D"),
-        "RemainingQuantity": quantity, "RealizedPnL": 0.0, "AvgExitPrice": 0.0,
-        "T1_Quantity": 0.0, "T2_Quantity": 0.0, "T3_Quantity": 0.0
+        "StrategyGrade": analysis.get("strategy_grade", "D")
     }
     journal = pd.concat([journal, pd.DataFrame([new_row])], ignore_index=True)
     save_journal(journal)
@@ -2473,98 +2093,79 @@ def close_trade_in_journal(index_id, exit_price, result=None, t1_hit=None, t2_hi
         save_journal(journal)
 
 
-def _apply_paper_partial_exit(journal, idx, row, exit_price, qty_to_close, target_flag=None, final=False):
-    """Close part/all of a paper position and persist cumulative realized PnL."""
-    entry = float(row["EntryPrice"])
-    remaining = float(row.get("RemainingQuantity", row["Quantity"])) if pd.notna(row.get("RemainingQuantity", row["Quantity"])) else float(row["Quantity"])
-    qty_to_close = min(float(qty_to_close), remaining)
-    if qty_to_close <= 0:
-        return False
-    signal = str(row["Signal"]).upper()
-    direction = 1 if ("BUY" in signal or "CALL" in signal) else -1
-    pnl = (float(exit_price) - entry) * qty_to_close * direction
-    # Keep the position count unchanged until the final remaining units are closed.
-    will_finish = qty_to_close >= remaining
-    paper_trade_exit(entry, float(exit_price), qty_to_close, signal, final_exit=will_finish)
-    old_realized = float(row.get("RealizedPnL", 0) or 0) if pd.notna(row.get("RealizedPnL", 0)) else 0.0
-    old_closed_qty = float(row["Quantity"]) - remaining
-    new_closed_qty = old_closed_qty + qty_to_close
-    old_avg = float(row.get("AvgExitPrice", 0) or 0) if pd.notna(row.get("AvgExitPrice", 0)) else 0.0
-    avg_exit = ((old_avg * old_closed_qty) + (float(exit_price) * qty_to_close)) / new_closed_qty if new_closed_qty else 0.0
-    new_remaining = max(0.0, remaining - qty_to_close)
-    journal.at[idx, "RemainingQuantity"] = new_remaining
-    journal.at[idx, "RealizedPnL"] = round(old_realized + pnl, 2)
-    journal.at[idx, "AvgExitPrice"] = avg_exit
-    if target_flag:
-        journal.at[idx, target_flag] = True
-        qty_col = target_flag.replace("_Hit", "_Quantity")
-        if qty_col in journal.columns:
-            journal.at[idx, qty_col] = float(row.get(qty_col, 0) or 0) + qty_to_close
-    if final or new_remaining <= 0:
-        journal.at[idx, "ExitPrice"] = avg_exit
-        journal.at[idx, "Status"] = "CLOSED"
-        journal.at[idx, "Quantity"] = float(row["Quantity"])
-        total_pnl = old_realized + pnl
-        journal.at[idx, "PnL"] = round(total_pnl, 2)
-        journal.at[idx, "PnLPercent"] = round((total_pnl / (entry * float(row["Quantity"]))) * 100, 2) if entry else 0
-        journal.at[idx, "Result"] = "WIN" if total_pnl > 0 else "LOSS" if total_pnl < 0 else "BREAKEVEN"
-    save_journal(journal)
-    return True
-
-
-def auto_paper_trade_exit(current_price, exit_target_level=3, enabled=True, symbol_filter=None):
-    """Paper-only staged exits: 1/3 at T1, 1/3 at T2, remainder at selected final target or SL."""
+def auto_paper_trade_exit(current_price):
     try:
-        if not enabled or current_price is None:
-            return 0
         journal = load_journal()
         if journal.empty:
             return 0
-        for col, default in [("RemainingQuantity", np.nan), ("RealizedPnL", 0.0), ("AvgExitPrice", 0.0),
-                             ("T1_Quantity", 0.0), ("T2_Quantity", 0.0), ("T3_Quantity", 0.0)]:
-            if col not in journal.columns:
-                journal[col] = default
-        open_idx = journal.index[journal["Status"].astype(str).eq("OPEN")].tolist()
-        if symbol_filter:
-            open_idx = [i for i in open_idx if str(journal.at[i, "Symbol"]) == str(symbol_filter)]
+
+        open_trades = journal[journal["Status"] == "OPEN"].copy()
+        if open_trades.empty:
+            return 0
+
         closed_count = 0
-        for idx in open_idx:
-            row = journal.loc[idx].copy()
-            total_qty = float(row["Quantity"])
-            remaining_val = row.get("RemainingQuantity", np.nan)
-            remaining = total_qty if pd.isna(remaining_val) else float(remaining_val)
-            if remaining <= 0:
-                continue
+        for idx, row in open_trades.iterrows():
             signal = str(row["Signal"]).upper()
-            is_long = "BUY" in signal or "CALL" in signal
+            entry = float(row["EntryPrice"])
             sl = float(row["StopLoss"]) if pd.notna(row["StopLoss"]) else None
-            targets = [float(row[f"Target{i}"]) if pd.notna(row.get(f"Target{i}")) else None for i in (1,2,3)]
-            sl_hit = (current_price <= sl) if is_long and sl is not None else ((current_price >= sl) if sl is not None else False)
-            if sl_hit:
-                if _apply_paper_partial_exit(journal, idx, row, sl, remaining, final=True):
-                    closed_count += 1
-                continue
-            # Targets already marked are not paid twice. Close a third at each milestone.
-            for level in range(1, min(int(exit_target_level), 3) + 1):
-                flag = f"T{level}_Hit"
-                if bool(journal.at[idx, flag]) or targets[level-1] is None:
-                    continue
-                hit = current_price >= targets[level-1] if is_long else current_price <= targets[level-1]
-                if not hit:
-                    continue
-                current_remaining = float(journal.at[idx, "RemainingQuantity"]) if pd.notna(journal.at[idx, "RemainingQuantity"]) else total_qty
-                # Leave at least one unit for the final target where possible.
-                if level < int(exit_target_level) and current_remaining > 1:
-                    qty_close = max(1, int(total_qty / 3))
-                    qty_close = min(qty_close, current_remaining - 1)
-                else:
-                    qty_close = current_remaining
-                fresh_row = journal.loc[idx].copy()
-                if _apply_paper_partial_exit(journal, idx, fresh_row, targets[level-1], qty_close, flag, final=(qty_close >= current_remaining)):
-                    if str(journal.at[idx, "Status"]) == "CLOSED":
-                        closed_count += 1
-                if str(journal.at[idx, "Status"]) == "CLOSED":
-                    break
+            t1 = float(row["Target1"]) if pd.notna(row["Target1"]) else None
+            t2 = float(row["Target2"]) if pd.notna(row["Target2"]) else None
+            t3 = float(row["Target3"]) if pd.notna(row["Target3"]) else None
+            qty = float(row["Quantity"])
+
+            t1_hit = False
+            t2_hit = False
+            t3_hit = False
+            exit_price = None
+            result = None
+
+            if "BUY" in signal:
+                if t1 is not None and current_price >= t1:
+                    t1_hit = True
+                if t2 is not None and current_price >= t2:
+                    t2_hit = True
+                if t3 is not None and current_price >= t3:
+                    t3_hit = True
+
+                if sl is not None and current_price <= sl:
+                    exit_price = sl
+                    result = "LOSS"
+                elif t3 is not None and current_price >= t3:
+                    exit_price = t3
+                    result = "WIN"
+                elif t2 is not None and current_price >= t2:
+                    exit_price = t2
+                    result = "WIN"
+                elif t1 is not None and current_price >= t1:
+                    exit_price = t1
+                    result = "WIN"
+
+            else:
+                if t1 is not None and current_price <= t1:
+                    t1_hit = True
+                if t2 is not None and current_price <= t2:
+                    t2_hit = True
+                if t3 is not None and current_price <= t3:
+                    t3_hit = True
+
+                if sl is not None and current_price >= sl:
+                    exit_price = sl
+                    result = "LOSS"
+                elif t3 is not None and current_price <= t3:
+                    exit_price = t3
+                    result = "WIN"
+                elif t2 is not None and current_price <= t2:
+                    exit_price = t2
+                    result = "WIN"
+                elif t1 is not None and current_price <= t1:
+                    exit_price = t1
+                    result = "WIN"
+
+            if exit_price is not None:
+                pnl = paper_trade_exit(entry, exit_price, qty, signal)
+                close_trade_in_journal(idx, exit_price, result=result, t1_hit=t1_hit, t2_hit=t2_hit, t3_hit=t3_hit)
+                closed_count += 1
+
         return closed_count
     except Exception as e:
         log_app_error("auto_paper_trade_exit", e)
@@ -3154,14 +2755,15 @@ init_signal_audit()
 init_ws_state()
 
 stocks = {
-    "NIFTY": "^NSEI", "BANKNIFTY": "^NSEBANK", "SENSEX": "^BSESN",
-    "RELIANCE": "RELIANCE.NS", "HDFCBANK": "HDFCBANK.NS", "ICICIBANK": "ICICIBANK.NS",
-    "SBIN": "SBIN.NS", "AXISBANK": "AXISBANK.NS", "KOTAKBANK": "KOTAKBANK.NS",
-    "TCS": "TCS.NS", "INFY": "INFY.NS", "HCLTECH": "HCLTECH.NS",
-    "WIPRO": "WIPRO.NS", "TECHM": "TECHM.NS", "TATAMOTORS": "TATAMOTORS.NS",
-    "MARUTI": "MARUTI.NS", "M&M": "M&M.NS", "BAJAJ-AUTO": "BAJAJ-AUTO.NS",
-    "HEROMOTOCO": "HEROMOTOCO.NS", "ITC": "ITC.NS", "LT": "LT.NS",
-    "BHARTIARTL": "BHARTIARTL.NS", "SUNPHARMA": "SUNPHARMA.NS"
+    "NIFTY": "^NSEI",
+    "BANKNIFTY": "^NSEBANK",
+    "RELIANCE": "RELIANCE.NS",
+    "TCS": "TCS.NS",
+    "INFY": "INFY.NS",
+    "HDFCBANK": "HDFCBANK.NS",
+    "SBIN": "SBIN.NS",
+    "ICICIBANK": "ICICIBANK.NS",
+    "ITC": "ITC.NS"
 }
 
 ANGEL_TOKENS = {
@@ -3176,40 +2778,15 @@ ANGEL_TOKENS = {
     "ITC": "1660"
 }
 
-
-# Broader market context (Yahoo symbols); these tables show latest daily closes.
-global_indices = {
-    "S&P 500": "^GSPC", "Dow Jones": "^DJI", "Nasdaq": "^IXIC", "FTSE 100": "^FTSE",
-    "DAX": "^GDAXI", "Nikkei 225": "^N225", "Hang Seng": "^HSI", "Shanghai": "000001.SS",
-    "Brent Crude": "BZ=F", "Gold": "GC=F", "USD/INR": "INR=X"
-}
-indian_indices = {
-    "NIFTY 50": "^NSEI", "BANKNIFTY": "^NSEBANK", "SENSEX": "^BSESN", "NIFTY IT": "^CNXIT",
-    "NIFTY AUTO": "^CNXAUTO", "NIFTY PHARMA": "^CNXPHARMA", "India VIX": "^INDIAVIX"
-}
-major_stocks = {
-    "RELIANCE": "RELIANCE.NS", "HDFC BANK": "HDFCBANK.NS", "ICICI BANK": "ICICIBANK.NS",
-    "SBI": "SBIN.NS", "AXIS BANK": "AXISBANK.NS", "KOTAK BANK": "KOTAKBANK.NS",
-    "TCS": "TCS.NS", "INFOSYS": "INFY.NS", "HCL TECH": "HCLTECH.NS", "WIPRO": "WIPRO.NS",
-    "TECH MAHINDRA": "TECHM.NS", "TATA MOTORS": "TATAMOTORS.NS", "MARUTI": "MARUTI.NS",
-    "M&M": "M&M.NS", "BAJAJ AUTO": "BAJAJ-AUTO.NS", "HERO MOTOCORP": "HEROMOTOCO.NS",
-    "ITC": "ITC.NS", "L&T": "LT.NS", "BHARTI AIRTEL": "BHARTIARTL.NS", "SUN PHARMA": "SUNPHARMA.NS"
-}
-
 st.title("Elite Trading Dashboard Final Ultimate")
-st.caption("Polling Primary | WebSocket Secondary | Yahoo / Angel One | NSE Website LTP fallback | Heikin-Ashi | Candlestick Patterns | OI/PCR | FII/DII | Paper Simulation Only — no broker orders")
+st.caption("Polling First | Walk Forward | Auto Exit | News Filter | Dynamic Option Chain")
 
 debug_mode = st.sidebar.checkbox("Debug Mode", value=False)
 selected = st.selectbox("Select Stock / Index", list(stocks.keys()))
-data_source = st.radio("Primary Data Source", ["Yahoo", "Angel"], horizontal=True, format_func=lambda x: "Yahoo Finance" if x == "Yahoo" else "Angel One")
-fallback_source = st.selectbox("Angel One data unavailable hone par fallback", ["Yahoo Finance", "NSE Website (LTP only) + Yahoo candles", "No fallback"], index=0)
+data_source = st.radio("Data Source", ["Yahoo", "Angel"], horizontal=True)
 timeframe = st.selectbox("Select Time Frame", ["1m", "3m", "5m", "10m", "15m", "30m", "1h", "1d"])
 auto_refresh = st.checkbox("Enable Auto Refresh", value=True)
-refresh_seconds = st.selectbox("Refresh Every (seconds)", [5, 10, 15, 30, 60], index=2)
-auto_exit_enabled = st.checkbox("Enable Paper Auto Exit (SL / Target)", value=st.session_state.get("auto_exit_enabled", True))
-auto_exit_target_level = st.selectbox("Auto full-exit target", [1, 2, 3], index=[1, 2, 3].index(int(st.session_state.get("auto_exit_target_level", 3))), format_func=lambda x: f"Target {x}")
-st.session_state["auto_exit_enabled"] = auto_exit_enabled
-st.session_state["auto_exit_target_level"] = auto_exit_target_level
+refresh_seconds = st.selectbox("Refresh Every (seconds)", [10, 20, 30, 60], index=2)
 
 with st.expander("Telegram Alert Settings"):
     telegram_enabled = st.checkbox("Enable Telegram Alerts", value=False)
@@ -3226,13 +2803,8 @@ with st.expander("Angel One API Settings"):
     angel_client_code = st.text_input("Angel Client Code")
     angel_pin = st.text_input("Angel PIN", type="password")
     angel_totp_secret = st.text_input("Angel TOTP Secret", type="password")
-    st.caption("Polling is the PRIMARY feed. WebSocket is a SECONDARY optional feed/fallback.")
-    if SmartConnect is None or pyotp is None:
-        st.warning("Angel One connector packages are not installed. Yahoo Finance will continue to work; install the optional Angel dependencies from requirements-angel.txt to enable Angel One data.")
-    if not SMART_WS_AVAILABLE:
-        st.info("Angel One WebSocket connector is unavailable until the optional SmartAPI package is installed. Polling remains the preferred mode when Angel One is available.")
-    polling_mode = st.checkbox("Enable REST LTP Polling (Primary)", value=True)
-    ws_enable = st.checkbox("Enable Angel WebSocket (Secondary / Optional)", value=False)
+    polling_mode = st.checkbox("Use Angel LTP Polling Mode", value=True)
+    ws_enable = st.checkbox("Enable Angel WebSocket (Optional)", value=False)
 
     if st.button("Test Angel Login"):
         angel, session = angel_login(angel_api_key, angel_client_code, angel_pin, angel_totp_secret, force_refresh=True)
@@ -3248,10 +2820,8 @@ with st.expander("Angel One API Settings"):
 
 ticker = stocks[selected]
 
-if auto_refresh and st_autorefresh is not None:
+if auto_refresh:
     st_autorefresh(interval=refresh_seconds * 1000, key="elite_ultimate_refresh")
-elif auto_refresh and st_autorefresh is None:
-    st.warning("streamlit-autorefresh is not installed; automatic refresh is unavailable.")
 
 if timeframe == "1m":
     yf_interval, yf_period = "1m", "7d"
@@ -3276,40 +2846,27 @@ if "last_good_candles" not in st.session_state:
     st.session_state["last_good_candles"] = None
 
 if data_source == "Angel":
-    angel_credentials_ready = bool(angel_api_key and angel_client_code and angel_pin and angel_totp_secret)
-    if not angel_credentials_ready:
-        st.warning("Angel One credentials missing. Using selected fallback feed." if fallback_source != "No fallback" else "Please fill Angel One credentials to use this source.")
-        if fallback_source in ("Yahoo Finance", "NSE Website (LTP only) + Yahoo candles"):
-            data = fetch_data(ticker, yf_interval, yf_period)
-            st.session_state["active_data_provider"] = "Yahoo Finance history fallback (Angel credentials missing)"
-        else:
-            st.stop()
+    if not (angel_api_key and angel_client_code and angel_pin and angel_totp_secret):
+        st.warning("Please fill Angel credentials to use Angel data source.")
+        st.stop()
+
+    angel_interval = map_angel_interval(timeframe)
+    candles = get_angel_candles(angel_api_key, angel_client_code, angel_pin, angel_totp_secret, selected, angel_interval)
+    data = candles_to_df(candles)
+
+    if data.empty:
+        last_good = st.session_state.get("last_good_candles")
+        data = candles_to_df(last_good)
+        if not data.empty:
+            st.warning("Using last successful Angel candle data.")
     else:
-        angel_interval = map_angel_interval(timeframe)
-        candles = get_angel_candles(angel_api_key, angel_client_code, angel_pin, angel_totp_secret, selected, angel_interval)
-        data = candles_to_df(candles)
+        st.session_state["last_good_candles"] = candles
 
-        if data.empty and fallback_source in ("Yahoo Finance", "NSE Website (LTP only) + Yahoo candles"):
-            st.warning("Angel One candle data unavailable. Yahoo Finance is used for chart/history; NSE Website option is an LTP-only fallback.")
-            data = fetch_data(ticker, yf_interval, yf_period)
-            st.session_state["active_data_provider"] = "Yahoo Finance history fallback"
-        elif data.empty:
-            last_good = st.session_state.get("last_good_candles")
-            data = candles_to_df(last_good)
-            if not data.empty:
-                st.warning("Angel API unavailable; showing last successful Angel candle cache (may be stale).")
-                st.session_state["active_data_provider"] = "Angel cached candles (possibly stale)"
-        else:
-            st.session_state["last_good_candles"] = candles
-            st.session_state["active_data_provider"] = "Angel One"
-
-    if ws_enable:
-        # Start WebSocket only as secondary feed; polling remains the preferred source.
+    if ws_enable and not USE_POLLING_AS_PRIMARY:
         start_angel_websocket(angel_api_key, angel_client_code, angel_pin, angel_totp_secret, selected)
         sync_ws_state_to_session()
 else:
     data = fetch_data(ticker, yf_interval, yf_period)
-    st.session_state["active_data_provider"] = "Yahoo Finance"
 
 if data.empty:
     st.error("No data found")
@@ -3327,40 +2884,6 @@ if not ok:
 
 data = add_indicators(data).bfill().ffill()
 backtest_data = data.copy()
-
-# Standard Japanese candlestick chart (raw OHLC) and Heikin-Ashi view are both shown.
-raw_chart_data = data.tail(180)
-if not raw_chart_data.empty:
-    st.subheader("Japanese Candlestick / Price Action Chart")
-    raw_fig = go.Figure(data=[go.Candlestick(
-        x=raw_chart_data.index, open=raw_chart_data["Open"], high=raw_chart_data["High"],
-        low=raw_chart_data["Low"], close=raw_chart_data["Close"], name="OHLC"
-    )])
-    for col, label in [("EMA20", "EMA 20"), ("EMA50", "EMA 50"), ("VWAP", "VWAP")]:
-        if col in raw_chart_data:
-            raw_fig.add_trace(go.Scatter(x=raw_chart_data.index, y=raw_chart_data[col], mode="lines", name=label))
-    raw_fig.update_layout(height=480, xaxis_rangeslider_visible=False,
-                          margin=dict(l=10, r=10, t=35, b=10),
-                          title=f"{selected} — Standard OHLC ({timeframe})")
-    st.plotly_chart(raw_fig, use_container_width=True)
-
-# Heikin-Ashi candle chart (visual analysis; original OHLC remains the signal input).
-ha_chart_data = convert_to_heikin_ashi(data.tail(180))
-if not ha_chart_data.empty:
-    st.subheader("Heikin-Ashi Candlestick Chart")
-    ha_fig = go.Figure(data=[go.Candlestick(
-        x=ha_chart_data.index,
-        open=ha_chart_data["HA_Open"], high=ha_chart_data["HA_High"],
-        low=ha_chart_data["HA_Low"], close=ha_chart_data["HA_Close"],
-        name="Heikin-Ashi"
-    )])
-    ha_fig.update_layout(height=520, xaxis_rangeslider_visible=False,
-                         margin=dict(l=10, r=10, t=35, b=10),
-                         title=f"{selected} — Heikin-Ashi ({timeframe})")
-    st.plotly_chart(ha_fig, use_container_width=True)
-    ha_last = ha_chart_data.iloc[-1]
-    ha_state = "Bullish" if ha_last["HA_Close"] > ha_last["HA_Open"] else "Bearish" if ha_last["HA_Close"] < ha_last["HA_Open"] else "Neutral"
-    st.caption(f"Latest Heikin-Ashi candle: {ha_state}. HA candles smooth price movement and can lag; use standard OHLC/LTP for execution decisions.")
 
 if len(data) < 30:
     st.warning(f"Only {len(data)} rows available after indicator calculation.")
@@ -3396,92 +2919,9 @@ bear_count = sum("Bearish" in sig for sig in mtf_table["Trend"])
 dynamic_oc_symbol = get_dynamic_option_chain_symbol(selected)
 option_metrics = parse_option_chain_metrics(dynamic_oc_symbol)
 
-st.subheader("Option Chain / OI / PCR Snapshot")
-oc1, oc2, oc3, oc4, oc5, oc6 = st.columns(6)
-with oc1: st.metric("PCR", option_metrics.get("pcr") if option_metrics.get("pcr") is not None else "N/A")
-with oc2: st.metric("Call OI", f"{int(option_metrics.get('call_oi', 0)):,}")
-with oc3: st.metric("Put OI", f"{int(option_metrics.get('put_oi', 0)):,}")
-with oc4: st.metric("Call Day ΔOI", f"{int(option_metrics.get('call_day_change_oi', 0)):,}")
-with oc5: st.metric("Put Day ΔOI", f"{int(option_metrics.get('put_day_change_oi', 0)):,}")
-with oc6: st.metric("OI Bias", option_metrics.get("oi_bias", "N/A"))
-oc7, oc8 = st.columns(2)
-with oc7: st.metric("Call Snapshot ΔOI", option_metrics.get("call_snapshot_delta_oi") if option_metrics.get("call_snapshot_delta_oi") is not None else "Baseline")
-with oc8: st.metric("Put Snapshot ΔOI", option_metrics.get("put_snapshot_delta_oi") if option_metrics.get("put_snapshot_delta_oi") is not None else "Baseline")
-st.caption("NSE change-in-OI is exchange-reported day change. Snapshot ΔOI is calculated between successful app refresh snapshots; first snapshot is a baseline, not a zero-signal confirmation.")
-
-latest_patterns = [x for x in str(data.iloc[-1].get("CandlestickPattern", "No major pattern")).split(", ") if x and x != "No major pattern"]
-st.subheader("Latest Candlestick Pattern Detection")
-if latest_patterns:
-    st.success(" | ".join(latest_patterns))
-else:
-    st.info("No major candlestick pattern detected on the latest completed/current candle.")
-pa1, pa2, pa3, pa4 = st.columns(4)
-last_bar = data.iloc[-1]
-with pa1:
-    st.metric("Price Action", str(last_bar.get("PriceAction", "N/A")))
-with pa2:
-    st.metric("Bollinger Upper", round(float(last_bar["BB_Upper"]), 2) if pd.notna(last_bar.get("BB_Upper")) else "N/A")
-with pa3:
-    st.metric("Bollinger Lower", round(float(last_bar["BB_Lower"]), 2) if pd.notna(last_bar.get("BB_Lower")) else "N/A")
-with pa4:
-    st.metric("BB Squeeze", "Yes" if bool(last_bar.get("BB_Squeeze", False)) else "No")
-with st.expander("Recent Price Action / Candlestick Details"):
-    show_cols = [c for c in ["Open", "High", "Low", "Close", "Volume", "PriceAction", "CandlestickPattern",
-                              "RSI", "MACD", "ADX", "ATR", "VWAP", "BB_Upper", "BB_Lower", "BB_Width_Pct"]
-                 if c in data.columns]
-    st.dataframe(data[show_cols].tail(30), use_container_width=True)
-
-with st.expander("Government Announcements / Geopolitical News"):
-    macro_news = get_macro_news_events()
-    st.caption(f"Source: {macro_news['source']} | {macro_news['message']}")
-    if macro_news["available"]:
-        st.dataframe(pd.DataFrame(macro_news["articles"]), use_container_width=True, hide_index=True,
-                     column_config={"URL": st.column_config.LinkColumn("Article")})
-    else:
-        st.warning("Macro news feed unavailable at this moment.")
-
-with st.expander("FII / DII Activity (NSE feed)"):
-    fii_dii = get_fii_dii_activity()
-    st.caption(f"Source: {fii_dii['source']} | Checked: {fii_dii['as_of']} | {fii_dii['message']}")
-    if fii_dii["available"]:
-        st.dataframe(pd.DataFrame(fii_dii["rows"]), use_container_width=True, hide_index=True)
-    else:
-        st.warning("FII/DII data is not available from the NSE endpoint right now. No values are fabricated; try again later.")
-
 news_info = {"allow_trade": True, "message": "News filter disabled", "events": []}
 if news_filter_enabled:
     news_info = get_news_events(news_api_key, selected)
-
-# Incorporate public macro headlines and NSE FII/DII net flow into the signal score.
-# Missing/blocked feeds remain Neutral; the app never invents values.
-macro_articles = macro_news.get("articles", []) if isinstance(macro_news, dict) else []
-macro_text = " ".join(str(a.get("Headline", "")) for a in macro_articles).lower()
-macro_risk_terms = ("war", "conflict", "attack", "sanction", "crisis", "escalation",
-                    "border", "terror", "disruption", "emergency", "military")
-news_info["macro_event_present"] = bool(macro_articles)
-news_info["macro_risk_caution"] = any(term in macro_text for term in macro_risk_terms)
-
-def _safe_flow_number(value):
-    try:
-        cleaned = str(value).replace(",", "").replace("₹", "").strip()
-        return float(cleaned)
-    except Exception:
-        return None
-
-flow_values = {}
-for flow_row in (fii_dii.get("rows", []) if isinstance(fii_dii, dict) else []):
-    category = str(flow_row.get("Category", "")).upper()
-    net_value = _safe_flow_number(flow_row.get("Net"))
-    if net_value is not None:
-        if "FII" in category or "FPI" in category:
-            flow_values["FII"] = net_value
-        elif "DII" in category:
-            flow_values["DII"] = net_value
-if len(flow_values) == 2:
-    combined_flow = flow_values["FII"] + flow_values["DII"]
-    news_info["fii_dii_bias"] = "Bullish" if combined_flow > 0 else "Bearish" if combined_flow < 0 else "Neutral"
-else:
-    news_info["fii_dii_bias"] = "Neutral"
 
 wins, losses, total_trades, backtest_win_rate, backtest_trades_df = simple_backtest(
     backtest_data,
@@ -3547,62 +2987,16 @@ elif quality_score >= 55:
 else:
     signal_quality = "Weak"
 
-@st.cache_data(ttl=8, show_spinner=False)
-def get_nse_website_ltp(symbol_name):
-    """NSE website quote fallback for LTP only; it does not supply OHLC history."""
-    headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json,text/plain,*/*", "Referer": "https://www.nseindia.com/"}
-    try:
-        session = requests.Session()
-        session.get("https://www.nseindia.com", headers=headers, timeout=8)
-        if symbol_name in ("NIFTY", "BANKNIFTY", "SENSEX"):
-            response = session.get("https://www.nseindia.com/api/allIndices", headers=headers, timeout=8)
-            response.raise_for_status()
-            records = response.json().get("data", [])
-            aliases = {"NIFTY": "NIFTY 50", "BANKNIFTY": "NIFTY BANK", "SENSEX": "SENSEX"}
-            for row in records:
-                if str(row.get("index", "")).upper() == aliases.get(symbol_name, ""):
-                    value = row.get("last") or row.get("lastPrice")
-                    return float(str(value).replace(",", "")) if value is not None else None
-        else:
-            response = session.get("https://www.nseindia.com/api/quote-equity", params={"symbol": symbol_name}, headers=headers, timeout=8)
-            response.raise_for_status()
-            value = response.json().get("priceInfo", {}).get("lastPrice")
-            return float(str(value).replace(",", "")) if value is not None else None
-    except Exception as exc:
-        log_app_error("get_nse_website_ltp", exc)
-    return None
-
-
 live_price = None
-live_price_provider = st.session_state.get("active_data_provider", data_source)
-if data_source == "Angel":
-    # Primary polling quote; WebSocket is deliberately secondary.
-    if polling_mode:
-        live_price = get_angel_ltp_polling(angel_api_key, angel_client_code, angel_pin, angel_totp_secret, selected)
-        if live_price is not None:
-            live_price_provider = "Angel One REST Polling"
-    if live_price is None and ws_enable:
-        sync_ws_state_to_session()
-        live_price = st.session_state.get("live_price")
-        if live_price is not None:
-            live_price_provider = "Angel One WebSocket (secondary)"
-    if live_price is None and fallback_source == "NSE Website (LTP only) + Yahoo candles":
-        live_price = get_nse_website_ltp(selected)
-        if live_price is not None:
-            live_price_provider = "NSE Website LTP fallback (Yahoo history candles)"
-    if live_price is None and fallback_source in ("Yahoo Finance", "NSE Website (LTP only) + Yahoo candles"):
-        # Yahoo supplies a recent candle close if the optional NSE website quote is blocked/unavailable.
-        yahoo_fallback = fetch_data(ticker, "1m", "7d")
-        if not yahoo_fallback.empty:
-            live_price = float(yahoo_fallback["Close"].iloc[-1])
-            live_price_provider = "Yahoo Finance fallback"
+if data_source == "Angel" and polling_mode:
+    live_price = get_angel_ltp_polling(angel_api_key, angel_client_code, angel_pin, angel_totp_secret, selected)
+elif data_source == "Angel" and ws_enable:
+    sync_ws_state_to_session()
+    live_price = st.session_state.get("live_price")
 
-current_display_price = live_price if live_price is not None else float(analysis["close_price"])
+current_display_price = live_price if live_price else analysis["close_price"]
 
-# Auto-exit is paper-journal simulation only. It never sends broker orders.
-auto_exit_enabled = st.session_state.get("auto_exit_enabled", True)
-auto_exit_target_level = int(st.session_state.get("auto_exit_target_level", 3))
-closed_auto = auto_paper_trade_exit(current_display_price, exit_target_level=auto_exit_target_level, enabled=auto_exit_enabled, symbol_filter=selected)
+closed_auto = auto_paper_trade_exit(current_display_price)
 
 option_suggestion = suggest_option_strike(selected, analysis["close_price"], analysis["signal_type"])
 expiry_seconds = get_signal_expiry_remaining(selected, timeframe, analysis["signal_text"])
@@ -3661,7 +3055,6 @@ if data_source == "Angel":
         st.metric("Live Price", round(live_price, 2) if live_price else "-")
     with p4:
         st.metric("Auto Closed Trades", closed_auto)
-    st.caption(f"Active quote feed: {live_price_provider} | Polling primary: {'ON' if polling_mode else 'OFF'} | WebSocket secondary: {'ON' if ws_enable else 'OFF'}")
 
 if analysis["signal_type"] == "buy":
     st.success(alert_text)
@@ -3757,14 +3150,6 @@ with c5:
 with c6:
     st.metric("No Trade Zone", "Yes" if analysis["no_trade_zone"] else "No")
 
-ma1, ma2, ma3, ma4, ma5 = st.columns(5)
-latest_bar = data.iloc[-1]
-with ma1: st.metric("SMA 20", round(float(latest_bar["SMA20"]), 2) if pd.notna(latest_bar["SMA20"]) else "N/A")
-with ma2: st.metric("SMA 50", round(float(latest_bar["SMA50"]), 2) if pd.notna(latest_bar["SMA50"]) else "N/A")
-with ma3: st.metric("SMA 100", round(float(latest_bar["SMA100"]), 2) if pd.notna(latest_bar["SMA100"]) else "N/A")
-with ma4: st.metric("SMA 200", round(float(latest_bar["SMA200"]), 2) if pd.notna(latest_bar["SMA200"]) else "N/A")
-with ma5: st.metric("ADR 14", round(float(latest_bar["ADR14"]), 2) if pd.notna(latest_bar["ADR14"]) else "N/A")
-
 r1, r2, r3, r4 = st.columns(4)
 with r1:
     st.metric("Trending Market", "Yes" if analysis["trending_market"] else "No")
@@ -3774,10 +3159,6 @@ with r3:
     st.metric("High Volatility", "Yes" if analysis["high_volatility_market"] else "No")
 with r4:
     st.metric("Signal Quality", signal_quality)
-
-st.subheader("Auto Exit Status (Paper Trading)")
-st.metric("Auto-exit mode", "Enabled" if auto_exit_enabled else "Disabled")
-st.caption(f"Stop-loss always triggers a simulated full exit. Target {auto_exit_target_level} triggers the simulated full exit. Auto-exit is scoped to the currently selected symbol and never places real broker orders.")
 
 st.subheader("Risk Management")
 rk1, rk2, rk3, rk4, rk5 = st.columns(5)
@@ -3965,45 +3346,3 @@ else:
 if debug_mode:
     st.subheader("Debug Panel")
    
-
-
-# =========================================================
-# MARKET BREADTH + GLOBAL CONTEXT (merged from companion app)
-# =========================================================
-st.subheader("F&O-Style Major Stocks Scanner")
-st.caption("Yahoo Finance prices may be delayed and are underlying spot prices, not guaranteed live futures quotes. Angel One polling is the primary quote feed when selected; WebSocket is secondary. Auto-exit is paper simulation only.")
-with st.spinner("Loading major-stock market context..."):
-    fno_scanner_df = fetch_fno_style_scanner(major_stocks)
-if not fno_scanner_df.empty:
-    def _market_trend_style(value):
-        if value == "BULLISH": return "background-color: #163d1a; color: #7CFC00; font-weight: bold;"
-        if value == "BEARISH": return "background-color: #4a1515; color: #ff6b6b; font-weight: bold;"
-        if value == "NEUTRAL": return "background-color: #3a3a3a; color: #f2c94c; font-weight: bold;"
-        return ""
-    try:
-        st.dataframe(fno_scanner_df.style.map(_market_trend_style, subset=["1m", "2m", "3m", "Direction"]), use_container_width=True, hide_index=True)
-    except Exception:
-        st.dataframe(fno_scanner_df, use_container_width=True, hide_index=True)
-    fno_summary = summarize_fno_bias(fno_scanner_df)
-    sm1, sm2, sm3, sm4 = st.columns(4)
-    sm1.metric("Major Stocks Bias", fno_summary["overall_bias"])
-    sm2.metric("Bullish Stocks", f"{fno_summary['bullish_pct']}%")
-    sm3.metric("Bearish Stocks", f"{fno_summary['bearish_pct']}%")
-    sm4.metric("Strongest Gainer", fno_summary["strongest_gainer"])
-    st.caption("Strongest Loser: " + fno_summary["strongest_loser"])
-else:
-    st.info("Major-stock scanner data unavailable right now.")
-
-st.subheader("Global / Macro Performance — Latest Daily Close")
-global_df = fetch_market_snapshot(global_indices)
-if not global_df.empty:
-    st.dataframe(global_df, use_container_width=True, hide_index=True)
-else:
-    st.info("Global market data unavailable right now.")
-
-st.subheader("Indian Indices Performance — Latest Daily Close")
-india_df = fetch_market_snapshot(indian_indices)
-if not india_df.empty:
-    st.dataframe(india_df, use_container_width=True, hide_index=True)
-else:
-    st.info("Indian index data unavailable right now.")
