@@ -943,6 +943,80 @@ def compute_supertrend(df, period=10, multiplier=3):
     return data
 
 
+def detect_candlestick_patterns(df):
+    """Vectorized OHLC candlestick library. Patterns are heuristic confirmations, not standalone trade signals."""
+    out = df.copy()
+    o, h, l, c = [pd.to_numeric(out[k], errors="coerce") for k in ("Open", "High", "Low", "Close")]
+    body = (c - o).abs()
+    rng = (h - l).replace(0, np.nan)
+    upper = h - pd.concat([o, c], axis=1).max(axis=1)
+    lower = pd.concat([o, c], axis=1).min(axis=1) - l
+    small = body <= rng * 0.30
+    long_body = body >= rng * 0.60
+    bull = c > o
+    bear = c < o
+    prev_bull, prev_bear = bull.shift(1).fillna(False), bear.shift(1).fillna(False)
+    prev_body = body.shift(1)
+    prev_mid = (o.shift(1) + c.shift(1)) / 2
+
+    # Single-candle patterns
+    out["Hammer"] = (lower >= body * 2.0) & (upper <= body * 0.6) & (body > 0)
+    out["HangingMan"] = out["Hammer"]  # Context (preceding uptrend) is shown separately as a heuristic.
+    out["InvertedHammer"] = (upper >= body * 2.0) & (lower <= body * 0.6) & (body > 0) & bear
+    out["ShootingStar"] = (upper >= body * 2.0) & (lower <= body * 0.6) & (body > 0) & bear
+    out["Doji"] = body <= rng * 0.10
+    out["SpinningTop"] = (body <= rng * 0.30) & (upper >= body * 0.5) & (lower >= body * 0.5) & (~out["Doji"])
+    out["MarubozuBull"] = bull & (upper <= rng * 0.05) & (lower <= rng * 0.05) & long_body
+    out["MarubozuBear"] = bear & (upper <= rng * 0.05) & (lower <= rng * 0.05) & long_body
+
+    # Two-candle patterns
+    out["BullishEngulfing"] = bull & prev_bear & (o <= c.shift(1)) & (c >= o.shift(1)) & (body >= prev_body)
+    out["BearishEngulfing"] = bear & prev_bull & (o >= c.shift(1)) & (c <= o.shift(1)) & (body >= prev_body)
+    out["PiercingLine"] = bear.shift(1).fillna(False) & bull & (o < l.shift(1)) & (c > prev_mid) & (c < o.shift(1))
+    out["DarkCloudCover"] = bull.shift(1).fillna(False) & bear & (o > h.shift(1)) & (c < prev_mid) & (c > o.shift(1))
+    prev_high = h.shift(1)
+    prev_low = l.shift(1)
+    out["TweezerBottom"] = bear.shift(1).fillna(False) & bull & ((l - prev_low).abs() <= (rng * 0.10))
+    out["TweezerTop"] = bull.shift(1).fillna(False) & bear & ((h - prev_high).abs() <= (rng * 0.10))
+    out["InsideBar"] = (h < prev_high) & (l > prev_low)
+    out["OutsideBar"] = (h > prev_high) & (l < prev_low)
+
+    # Three-candle patterns (middle candle small; final close confirms direction)
+    o1, c1 = o.shift(2), c.shift(2)
+    o2, c2 = o.shift(1), c.shift(1)
+    mid_small = (c2 - o2).abs() <= (h.shift(1) - l.shift(1)).replace(0, np.nan) * 0.30
+    out["MorningStar"] = (c1 < o1) & mid_small & bull & (c > (o1 + c1) / 2)
+    out["EveningStar"] = (c1 > o1) & mid_small & bear & (c < (o1 + c1) / 2)
+    out["ThreeWhiteSoldiers"] = bull & bull.shift(1).fillna(False) & bull.shift(2).fillna(False) & (c > c.shift(1)) & (c.shift(1) > c.shift(2)) & (o < c.shift(1)) & (o.shift(1) < c.shift(2))
+    out["ThreeBlackCrows"] = bear & bear.shift(1).fillna(False) & bear.shift(2).fillna(False) & (c < c.shift(1)) & (c.shift(1) < c.shift(2)) & (o > c.shift(1)) & (o.shift(1) > c.shift(2))
+
+    # Trend-context approximations to avoid presenting every long lower wick as a reversal.
+    prior_up = c.shift(1) > c.shift(5)
+    prior_down = c.shift(1) < c.shift(5)
+    out["HangingMan"] = out["HangingMan"] & prior_up
+    out["Hammer"] = out["Hammer"] & prior_down
+    out["InvertedHammer"] = out["InvertedHammer"] & prior_down
+    out["ShootingStar"] = out["ShootingStar"] & prior_up
+
+    bullish_cols = ["Hammer", "InvertedHammer", "BullishEngulfing", "PiercingLine", "MorningStar", "ThreeWhiteSoldiers", "TweezerBottom", "MarubozuBull"]
+    bearish_cols = ["HangingMan", "ShootingStar", "BearishEngulfing", "DarkCloudCover", "EveningStar", "ThreeBlackCrows", "TweezerTop", "MarubozuBear"]
+    for col in bullish_cols + bearish_cols + ["Doji", "SpinningTop", "InsideBar", "OutsideBar"]:
+        out[col] = out[col].fillna(False).astype(bool)
+
+    names=[]; directions=[]; scores=[]
+    for idx in out.index:
+        found=[name for name in bullish_cols + bearish_cols + ["Doji", "SpinningTop", "InsideBar", "OutsideBar"] if bool(out.at[idx, name])]
+        names.append(", ".join(found) if found else "No clear pattern")
+        b=sum(bool(out.at[idx, name]) for name in bullish_cols)
+        s=sum(bool(out.at[idx, name]) for name in bearish_cols)
+        directions.append("Bullish" if b>s else "Bearish" if s>b else "Neutral")
+        scores.append(int(np.clip((b-s)*2, -6, 6)))
+    out["CandlePattern"] = names
+    out["CandlePatternBias"] = directions
+    out["CandlePatternScore"] = scores
+    return out
+
+
 def add_indicators(df):
     df = df.copy()
 
@@ -1018,7 +1092,105 @@ def add_indicators(df):
     )
     df["Doji"] = candle_body <= (candle_range * 0.1)
     df["BodyStrength"] = candle_body / candle_range
+    df = detect_candlestick_patterns(df)
     return df
+
+
+# =========================================================
+# NIFTY TOP 30 MULTI-TIMEFRAME SCANNER
+# =========================================================
+NIFTY_TOP30 = {
+    "RELIANCE": "RELIANCE.NS", "HDFC BANK": "HDFCBANK.NS", "ICICI BANK": "ICICIBANK.NS",
+    "BHARTI AIRTEL": "BHARTIARTL.NS", "TCS": "TCS.NS", "SBI": "SBIN.NS",
+    "INFOSYS": "INFY.NS", "BAJAJ FINANCE": "BAJFINANCE.NS", "LIC": "LICI.NS",
+    "HINDUSTAN UNILEVER": "HINDUNILVR.NS", "ITC": "ITC.NS", "L&T": "LT.NS",
+    "MARUTI": "MARUTI.NS", "HCL TECH": "HCLTECH.NS", "KOTAK BANK": "KOTAKBANK.NS",
+    "SUN PHARMA": "SUNPHARMA.NS", "AXIS BANK": "AXISBANK.NS", "M&M": "M&M.NS",
+    "ULTRATECH CEMENT": "ULTRACEMCO.NS", "TITAN": "TITAN.NS", "ONGC": "ONGC.NS",
+    "NTPC": "NTPC.NS", "BEL": "BEL.NS", "ADANI PORTS": "ADANIPORTS.NS",
+    "POWER GRID": "POWERGRID.NS", "TATA MOTORS": "TMPV.NS", "WIPRO": "WIPRO.NS",
+    "TRENT": "TRENT.NS", "JSW STEEL": "JSWSTEEL.NS", "TATA STEEL": "TATASTEEL.NS"
+}
+
+
+def classify_stock_timeframe(frame):
+    """Return a transparent trend classification using EMA, MACD, RSI and HA direction."""
+    if frame is None or frame.empty or len(frame) < 25:
+        return "N/A", 0
+    try:
+        x = add_indicators(frame).replace([np.inf, -np.inf], np.nan).dropna(subset=["EMA20", "EMA50", "MACD", "SignalLine", "RSI"])
+        if len(x) < 2:
+            return "N/A", 0
+        a, b = x.iloc[-1], x.iloc[-2]
+        ha = convert_to_heikin_ashi(x.tail(2))
+        ha_up = bool(ha.iloc[-1]["HA_Close"] > ha.iloc[-1]["HA_Open"])
+        score = 0
+        score += 2 if a["EMA20"] > a["EMA50"] else -2 if a["EMA20"] < a["EMA50"] else 0
+        score += 1 if a["Close"] > a["EMA20"] else -1
+        score += 1 if a["MACD"] > a["SignalLine"] else -1
+        score += 1 if a["MACD_Hist"] > b["MACD_Hist"] else -1
+        score += 1 if a["RSI"] >= 52 else -1 if a["RSI"] <= 48 else 0
+        score += 1 if ha_up else -1
+        if score >= 2:
+            return "Bullish", score
+        if score <= -2:
+            return "Bearish", score
+        return "Neutral", score
+    except Exception:
+        return "N/A", 0
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def build_nifty_top30_scanner():
+    rows=[]
+    intervals={"3m":"3min", "5m":"5min", "10m":"10min", "15m":"15min"}
+    for company, ticker_symbol in NIFTY_TOP30.items():
+        try:
+            intraday=fetch_data(ticker_symbol, "1m", "7d")
+            daily=fetch_data(ticker_symbol, "1d", "5d")
+            if intraday.empty:
+                rows.append({"Company":company,"CMP":np.nan,"% Change":np.nan,"3m":"N/A","5m":"N/A","10m":"N/A","15m":"N/A","Score":0})
+                continue
+            cmp=float(intraday["Close"].iloc[-1])
+            prev_close=float(daily["Close"].iloc[-2]) if len(daily)>=2 else np.nan
+            pct=((cmp-prev_close)/prev_close*100) if pd.notna(prev_close) and prev_close else np.nan
+            item={"Company":company,"CMP":round(cmp,2),"% Change":round(pct,2) if pd.notna(pct) else np.nan}
+            scores=[]
+            for label,rule in intervals.items():
+                tf_data=resample_ohlcv(intraday,rule)
+                trend,score=classify_stock_timeframe(tf_data)
+                item[label]=trend
+                scores.append(score if trend!="N/A" else 0)
+            item["Score"]=int(sum(scores))
+            valid=[item[k] for k in intervals if item[k] in ("Bullish","Bearish")]
+            bulls=valid.count("Bullish"); bears=valid.count("Bearish")
+            item["Overall"]="Bullish" if bulls>bears else "Bearish" if bears>bulls else "Neutral"
+            rows.append(item)
+        except Exception as exc:
+            log_app_error("nifty_top30_scanner", f"{company}: {exc}")
+            rows.append({"Company":company,"CMP":np.nan,"% Change":np.nan,"3m":"N/A","5m":"N/A","10m":"N/A","15m":"N/A","Score":0,"Overall":"N/A"})
+    return pd.DataFrame(rows)
+
+
+def scanner_breadth_summary(scanner_df):
+    if scanner_df is None or scanner_df.empty:
+        return pd.DataFrame()
+    result=[]
+    for tf in ["3m","5m","10m","15m"]:
+        vals=scanner_df[tf].astype(str)
+        bull=int((vals=="Bullish").sum()); bear=int((vals=="Bearish").sum()); neutral=int((vals=="Neutral").sum())
+        covered=bull+bear+neutral
+        result.append({"Timeframe":tf,"Bullish":bull,"Bearish":bear,"Neutral":neutral,
+                       "Bullish %":round(100*bull/covered,1) if covered else 0.0,
+                       "Bearish %":round(100*bear/covered,1) if covered else 0.0,
+                       "Coverage":covered})
+    all_vals=scanner_df[["3m","5m","10m","15m"]].values.ravel().tolist()
+    valid=[v for v in all_vals if v in ("Bullish","Bearish","Neutral")]
+    bull=valid.count("Bullish"); bear=valid.count("Bearish"); neutral=valid.count("Neutral"); total=len(valid)
+    result.append({"Timeframe":"Overall (all 4 TF votes)","Bullish":bull,"Bearish":bear,"Neutral":neutral,
+                   "Bullish %":round(100*bull/total,1) if total else 0.0,
+                   "Bearish %":round(100*bear/total,1) if total else 0.0,"Coverage":total})
+    return pd.DataFrame(result)
 
 
 # =========================================================
@@ -1541,20 +1713,18 @@ def analyze_signal(
         bearish += 3
         reasons.append("Bearish retest confirmed")
 
-    if bool(latest.get("Hammer", False)):
-        bullish += 2
-        reasons.append("Hammer pattern")
-    if bool(latest.get("ShootingStar", False)):
-        bearish += 2
-        reasons.append("Shooting Star pattern")
-    if bool(latest.get("BullishEngulfing", False)):
-        bullish += 3
-        reasons.append("Bullish Engulfing")
-    if bool(latest.get("BearishEngulfing", False)):
-        bearish += 3
-        reasons.append("Bearish Engulfing")
-    if bool(latest.get("Doji", False)):
-        reasons.append("Doji indecision")
+    # Candlestick library contribution: cap one candle's total influence to avoid score inflation.
+    candle_pattern = str(latest.get("CandlePattern", "No clear pattern"))
+    candle_bias = str(latest.get("CandlePatternBias", "Neutral"))
+    candle_pattern_score = int(latest.get("CandlePatternScore", 0) or 0)
+    if candle_pattern_score > 0:
+        bullish += min(3, candle_pattern_score)
+        reasons.append(f"Bullish candlestick confirmation: {candle_pattern} (+{min(3, candle_pattern_score)})")
+    elif candle_pattern_score < 0:
+        bearish += min(3, abs(candle_pattern_score))
+        reasons.append(f"Bearish candlestick confirmation: {candle_pattern} (+{min(3, abs(candle_pattern_score))})")
+    elif candle_bias == "Neutral" and candle_pattern != "No clear pattern":
+        reasons.append(f"Neutral / indecision candle: {candle_pattern}")
 
     if volume_spike:
         reasons.append("Volume spike present")
@@ -1790,6 +1960,10 @@ def analyze_signal(
         "rsi": rsi,
         "macd": macd,
         "macd_signal": macd_signal,
+        "macd_hist": float(latest["MACD_Hist"]) if pd.notna(latest.get("MACD_Hist", np.nan)) else 0.0,
+        "candle_pattern": candle_pattern,
+        "candle_pattern_bias": candle_bias,
+        "candle_pattern_score": candle_pattern_score,
         "atr": atr,
         "stoch_k": stoch_k,
         "stoch_d": stoch_d,
@@ -3181,6 +3355,39 @@ paper_state = load_paper_state()
 paper_balance = float(paper_state.loc[0, "Balance"])
 risk_ok, risk_msg = risk_check_before_trade()
 
+st.subheader("Japanese Heikin-Ashi Price Action Chart")
+chart_ha = convert_to_heikin_ashi(data.tail(180))
+if not chart_ha.empty:
+    price_fig = go.Figure()
+    price_fig.add_trace(go.Candlestick(
+        x=chart_ha.index, open=chart_ha["HA_Open"], high=chart_ha["HA_High"],
+        low=chart_ha["HA_Low"], close=chart_ha["HA_Close"], name="Heikin-Ashi"
+    ))
+    if "EMA20" in chart_ha.columns:
+        price_fig.add_trace(go.Scatter(x=chart_ha.index, y=chart_ha["EMA20"], mode="lines", name="EMA 20"))
+    if "EMA50" in chart_ha.columns:
+        price_fig.add_trace(go.Scatter(x=chart_ha.index, y=chart_ha["EMA50"], mode="lines", name="EMA 50"))
+    if "VWAP" in chart_ha.columns:
+        price_fig.add_trace(go.Scatter(x=chart_ha.index, y=chart_ha["VWAP"], mode="lines", name="VWAP"))
+    price_fig.update_layout(height=520, template="plotly_dark", xaxis_rangeslider_visible=False,
+                            title=f"{selected} — Japanese Heikin-Ashi Price Action | {timeframe}",
+                            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0))
+    st.plotly_chart(price_fig, use_container_width=True)
+
+macd_fig = go.Figure()
+macd_fig.add_trace(go.Bar(x=data.index, y=data["MACD_Hist"], name="MACD Histogram"))
+macd_fig.add_trace(go.Scatter(x=data.index, y=data["MACD"], mode="lines", name="MACD"))
+macd_fig.add_trace(go.Scatter(x=data.index, y=data["SignalLine"], mode="lines", name="Signal Line"))
+macd_fig.update_layout(height=260, template="plotly_dark", title="MACD Momentum")
+st.plotly_chart(macd_fig, use_container_width=True)
+
+latest_pattern_row = data.iloc[-1]
+st.info(f"Latest candle pattern: {latest_pattern_row.get('CandlePattern', 'N/A')} | Bias: {latest_pattern_row.get('CandlePatternBias', 'N/A')} | Pattern score: {latest_pattern_row.get('CandlePatternScore', 0)}")
+with st.expander("Candlestick Pattern Library — latest detected patterns"):
+    pattern_cols = ["Hammer", "HangingMan", "InvertedHammer", "ShootingStar", "Doji", "SpinningTop", "MarubozuBull", "MarubozuBear", "BullishEngulfing", "BearishEngulfing", "PiercingLine", "DarkCloudCover", "MorningStar", "EveningStar", "ThreeWhiteSoldiers", "ThreeBlackCrows", "TweezerBottom", "TweezerTop", "InsideBar", "OutsideBar"]
+    active_patterns = [name for name in pattern_cols if bool(latest_pattern_row.get(name, False))]
+    st.write(", ".join(active_patterns) if active_patterns else "No recognized pattern on the latest completed candle.")
+
 st.subheader("Live Signal Analytics")
 
 if data_source == "Angel":
@@ -3274,6 +3481,16 @@ with b5:
 with b6:
     st.metric("ATR", round(analysis["atr"], 2))
 
+mac1, mac2, mac3, mac4 = st.columns(4)
+with mac1:
+    st.metric("MACD", round(float(analysis["macd"]), 4))
+with mac2:
+    st.metric("MACD Signal", round(float(analysis["macd_signal"]), 4))
+with mac3:
+    st.metric("MACD Histogram", round(float(analysis["macd_hist"]), 4))
+with mac4:
+    st.metric("Candle Pattern Score", analysis["candle_pattern_score"])
+
 c1, c2, c3, c4, c5, c6 = st.columns(6)
 with c1:
     st.metric("Support", round(analysis["support"], 2))
@@ -3355,6 +3572,56 @@ if news_filter_enabled:
         st.dataframe(pd.DataFrame(news_info["events"]), use_container_width=True)
     else:
         st.info(news_info["message"])
+
+st.subheader("Major Stocks Scanner — NIFTY Top 30 | CMP & % Change")
+st.caption("30 major NIFTY constituents scanned on 3m, 5m, 10m and 15m. Scanner uses Yahoo Finance 1-minute candles resampled to each timeframe; unavailable feeds are shown as N/A, never fabricated.")
+scanner_enabled = st.checkbox("Enable NIFTY Top 30 multi-timeframe scanner", value=True, key="enable_nifty_top30_scanner")
+if scanner_enabled:
+    with st.spinner("Scanning NIFTY Top 30 stocks across 3m / 5m / 10m / 15m..."):
+        nifty30_df = build_nifty_top30_scanner()
+    if nifty30_df.empty:
+        st.warning("NIFTY Top 30 scanner data is currently unavailable. Check Yahoo Finance connectivity or retry after a short interval.")
+    else:
+        breadth = scanner_breadth_summary(nifty30_df)
+        st.markdown("**NIFTY market breadth by timeframe**")
+        st.dataframe(breadth, use_container_width=True, hide_index=True)
+        overall_row = breadth[breadth["Timeframe"] == "Overall (all 4 TF votes)"]
+        if not overall_row.empty:
+            br = overall_row.iloc[0]
+            k1,k2,k3,k4 = st.columns(4)
+            k1.metric("Overall Bullish %", f"{br['Bullish %']:.1f}%", f"{int(br['Bullish'])} bullish votes")
+            k2.metric("Overall Bearish %", f"{br['Bearish %']:.1f}%", f"{int(br['Bearish'])} bearish votes")
+            k3.metric("Neutral Votes", int(br["Neutral"]))
+            k4.metric("Total Valid TF Votes", int(br["Coverage"]))
+        st.markdown("**Company-wise CMP, daily % change and 3m / 5m / 10m / 15m trend**")
+        display_cols=["Company","CMP","% Change","3m","5m","10m","15m","Overall","Score"]
+        st.dataframe(nifty30_df[display_cols].sort_values("Score", ascending=False), use_container_width=True, hide_index=True)
+        bull_tab, bear_tab, neutral_tab = st.tabs(["Bullish Companies", "Bearish Companies", "Neutral / N/A"])
+        with bull_tab:
+            bullish_companies=nifty30_df[nifty30_df["Overall"]=="Bullish"].sort_values("Score",ascending=False)
+            if bullish_companies.empty: st.info("No bullish companies confirmed across the selected timeframes.")
+            else: st.dataframe(bullish_companies[display_cols],use_container_width=True,hide_index=True)
+        with bear_tab:
+            bearish_companies=nifty30_df[nifty30_df["Overall"]=="Bearish"].sort_values("Score",ascending=True)
+            if bearish_companies.empty: st.info("No bearish companies confirmed across the selected timeframes.")
+            else: st.dataframe(bearish_companies[display_cols],use_container_width=True,hide_index=True)
+        with neutral_tab:
+            neutral_companies=nifty30_df[nifty30_df["Overall"].isin(["Neutral","N/A"]) ]
+            if neutral_companies.empty: st.info("No neutral / unavailable companies.")
+            else: st.dataframe(neutral_companies[display_cols],use_container_width=True,hide_index=True)
+        top_bull=nifty30_df[nifty30_df["Overall"]=="Bullish"].sort_values("Score",ascending=False).head(5)
+        top_bear=nifty30_df[nifty30_df["Overall"]=="Bearish"].sort_values("Score",ascending=True).head(5)
+        top_b1,top_b2=st.columns(2)
+        with top_b1:
+            st.markdown("**Top Bullish Companies**")
+            if not top_bull.empty: st.dataframe(top_bull[["Company","CMP","% Change","3m","5m","10m","15m","Score"]],use_container_width=True,hide_index=True)
+            else: st.info("No top bullish candidate currently.")
+        with top_b2:
+            st.markdown("**Top Bearish Companies**")
+            if not top_bear.empty: st.dataframe(top_bear[["Company","CMP","% Change","3m","5m","10m","15m","Score"]],use_container_width=True,hide_index=True)
+            else: st.info("No top bearish candidate currently.")
+else:
+    st.info("NIFTY Top 30 scanner is paused. Enable the checkbox to load the breadth dashboard.")
 
 st.subheader("Backtest Analytics")
 st.caption(f"Backtest input: {len(backtest_data):,} candles | {backtest_data.index.min()} to {backtest_data.index.max()} | {selected} | {timeframe}")
