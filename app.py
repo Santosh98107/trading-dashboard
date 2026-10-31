@@ -16,7 +16,7 @@ import streamlit as st
 import yfinance as yf
 
 # Visible deployment marker: confirms which source file Streamlit Cloud is running.
-APP_BUILD_ID = "2026-11-01-NEWS-API-TEST-CONNECTION-15"
+APP_BUILD_ID = "2026-11-01-SIGNAL-ENGINE-AUDIT-16"
 # Optional integrations: Yahoo mode must still start if Angel SDK/TOTP or
 # the auto-refresh helper is not installed.
 try:
@@ -82,7 +82,7 @@ MANDATORY_MTF_ALIGN_COUNT = 2
 SIGNAL_EXPIRY_MINUTES = 3
 HIGH_QUALITY_SIGNAL_MIN_SCORE = 75
 MAX_SIGNAL_DUPLICATE_WINDOW_MIN = 10
-NO_TRADE_NEAR_SR_PCT = 0.5
+NO_TRADE_NEAR_SR_PCT = 0.08  # legacy display threshold; engine uses an ATR-aware level buffer
 GAP_FILTER_PCT = 0.75
 HIGH_VOL_ATR_PCT = 1.8
 SIDEWAYS_ADX_MAX = 18
@@ -1613,7 +1613,7 @@ MAJOR_INDIAN_MARKET_STOCKS = [
 
 def classify_stock_timeframe(frame):
     """Return a transparent trend classification using EMA, MACD, RSI and HA direction."""
-    if frame is None or frame.empty or len(frame) < 25:
+    if frame is None or frame.empty or len(frame) < 55:
         return "N/A", 0
     try:
         x = add_indicators(frame).replace([np.inf, -np.inf], np.nan).dropna(subset=["EMA20", "EMA50", "MACD", "SignalLine", "RSI"])
@@ -2568,73 +2568,82 @@ def get_dynamic_option_chain_symbol(selected_symbol):
 
 def parse_option_chain_metrics(symbol="NIFTY"):
     data = get_option_chain_snapshot(symbol)
+    empty = {"pcr": None, "oi_bias": "N/A", "long_unwinding": False, "short_covering": False,
+             "call_oi": 0, "put_oi": 0, "call_change_oi": 0, "put_change_oi": 0}
     if not data:
-        return {
-            "pcr": None,
-            "oi_bias": "Neutral",
-            "long_unwinding": False,
-            "short_covering": False,
-            "call_oi": 0,
-            "put_oi": 0
-        }
+        return empty
     try:
-        total_ce, total_pe = 0, 0
-        ce_change_oi, pe_change_oi = 0, 0
-
-        for item in data.get("records", {}).get("data", []):
-            if "CE" in item:
-                total_ce += item["CE"].get("openInterest", 0)
-                ce_change_oi += item["CE"].get("changeinOpenInterest", 0)
-            if "PE" in item:
-                total_pe += item["PE"].get("openInterest", 0)
-                pe_change_oi += item["PE"].get("changeinOpenInterest", 0)
-
+        total_ce = total_pe = ce_change_oi = pe_change_oi = 0.0
+        records = data.get("records", {}).get("data", [])
+        for item in records:
+            ce = item.get("CE") or {}
+            pe = item.get("PE") or {}
+            total_ce += float(ce.get("openInterest") or 0)
+            total_pe += float(pe.get("openInterest") or 0)
+            ce_change_oi += float(ce.get("changeinOpenInterest") or 0)
+            pe_change_oi += float(pe.get("changeinOpenInterest") or 0)
         pcr = round(total_pe / total_ce, 2) if total_ce > 0 else None
-        oi_bias = "Bullish" if total_pe > total_ce else "Bearish" if total_ce > total_pe else "Neutral"
-        long_unwinding = ce_change_oi < 0 and pe_change_oi > 0
-        short_covering = ce_change_oi > 0 and pe_change_oi < 0
-
-        return {
-            "pcr": pcr,
-            "oi_bias": oi_bias,
-            "long_unwinding": long_unwinding,
-            "short_covering": short_covering,
-            "call_oi": total_ce,
-            "put_oi": total_pe
-        }
-    except Exception as e:
-        log_app_error("parse_option_chain_metrics", e)
-        return {
-            "pcr": None,
-            "oi_bias": "Neutral",
-            "long_unwinding": False,
-            "short_covering": False,
-            "call_oi": 0,
-            "put_oi": 0
-        }
+        # The old version called Put OI > Call OI "Bullish" and then scored both
+        # PCR and OI, double-counting the same information. Keep OI as a descriptive
+        # change-in-OI comparison and do not turn it into a directional score.
+        oi_total_change = abs(ce_change_oi) + abs(pe_change_oi)
+        if oi_total_change <= 0 or abs(pe_change_oi - ce_change_oi) < 0.20 * oi_total_change:
+            oi_bias = "Neutral"
+        elif pe_change_oi > ce_change_oi:
+            oi_bias = "Put OI change higher"
+        else:
+            oi_bias = "Call OI change higher"
+        return {"pcr": pcr, "oi_bias": oi_bias, "long_unwinding": False, "short_covering": False,
+                "call_oi": int(total_ce), "put_oi": int(total_pe),
+                "call_change_oi": int(ce_change_oi), "put_change_oi": int(pe_change_oi)}
+    except Exception as exc:
+        log_app_error("parse_option_chain_metrics", exc)
+        return empty
 
 
 # =========================================================
 # SIGNAL ANALYSIS HELPERS
 # =========================================================
 def detect_gap_filter(df):
+    """Detect an actual session gap, not the open-to-previous-close noise of every intraday candle."""
+    neutral = {"gap_up": False, "gap_down": False, "gap_pct": 0.0, "allow_trade": True}
     try:
-        if len(df) < 2:
-            return {"gap_up": False, "gap_down": False, "gap_pct": 0.0, "allow_trade": True}
-        latest = df.iloc[-1]
-        prev = df.iloc[-2]
-        prev_close = float(prev["Close"])
-        current_open = float(latest["Open"])
-        gap_pct = ((current_open - prev_close) / prev_close) * 100 if prev_close else 0.0
+        if df is None or len(df) < 2 or not {"Open", "Close"}.issubset(df.columns):
+            return neutral
+        idx = pd.to_datetime(df.index, errors="coerce")
+        work = df.loc[~idx.isna(), ["Open", "Close"]].copy()
+        work.index = idx[~idx.isna()]
+        if len(work) < 2:
+            return neutral
+        dates = pd.Series([x.date() for x in work.index], index=work.index)
+        unique_dates = list(pd.unique(dates))
+        if len(unique_dates) >= 2:
+            current_date = unique_dates[-1]
+            previous_date = unique_dates[-2]
+            current_session = work.loc[dates == current_date]
+            previous_session = work.loc[dates == previous_date]
+            current_open = float(current_session["Open"].iloc[0])
+            previous_close = float(previous_session["Close"].iloc[-1])
+        else:
+            # With only one intraday session in the sample, there is no reliable
+            # previous-session close. Do not misclassify an ordinary candle as a gap.
+            if len(work) >= 2 and (work.index[-1] - work.index[0]).total_seconds() >= 20 * 3600:
+                current_open = float(work["Open"].iloc[-1])
+                previous_close = float(work["Close"].iloc[-2])
+            else:
+                return neutral
+        if not np.isfinite(previous_close) or previous_close <= 0 or not np.isfinite(current_open):
+            return neutral
+        gap_pct = ((current_open - previous_close) / previous_close) * 100.0
         return {
             "gap_up": gap_pct >= GAP_FILTER_PCT,
             "gap_down": gap_pct <= -GAP_FILTER_PCT,
-            "gap_pct": round(gap_pct, 2),
-            "allow_trade": abs(gap_pct) < 2.5
+            "gap_pct": round(float(gap_pct), 2),
+            "allow_trade": abs(gap_pct) < 2.5,
         }
-    except Exception as e:
-        log_app_error("detect_gap_filter", e)
-        return {"gap_up": False, "gap_down": False, "gap_pct": 0.0, "allow_trade": True}
+    except Exception as exc:
+        log_app_error("detect_gap_filter", exc)
+        return neutral
 
 
 def detect_market_regime(df):
@@ -2751,548 +2760,457 @@ def session_filter(df, tf):
     if tf == "1d":
         return {"valid": True, "message": "Daily timeframe - session filter skipped"}
     try:
-        last_ts = pd.to_datetime(df.index[-1])
+        if df is None or df.empty:
+            return {"valid": False, "message": "No candle timestamp available"}
+        last_ts = pd.Timestamp(df.index[-1])
+        if last_ts.tzinfo is not None:
+            last_ts = last_ts.tz_convert("Asia/Kolkata")
         current_t = last_ts.time()
         if current_t < time(9, 20):
-            return {"valid": False, "message": "Avoid first few minutes after open"}
+            return {"valid": False, "message": "Avoid first 5-10 minutes after open"}
         if time(12, 15) <= current_t <= time(13, 15):
-            return {"valid": False, "message": "Lunch low momentum zone"}
+            return {"valid": False, "message": "Lunch low-momentum window"}
         return {"valid": True, "message": "Session timing okay"}
     except Exception:
-        return {"valid": True, "message": "Session filter unavailable"}
+        return {"valid": True, "message": "Session filter unavailable; not used as a blocker"}
 
 
-def calculate_win_chance(bullish, bearish, adx, volume_spike, breakout, breakdown, htf_bias, sideways, rr_ratio, backtest_win_rate):
-    score = 50
-    score += (bullish - bearish) * 4
-    if adx > 25:
-        score += 8
-    elif adx < 18:
-        score -= 10
-    if volume_spike:
-        score += 5
-    if breakout:
-        score += 6
-    if breakdown:
-        score += 6
-    if htf_bias in ["bullish", "bearish"]:
-        score += 5
-    if sideways:
-        score -= 12
-    if rr_ratio is not None:
-        if rr_ratio >= 2:
-            score += 6
-        elif rr_ratio < 1.2:
-            score -= 8
-    if backtest_win_rate >= 60:
-        score += 8
-    elif backtest_win_rate < 45:
-        score -= 8
-    return int(max(5, min(score, 95)))
+def calculate_win_chance(backtest_win_rate, backtest_trade_count=0, backtest_is_comparable=False):
+    """Return only a measured same-strategy historical rate; never a heuristic probability."""
+    try:
+        count = int(backtest_trade_count or 0)
+        rate = float(backtest_win_rate)
+        if not backtest_is_comparable or count < 30 or not np.isfinite(rate):
+            return None
+        return round(float(np.clip(rate, 0.0, 100.0)), 1)
+    except Exception:
+        return None
 
 
 def analyze_signal(
     df,
     htf_bias=None,
     timeframe_label="1d",
-    backtest_win_rate=50,
+    backtest_win_rate=0.0,
     mtf_bull_count=0,
     mtf_bear_count=0,
+    mtf_available_count=0,
     option_metrics=None,
-    news_info=None
+    news_info=None,
+    backtest_trade_count=0,
+    backtest_is_comparable=False,
 ):
+    """Explainable multi-factor signal engine.
+
+    Scores are directional evidence, not probabilities. MTF/volume/option data
+    are treated as unavailable rather than bearish when providers do not return them.
+    """
+    empty = df is None or not isinstance(df, pd.DataFrame) or len(df) < 2
+    if empty:
+        return {
+            "close_price": 0.0, "ema20": 0.0, "ema50": 0.0, "ema200": 0.0,
+            "vwap": None, "rsi": 50.0, "macd": 0.0, "macd_signal": 0.0,
+            "macd_hist": 0.0, "candle_pattern": "N/A", "candle_pattern_bias": "Neutral",
+            "candle_pattern_score": 0, "atr": 0.0, "stoch_k": 50.0, "stoch_d": 50.0,
+            "adx": 0.0, "support": 0.0, "resistance": 0.0, "volume_spike": False,
+            "breakout": False, "breakdown": False, "body_strength": 0.0, "sideways": False,
+            "signal_text": "NO TRADE", "signal_type": "neutral", "strength": "Low",
+            "confidence": None, "win_chance": None, "win_chance_sample_size": 0,
+            "stop_loss": None, "partial_exit": None, "target1": None, "target2": None,
+            "target3": None, "trailing_stop": None, "rr_ratio": None, "reasons": ["At least two valid candles are required"],
+            "no_trade_reason": "At least two valid candles are required", "no_trade_reasons": ["At least two valid candles are required"],
+            "bullish_score": 0, "bearish_score": 0, "directional_bias": "Neutral",
+            "session_message": "N/A", "supertrend_direction": 0, "ha_bullish": False,
+            "ha_bearish": False, "ha_trend_up": False, "ha_trend_down": False,
+            "validation_score": 0, "strategy_grade": "D", "trade_quality_score": 0,
+            "market_regime": "Unknown", "trending_market": False, "sideways_market": False,
+            "high_volatility_market": False, "atr_pct": 0.0, "gap_up": False, "gap_down": False,
+            "gap_pct": 0.0, "mtf_bull_ok": False, "mtf_bear_ok": False, "no_trade_zone": False,
+            "oi_bias": "N/A", "pcr": None, "long_unwinding": False, "short_covering": False,
+            "news_message": "No analysis available", "trade_allowed": False,
+            "setup_confidence_label": "Unavailable", "volume_data_available": False,
+            "mtf_available_count": 0, "directional_edge": 0, "ema200_available": False,
+        }
+
     latest = df.iloc[-1]
     prev = df.iloc[-2]
+
+    def num(row, key, default=0.0):
+        try:
+            value = float(row.get(key, default))
+            return value if np.isfinite(value) else float(default)
+        except Exception:
+            return float(default)
+
+    close_price = num(latest, "Close")
+    ema20 = num(latest, "EMA20", close_price)
+    ema50 = num(latest, "EMA50", close_price)
+    ema200 = num(latest, "EMA200", close_price)
+    # EMA200 is not treated as a confirmed long-term trend until 200 real bars exist.
+    ema200_available = len(df) >= 200 and pd.notna(latest.get("EMA200", np.nan)) and np.isfinite(ema200)
+    prev_ema20 = num(prev, "EMA20", ema20)
+    prev_ema50 = num(prev, "EMA50", ema50)
+    vwap_value = num(latest, "VWAP", close_price)
+    rsi = num(latest, "RSI", 50.0)
+    prev_rsi = num(prev, "RSI", 50.0)
+    macd = num(latest, "MACD", 0.0)
+    macd_signal = num(latest, "SignalLine", 0.0)
+    macd_hist = num(latest, "MACD_Hist", macd - macd_signal)
+    prev_macd_hist = num(prev, "MACD_Hist", macd_hist)
+    atr = max(0.0, num(latest, "ATR", 0.0))
+    stoch_k = num(latest, "StochK", 50.0)
+    stoch_d = num(latest, "StochD", 50.0)
+    adx = max(0.0, num(latest, "ADX", 0.0))
+    plus_di = num(latest, "PlusDI", 0.0)
+    minus_di = num(latest, "MinusDI", 0.0)
+    supertrend_dir = int(num(latest, "SuperTrendDirection", 0))
+    volume_spike = bool(latest.get("Volume_Spike", False)) if pd.notna(latest.get("Volume_Spike", False)) else False
+    breakout = bool(latest.get("Breakout", False)) if pd.notna(latest.get("Breakout", False)) else False
+    breakdown = bool(latest.get("Breakdown", False)) if pd.notna(latest.get("Breakdown", False)) else False
+    retest_bull = bool(latest.get("RetestBull", False)) if pd.notna(latest.get("RetestBull", False)) else False
+    retest_bear = bool(latest.get("RetestBear", False)) if pd.notna(latest.get("RetestBear", False)) else False
+    body_strength = max(0.0, min(1.0, num(latest, "BodyStrength", 0.0)))
+
+    recent_volume = pd.to_numeric(df.get("Volume", pd.Series(0, index=df.index)).tail(20), errors="coerce").fillna(0)
+    volume_data_available = bool((recent_volume > 0).sum() >= max(5, int(len(recent_volume) * 0.6)))
 
     ha_df = convert_to_heikin_ashi(df.tail(10))
     ha_latest = ha_df.iloc[-1]
     ha_prev = ha_df.iloc[-2]
+    ha_bullish = bool(ha_latest["HA_Close"] > ha_latest["HA_Open"])
+    ha_bearish = bool(ha_latest["HA_Close"] < ha_latest["HA_Open"])
+    ha_trend_up = ha_bullish and bool(ha_prev["HA_Close"] > ha_prev["HA_Open"])
+    ha_trend_down = ha_bearish and bool(ha_prev["HA_Close"] < ha_prev["HA_Open"])
 
-    ha_bullish = ha_latest["HA_Close"] > ha_latest["HA_Open"]
-    ha_bearish = ha_latest["HA_Close"] < ha_latest["HA_Open"]
-    ha_trend_up = ha_bullish and (ha_prev["HA_Close"] > ha_prev["HA_Open"])
-    ha_trend_down = ha_bearish and (ha_prev["HA_Close"] < ha_prev["HA_Open"])
+    # Use completed prior bars for S/R so the current candle cannot define its own level.
+    prior_window = df.iloc[max(0, len(df) - 21):-1]
+    resistance = float(pd.to_numeric(prior_window["High"], errors="coerce").max()) if not prior_window.empty else close_price
+    support = float(pd.to_numeric(prior_window["Low"], errors="coerce").min()) if not prior_window.empty else close_price
+    if not np.isfinite(resistance):
+        resistance = close_price
+    if not np.isfinite(support):
+        support = close_price
+    distance_to_resistance = ((resistance - close_price) / close_price) * 100 if close_price > 0 else 0.0
+    distance_to_support = ((close_price - support) / close_price) * 100 if close_price > 0 else 0.0
 
-    close_price = float(latest["Close"])
-    ema20 = float(latest["EMA20"])
-    ema50 = float(latest["EMA50"])
-    ema200 = float(latest["EMA200"]) if pd.notna(latest["EMA200"]) else close_price
-    ema20_slope = ema20 - float(prev["EMA20"])
-    vwap = float(latest["VWAP"]) if pd.notna(latest["VWAP"]) else close_price
-    rsi = float(latest["RSI"])
-    macd = float(latest["MACD"])
-    macd_signal = float(latest["SignalLine"])
-    atr = float(latest["ATR"]) if pd.notna(latest["ATR"]) else 0.0
-    stoch_k = float(latest["StochK"]) if pd.notna(latest["StochK"]) else 50.0
-    stoch_d = float(latest["StochD"]) if pd.notna(latest["StochD"]) else 50.0
-    adx = float(latest["ADX"]) if pd.notna(latest["ADX"]) else 0.0
-    support = float(latest["PivotLow"]) if pd.notna(latest["PivotLow"]) else close_price
-    resistance = float(latest["PivotHigh"]) if pd.notna(latest["PivotHigh"]) else close_price
-    supertrend_dir = int(latest["SuperTrendDirection"]) if pd.notna(latest["SuperTrendDirection"]) else 0
-    plus_di = float(latest["PlusDI"]) if pd.notna(latest["PlusDI"]) else 0
-    minus_di = float(latest["MinusDI"]) if pd.notna(latest["MinusDI"]) else 0
-
-    distance_to_resistance = ((resistance - close_price) / close_price) * 100 if close_price else 0
-    distance_to_support = ((close_price - support) / close_price) * 100 if close_price else 0
-
-    volume_spike = bool(latest["Volume_Spike"])
-    breakout = bool(latest["Breakout"])
-    breakdown = bool(latest["Breakdown"])
-    body_strength = float(latest["BodyStrength"]) if pd.notna(latest["BodyStrength"]) else 0
-
-    bullish = 0
-    bearish = 0
+    bullish = 0.0
+    bearish = 0.0
     reasons = []
 
+    # Trend structure: intentionally separate, modest weights to limit correlated double-counting.
     if ema20 > ema50:
-        bullish += 1
-        reasons.append("EMA20 > EMA50 bullish trend")
-    else:
-        bearish += 1
-        reasons.append("EMA20 < EMA50 bearish trend")
-
-    if close_price > ema20 > ema50:
-        bullish += 1
-        reasons.append("Perfect bullish EMA alignment")
-    if close_price < ema20 < ema50:
-        bearish += 1
-        reasons.append("Perfect bearish EMA alignment")
-
+        bullish += 2; reasons.append("EMA20 above EMA50 (+2 bullish)")
+    elif ema20 < ema50:
+        bearish += 2; reasons.append("EMA20 below EMA50 (+2 bearish)")
     if close_price > ema20:
-        bullish += 1
-        reasons.append("Price above EMA20")
+        bullish += 1; reasons.append("Price above EMA20 (+1 bullish)")
+    elif close_price < ema20:
+        bearish += 1; reasons.append("Price below EMA20 (+1 bearish)")
+    if ema200_available:
+        if close_price > ema200:
+            bullish += 2; reasons.append("Price above mature EMA200 (+2 bullish)")
+        elif close_price < ema200:
+            bearish += 2; reasons.append("Price below mature EMA200 (+2 bearish)")
     else:
-        bearish += 1
-        reasons.append("Price below EMA20")
-
-    if close_price > ema200:
-        bullish += 2
-        reasons.append("Price above EMA200")
-    elif close_price < ema200:
-        bearish += 2
-        reasons.append("Price below EMA200")
-
-    if close_price > vwap:
-        bullish += 1
-        reasons.append("Price above VWAP")
-    else:
-        bearish += 1
-        reasons.append("Price below VWAP")
-
-    if rsi > 60:
-        bullish += 1
-        reasons.append("RSI bullish strength")
-    elif rsi < 40:
-        bearish += 1
-        reasons.append("RSI bearish weakness")
-    else:
-        reasons.append("RSI neutral")
-
-    if rsi > float(prev["RSI"]):
-        bullish += 1
-        reasons.append("RSI momentum increasing")
-    elif rsi < float(prev["RSI"]):
-        bearish += 1
-        reasons.append("RSI momentum decreasing")
-
-    if macd > macd_signal:
-        bullish += 1
-        reasons.append("MACD above signal")
-    else:
-        bearish += 1
-        reasons.append("MACD below signal")
-
-    if latest["MACD_Hist"] > prev["MACD_Hist"]:
-        bullish += 1
-        reasons.append("MACD momentum increasing")
-    elif latest["MACD_Hist"] < prev["MACD_Hist"]:
-        bearish += 1
-        reasons.append("MACD momentum decreasing")
-
-    if ema20_slope > 0:
-        bullish += 1
-        reasons.append("EMA20 rising")
-    elif ema20_slope < 0:
-        bearish += 1
-        reasons.append("EMA20 falling")
-
-    if adx > 20:
-        reasons.append("ADX trend strength okay")
-        if plus_di > minus_di:
-            bullish += 1
-        else:
-            bearish += 1
-    else:
-        reasons.append("ADX low / sideways risk")
-
-    if adx > 30:
-        if plus_di > minus_di:
-            bullish += 1
-            reasons.append("Strong bullish trend")
-        else:
-            bearish += 1
-            reasons.append("Strong bearish trend")
-
-    if stoch_k > stoch_d and stoch_k < 80:
-        bullish += 1
-        reasons.append("Stochastic bullish crossover")
-    elif stoch_k < stoch_d and stoch_k > 20:
-        bearish += 1
-        reasons.append("Stochastic bearish crossover")
-
-    if prev["EMA20"] <= prev["EMA50"] and latest["EMA20"] > latest["EMA50"]:
-        bullish += 2
-        reasons.append("Fresh bullish EMA crossover")
-    if prev["EMA20"] >= prev["EMA50"] and latest["EMA20"] < latest["EMA50"]:
-        bearish += 2
-        reasons.append("Fresh bearish EMA crossover")
-
+        reasons.append(f"EMA200 not mature ({len(df)}/200 bars); excluded from score and trend votes")
+    if close_price > vwap_value:
+        bullish += 1; reasons.append("Price above VWAP (+1 bullish)")
+    elif close_price < vwap_value:
+        bearish += 1; reasons.append("Price below VWAP (+1 bearish)")
     if supertrend_dir == 1:
-        bullish += 3
-        reasons.append("SuperTrend bullish")
+        bullish += 2; reasons.append("SuperTrend bullish (+2)")
     elif supertrend_dir == -1:
-        bearish += 3
-        reasons.append("SuperTrend bearish")
+        bearish += 2; reasons.append("SuperTrend bearish (+2)")
 
-    if ha_bullish:
-        bullish += 1
-        reasons.append("Heikin Ashi bullish candle")
-    if ha_bearish:
-        bearish += 1
-        reasons.append("Heikin Ashi bearish candle")
-    if ha_trend_up:
-        bullish += 2
-        reasons.append("Heikin Ashi bullish continuation")
-    if ha_trend_down:
-        bearish += 2
-        reasons.append("Heikin Ashi bearish continuation")
+    # Momentum: RSI zones avoid the old 55/45 cliff; MACD is a separate confirmation.
+    if rsi >= 55:
+        bullish += 2; reasons.append("RSI bullish zone (+2)")
+    elif rsi >= 51:
+        bullish += 1; reasons.append("RSI mildly bullish (+1)")
+    elif rsi <= 45:
+        bearish += 2; reasons.append("RSI bearish zone (+2)")
+    elif rsi <= 49:
+        bearish += 1; reasons.append("RSI mildly bearish (+1)")
+    if rsi > prev_rsi + 0.25:
+        bullish += 1; reasons.append("RSI rising (+1)")
+    elif rsi < prev_rsi - 0.25:
+        bearish += 1; reasons.append("RSI falling (+1)")
+    if macd > macd_signal:
+        bullish += 2; reasons.append("MACD above signal (+2)")
+    elif macd < macd_signal:
+        bearish += 2; reasons.append("MACD below signal (+2)")
+    if macd_hist > prev_macd_hist:
+        bullish += 1; reasons.append("MACD histogram improving (+1)")
+    elif macd_hist < prev_macd_hist:
+        bearish += 1; reasons.append("MACD histogram weakening (+1)")
+    if ema20 > prev_ema20:
+        bullish += 1; reasons.append("EMA20 slope rising (+1)")
+    elif ema20 < prev_ema20:
+        bearish += 1; reasons.append("EMA20 slope falling (+1)")
+    if adx >= 18:
+        if plus_di > minus_di:
+            bullish += 2; reasons.append("Directional index +DI dominant (+2)")
+        elif minus_di > plus_di:
+            bearish += 2; reasons.append("Directional index -DI dominant (+2)")
+    else:
+        reasons.append("ADX below 18: trend-strength confirmation is weak")
+    if stoch_k > stoch_d and stoch_k < 80:
+        bullish += 1; reasons.append("Stochastic bullish crossover (+1)")
+    elif stoch_k < stoch_d and stoch_k > 20:
+        bearish += 1; reasons.append("Stochastic bearish crossover (+1)")
 
-    if breakout:
-        bullish += 2
-        reasons.append("Resistance breakout")
-        if volume_spike:
-            bullish += 2
-            reasons.append("Breakout with volume")
-
-    if breakdown:
-        bearish += 2
-        reasons.append("Support breakdown")
-        if volume_spike:
-            bearish += 2
-            reasons.append("Breakdown with volume")
-
-    if bool(latest.get("RetestBull", False)):
-        bullish += 3
-        reasons.append("Bullish retest confirmed")
-    if bool(latest.get("RetestBear", False)):
-        bearish += 3
-        reasons.append("Bearish retest confirmed")
-
-    # Candlestick library contribution: cap one candle's total influence to avoid score inflation.
+    # Price-action confirmation. Patterns are capped and do not override trend/momentum.
     candle_pattern = str(latest.get("CandlePattern", "No clear pattern"))
     candle_bias = str(latest.get("CandlePatternBias", "Neutral"))
-    candle_pattern_score = int(latest.get("CandlePatternScore", 0) or 0)
-    if candle_pattern_score > 0:
-        bullish += min(3, candle_pattern_score)
-        reasons.append(f"Bullish candlestick confirmation: {candle_pattern} (+{min(3, candle_pattern_score)})")
-    elif candle_pattern_score < 0:
-        bearish += min(3, abs(candle_pattern_score))
-        reasons.append(f"Bearish candlestick confirmation: {candle_pattern} (+{min(3, abs(candle_pattern_score))})")
-    elif candle_bias == "Neutral" and candle_pattern != "No clear pattern":
-        reasons.append(f"Neutral / indecision candle: {candle_pattern}")
-
-    if volume_spike:
-        reasons.append("Volume spike present")
-        if close_price > ema20:
-            bullish += 1
+    try:
+        candle_pattern_score = int(num(latest, "CandlePatternScore", 0))
+    except Exception:
+        candle_pattern_score = 0
+    if candle_pattern_score > 0 or candle_bias == "Bullish":
+        bullish += 1; reasons.append(f"Bullish candle pattern: {candle_pattern} (+1)")
+    elif candle_pattern_score < 0 or candle_bias == "Bearish":
+        bearish += 1; reasons.append(f"Bearish candle pattern: {candle_pattern} (+1)")
+    if ha_trend_up:
+        bullish += 1; reasons.append("Two-candle Heikin-Ashi bullish trend (+1)")
+    elif ha_trend_down:
+        bearish += 1; reasons.append("Two-candle Heikin-Ashi bearish trend (+1)")
+    if breakout or retest_bull:
+        bullish += 2; reasons.append("Bullish breakout/retest (+2)")
+    if breakdown or retest_bear:
+        bearish += 2; reasons.append("Bearish breakdown/retest (+2)")
+    if volume_data_available and volume_spike:
+        if close_price >= num(latest, "Open", close_price):
+            bullish += 1; reasons.append("Above-average volume on up candle (+1)")
         else:
-            bearish += 1
+            bearish += 1; reasons.append("Above-average volume on down candle (+1)")
+    elif not volume_data_available:
+        reasons.append("Volume unavailable/non-representative for this instrument; volume is not used as a veto")
 
-    if body_strength > 0.6:
-        reasons.append("Strong candle body")
-        if close_price > ema20:
-            bullish += 1
-        else:
-            bearish += 1
-
-    if bullish > bearish and distance_to_resistance < NO_TRADE_NEAR_SR_PCT:
-        bullish -= 2
-        reasons.append("Too close to resistance")
-    if bearish > bullish and distance_to_support < NO_TRADE_NEAR_SR_PCT:
-        bearish -= 2
-        reasons.append("Too close to support")
-
+    # Higher timeframe and MTF are confirmations, not duplicated fake counts.
+    mtf_available_count = max(0, int(mtf_available_count or 0))
+    mtf_bull_count = max(0, int(mtf_bull_count or 0))
+    mtf_bear_count = max(0, int(mtf_bear_count or 0))
     if htf_bias == "bullish":
-        bullish += 3
-        reasons.append("Higher timeframe bullish confirmation")
+        bullish += 2; reasons.append("Higher timeframe EMA trend bullish (+2)")
     elif htf_bias == "bearish":
-        bearish += 3
-        reasons.append("Higher timeframe bearish confirmation")
+        bearish += 2; reasons.append("Higher timeframe EMA trend bearish (+2)")
+    if mtf_available_count > 0:
+        if mtf_bull_count > mtf_bear_count:
+            bullish += min(2, mtf_bull_count - mtf_bear_count); reasons.append(f"MTF majority bullish ({mtf_bull_count}/{mtf_available_count})")
+        elif mtf_bear_count > mtf_bull_count:
+            bearish += min(2, mtf_bear_count - mtf_bull_count); reasons.append(f"MTF majority bearish ({mtf_bear_count}/{mtf_available_count})")
+        else:
+            reasons.append("MTF alignment is mixed")
+    else:
+        reasons.append("MTF feed unavailable; no directional points or penalty applied")
+
+    option_metrics = option_metrics if isinstance(option_metrics, dict) else {}
+    pcr = option_metrics.get("pcr")
+    try:
+        pcr = float(pcr) if pcr is not None and np.isfinite(float(pcr)) and float(pcr) > 0 else None
+    except Exception:
+        pcr = None
+    oi_bias = str(option_metrics.get("oi_bias", "N/A"))
+    long_unwinding = bool(option_metrics.get("long_unwinding", False))
+    short_covering = bool(option_metrics.get("short_covering", False))
+    if pcr is not None:
+        if pcr >= 1.20:
+            bullish += 1; reasons.append(f"PCR supportive of bullish bias ({pcr:.2f}; +1)")
+        elif pcr <= 0.80:
+            bearish += 1; reasons.append(f"PCR supportive of bearish bias ({pcr:.2f}; +1)")
+        else:
+            reasons.append(f"PCR neutral band ({pcr:.2f})")
+    else:
+        reasons.append("PCR unavailable; excluded from scoring")
+    # Avoid double-counting OI bias where it is derived from the same total CE/PE OI as PCR.
 
     regime = detect_market_regime(df)
     gap_info = detect_gap_filter(df)
     session_info = session_filter(df, timeframe_label)
-    news_info = news_info or {"allow_trade": True, "message": "News filter unavailable", "events": []}
+    news_info = news_info if isinstance(news_info, dict) else {"allow_trade": True, "message": "News filter unavailable", "events": []}
+    if "allow_trade" not in news_info:
+        news_info = {**news_info, "allow_trade": True}
 
-    sideways = bool(regime["sideways"])
-    mtf_strict_bull_ok = mtf_bull_count >= MANDATORY_MTF_ALIGN_COUNT
-    mtf_strict_bear_ok = mtf_bear_count >= MANDATORY_MTF_ALIGN_COUNT
+    sideways = bool(regime.get("sideways", False))
+    atr_pct = float(regime.get("atr_pct", 0.0))
+    gap_allowed = bool(gap_info.get("allow_trade", True))
+    session_allowed = bool(session_info.get("valid", True))
+    news_allowed = bool(news_info.get("allow_trade", True))
 
-    option_metrics = option_metrics or {
-        "pcr": None,
-        "oi_bias": "Neutral",
-        "long_unwinding": False,
-        "short_covering": False
-    }
+    # Candidate direction requires both score advantage and price/trend structure.
+    directional_edge = abs(bullish - bearish)
+    directional_bias = "Bullish" if bullish > bearish else "Bearish" if bearish > bullish else "Neutral"
+    is_buy_candidate = bullish >= 7 and bullish - bearish >= 3
+    is_sell_candidate = bearish >= 7 and bearish - bullish >= 3
 
-    pcr = option_metrics.get("pcr")
-    oi_bias = option_metrics.get("oi_bias")
-    long_unwinding = option_metrics.get("long_unwinding", False)
-    short_covering = option_metrics.get("short_covering", False)
+    trend_vote_count = 4 if ema200_available else 3
+    buy_trend_votes = sum([close_price > ema20, ema20 > ema50, (close_price > ema200) if ema200_available else False, supertrend_dir == 1])
+    sell_trend_votes = sum([close_price < ema20, ema20 < ema50, (close_price < ema200) if ema200_available else False, supertrend_dir == -1])
+    buy_momentum_ok = (macd > macd_signal) or (rsi >= 52) or breakout or retest_bull
+    sell_momentum_ok = (macd < macd_signal) or (rsi <= 48) or breakdown or retest_bear
+    adx_ok = adx >= 15 or breakout or breakdown or retest_bull or retest_bear
 
-    if pcr is not None:
-        if pcr > 1.2:
-            bullish += 1
-            reasons.append(f"PCR bullish ({pcr})")
-        elif pcr < 0.8:
-            bearish += 1
-            reasons.append(f"PCR bearish ({pcr})")
+    # Prior-bar S/R and ATR-aware buffer: 0.5% was far too wide for NIFTY intraday.
+    sr_buffer = max(0.20 * atr, close_price * 0.0005, 0.01)
+    buy_near_resistance = (resistance >= close_price) and ((resistance - close_price) <= sr_buffer) and not breakout and not retest_bull
+    sell_near_support = (support <= close_price) and ((close_price - support) <= sr_buffer) and not breakdown and not retest_bear
+    candidate_no_trade_zone = bool((is_buy_candidate and buy_near_resistance) or (is_sell_candidate and sell_near_support))
 
-    if oi_bias == "Bullish":
-        bullish += 1
-        reasons.append("OI bias bullish")
-    elif oi_bias == "Bearish":
-        bearish += 1
-        reasons.append("OI bias bearish")
+    mtf_buy_conflict = mtf_available_count >= 2 and mtf_bear_count >= mtf_bull_count + 2
+    mtf_sell_conflict = mtf_available_count >= 2 and mtf_bull_count >= mtf_bear_count + 2
+    htf_buy_conflict = htf_bias == "bearish" and mtf_available_count >= 2 and mtf_bear_count > mtf_bull_count
+    htf_sell_conflict = htf_bias == "bullish" and mtf_available_count >= 2 and mtf_bull_count > mtf_bear_count
 
-    if short_covering:
-        bullish += 1
-        reasons.append("Short covering detected")
-    if long_unwinding:
-        bearish += 1
-        reasons.append("Long unwinding detected")
+    def blockers(side):
+        out = []
+        if side == "BUY":
+            score_ok = is_buy_candidate
+            votes = buy_trend_votes
+            momentum_ok = buy_momentum_ok
+            conflict = mtf_buy_conflict or htf_buy_conflict
+            near_level = buy_near_resistance
+        else:
+            score_ok = is_sell_candidate
+            votes = sell_trend_votes
+            momentum_ok = sell_momentum_ok
+            conflict = mtf_sell_conflict or htf_sell_conflict
+            near_level = sell_near_support
+        if not score_ok:
+            out.append("Directional score is not sufficiently separated (need score >= 7 and edge >= 3)")
+        if votes < 2:
+            out.append(f"Trend structure incomplete ({votes}/{trend_vote_count} available confirmations; need at least 2)")
+        if not momentum_ok:
+            out.append("Momentum confirmation missing (MACD/RSI/breakout)")
+        if not adx_ok:
+            out.append(f"ADX weak ({adx:.1f}); no breakout/retest override")
+        if conflict:
+            out.append("Higher-timeframe/MTF direction conflicts with this setup")
+        if sideways and not (breakout or breakdown or retest_bull or retest_bear) and votes < 3:
+            out.append("Sideways regime without a confirmed range breakout")
+        if not session_allowed:
+            out.append(session_info.get("message", "Session filter blocked entry"))
+        if not gap_allowed:
+            out.append(f"Large session gap filter blocked entry ({gap_info.get('gap_pct', 0):.2f}%)")
+        if not news_allowed:
+            out.append(news_info.get("message", "News risk filter blocked entry"))
+        if near_level:
+            out.append("Price is too close to the prior resistance/support level")
+        return out
 
-    signal_text = "NO TRADE"
+    buy_blockers = blockers("BUY")
+    sell_blockers = blockers("SELL")
+    buy_allowed = is_buy_candidate and not buy_blockers
+    sell_allowed = is_sell_candidate and not sell_blockers
+
     signal_type = "neutral"
+    signal_text = "NO TRADE"
     strength = "Low"
-    stop_loss = None
-    partial_exit = None
-    target1 = None
-    target2 = None
-    target3 = None
-    trailing_stop = None
-    rr_ratio = None
+    stop_loss = target1 = target2 = target3 = partial_exit = trailing_stop = rr_ratio = None
+    selected_blockers = []
+    selected_side = None
+    if buy_allowed and (not sell_allowed or bullish - bearish >= bearish - bullish):
+        selected_side = "BUY"
+    elif sell_allowed:
+        selected_side = "SELL"
 
-    if atr and atr > 0:
-        rr_ratio = IDEAL_RR
-
-    buy_mandatory_ok = all([
-        adx >= MANDATORY_ADX,
-        close_price > ema200,
-        supertrend_dir == 1,
-        ha_trend_up,
-        volume_spike,
-        htf_bias == "bullish",
-        mtf_strict_bull_ok,
-        not sideways,
-        session_info["valid"],
-        gap_info["allow_trade"],
-        news_info["allow_trade"]
-    ])
-
-    sell_mandatory_ok = all([
-        adx >= MANDATORY_ADX,
-        close_price < ema200,
-        supertrend_dir == -1,
-        ha_trend_down,
-        volume_spike,
-        htf_bias == "bearish",
-        mtf_strict_bear_ok,
-        not sideways,
-        session_info["valid"],
-        gap_info["allow_trade"],
-        news_info["allow_trade"]
-    ])
-
-    if atr and atr > 0:
-        buy_sl = close_price - atr
-        buy_t1 = close_price + 2 * atr
-        buy_t2 = close_price + 3 * atr
-        buy_t3 = close_price + 4 * atr
-        buy_rr = (buy_t1 - close_price) / (close_price - buy_sl) if close_price > buy_sl else None
-
-        sell_sl = close_price + atr
-        sell_t1 = close_price - 2 * atr
-        sell_t2 = close_price - 3 * atr
-        sell_t3 = close_price - 4 * atr
-        sell_rr = (close_price - sell_t1) / (sell_sl - close_price) if sell_sl > close_price else None
-
-        if bullish >= 10 and (bullish - bearish) >= 4 and rsi > 55 and macd > macd_signal and buy_mandatory_ok and buy_rr is not None and buy_rr >= MIN_RR_REQUIRED:
-            signal_text = "STRONG BUY"
+    if selected_side:
+        risk = max(atr, close_price * 0.001, 0.01)
+        if selected_side == "BUY":
             signal_type = "buy"
-            strength = "High"
-            stop_loss = buy_sl
-            target1 = buy_t1
-            target2 = buy_t2
-            target3 = buy_t3
-            partial_exit = target1
-            trailing_stop = close_price - (0.5 * atr)
-            rr_ratio = round(buy_rr, 2)
-
-        elif bearish >= 10 and (bearish - bullish) >= 4 and rsi < 45 and macd < macd_signal and sell_mandatory_ok and sell_rr is not None and sell_rr >= MIN_RR_REQUIRED:
-            signal_text = "STRONG SELL"
+            stop_loss = close_price - risk
+            target1, target2, target3 = close_price + 2*risk, close_price + 3*risk, close_price + 4*risk
+            trailing_stop = close_price - 0.75*risk
+            strong = bullish >= 12 and (bullish - bearish) >= 6 and buy_trend_votes >= 3 and adx >= 20 and (htf_bias == "bullish" or mtf_bull_count > mtf_bear_count or breakout or volume_spike)
+            signal_text = "STRONG BUY" if strong else "BUY"
+            strength = "High" if strong else "Medium"
+            selected_blockers = []
+        else:
             signal_type = "sell"
-            strength = "High"
-            stop_loss = sell_sl
-            target1 = sell_t1
-            target2 = sell_t2
-            target3 = sell_t3
-            partial_exit = target1
-            trailing_stop = close_price + (0.5 * atr)
-            rr_ratio = round(sell_rr, 2)
+            stop_loss = close_price + risk
+            target1, target2, target3 = close_price - 2*risk, close_price - 3*risk, close_price - 4*risk
+            trailing_stop = close_price + 0.75*risk
+            strong = bearish >= 12 and (bearish - bullish) >= 6 and sell_trend_votes >= 3 and adx >= 20 and (htf_bias == "bearish" or mtf_bear_count > mtf_bull_count or breakdown or volume_spike)
+            signal_text = "STRONG SELL" if strong else "SELL"
+            strength = "High" if strong else "Medium"
+        partial_exit = target1
+        rr_ratio = round(abs(target1 - close_price) / abs(close_price - stop_loss), 2) if stop_loss != close_price else None
+    else:
+        if is_buy_candidate and (not is_sell_candidate or bullish - bearish >= bearish - bullish):
+            selected_blockers = buy_blockers
+        elif is_sell_candidate:
+            selected_blockers = sell_blockers
+        else:
+            selected_blockers = ["Bullish and bearish evidence is mixed; no directional edge"]
+        if not selected_blockers:
+            selected_blockers = ["No valid entry setup after confirmation checks"]
 
-        elif not STRICT_TRADE_ONLY_STRONG:
-            if bullish > bearish and bullish >= 7 and supertrend_dir == 1 and not DISABLE_BUY_BIAS_TRADING:
-                signal_text = "BUY BIAS"
-                signal_type = "buy"
-                strength = "Medium"
-            elif bearish > bullish and bearish >= 7 and supertrend_dir == -1 and not DISABLE_SELL_BIAS_TRADING:
-                signal_text = "SELL BIAS"
-                signal_type = "sell"
-                strength = "Medium"
+    # Setup confidence is a structural score, not a probability of winning.
+    if signal_type in ("buy", "sell"):
+        selected_score = bullish if signal_type == "buy" else bearish
+        selected_votes = buy_trend_votes if signal_type == "buy" else sell_trend_votes
+        mtf_aligned = (mtf_bull_count > mtf_bear_count) if signal_type == "buy" else (mtf_bear_count > mtf_bull_count)
+        confidence = int(min(92, 52 + min(18, directional_edge * 1.5) + selected_votes * 3 + (4 if mtf_aligned else 0) + (3 if htf_bias == ("bullish" if signal_type == "buy" else "bearish") else 0)))
+        setup_confidence_label = "Structural setup score; not a probability"
+    else:
+        confidence = None
+        setup_confidence_label = "No approved setup"
 
-    confidence = min(100, max(40, int((max(bullish, bearish) / 18) * 100)))
-    if supertrend_dir == 1 and bullish > bearish:
-        confidence += 3
-    elif supertrend_dir == -1 and bearish > bullish:
-        confidence += 3
-    if ha_trend_up and bullish > bearish:
-        confidence += 3
-    elif ha_trend_down and bearish > bullish:
-        confidence += 3
-    confidence = min(100, confidence)
-
+    # A measured historical win rate is shown only for 30+ completed trades from this exact engine.
+    win_chance = calculate_win_chance(backtest_win_rate, backtest_trade_count, backtest_is_comparable)
     validation_score = 0
-    validation_score += min(25, max(0, (max(bullish, bearish) * 2)))
-    validation_score += 10 if adx >= MANDATORY_ADX else 0
-    validation_score += 10 if volume_spike else 0
-    validation_score += 10 if ((signal_type == "buy" and close_price > ema200) or (signal_type == "sell" and close_price < ema200)) else 0
-    validation_score += 10 if ((signal_type == "buy" and supertrend_dir == 1) or (signal_type == "sell" and supertrend_dir == -1)) else 0
-    validation_score += 10 if ((signal_type == "buy" and ha_trend_up) or (signal_type == "sell" and ha_trend_down)) else 0
-    validation_score += 10 if ((signal_type == "buy" and htf_bias == "bullish") or (signal_type == "sell" and htf_bias == "bearish")) else 0
-    validation_score += 10 if ((signal_type == "buy" and mtf_strict_bull_ok) or (signal_type == "sell" and mtf_strict_bear_ok)) else 0
-    validation_score += 5 if rr_ratio is not None and rr_ratio >= MIN_RR_REQUIRED else 0
-    validation_score += 5 if oi_bias != "Neutral" else 0
-    if not gap_info["allow_trade"]:
-        validation_score -= 10
-    if sideways:
-        validation_score -= 15
-    if not news_info["allow_trade"]:
-        validation_score -= 10
-    validation_score = max(0, min(100, validation_score))
+    chosen_score = bullish if directional_bias == "Bullish" else bearish if directional_bias == "Bearish" else 0
+    chosen_votes = buy_trend_votes if directional_bias == "Bullish" else sell_trend_votes if directional_bias == "Bearish" else 0
+    validation_score += min(25, int(chosen_score * 1.5))
+    validation_score += min(20, chosen_votes * 5)
+    validation_score += 15 if ((macd > macd_signal and directional_bias == "Bullish") or (macd < macd_signal and directional_bias == "Bearish")) else 0
+    validation_score += 10 if adx >= 18 else 0
+    validation_score += 10 if session_allowed and gap_allowed and news_allowed else 0
+    mtf_supports_bias = ((directional_bias == "Bullish" and mtf_bull_count > mtf_bear_count) or (directional_bias == "Bearish" and mtf_bear_count > mtf_bull_count))
+    validation_score += 10 if (mtf_available_count >= 2 and mtf_supports_bias) else 0
+    validation_score += 5 if volume_data_available and volume_spike else 0
+    validation_score += 5 if atr > 0 else 0
+    validation_score = int(max(0, min(100, validation_score)))
+    strategy_grade = classify_strategy_grade(validation_score) if signal_type != "neutral" else "NO SETUP"
+    trade_quality_score = int(round(0.65 * validation_score + 0.35 * (confidence or 0))) if signal_type != "neutral" else 0
 
-    strategy_grade = classify_strategy_grade(validation_score)
-    trade_quality_score = int((validation_score + confidence + min(95, backtest_win_rate)) / 3)
-    trade_quality_score = max(0, min(100, trade_quality_score))
-
-    win_chance = calculate_win_chance(
-        bullish, bearish, adx, volume_spike, breakout, breakdown, htf_bias, sideways, rr_ratio, backtest_win_rate
-    )
-
-    no_trade_reason = None
-    if signal_type in ["buy", "sell"] and rr_ratio is not None and rr_ratio < MIN_RR_REQUIRED:
-        no_trade_reason = "Risk Reward below 1:2"
-    elif signal_type == "buy" and not buy_mandatory_ok:
-        no_trade_reason = "BUY mandatory confirmations failed"
-        signal_text = "NO TRADE"
-        signal_type = "neutral"
-    elif signal_type == "sell" and not sell_mandatory_ok:
-        no_trade_reason = "SELL mandatory confirmations failed"
-        signal_text = "NO TRADE"
-        signal_type = "neutral"
-    elif validation_score < MIN_VALIDATION_SCORE_FOR_ALERT and signal_type in ["buy", "sell"]:
-        no_trade_reason = "Validation score below threshold"
-        signal_text = "NO TRADE"
-        signal_type = "neutral"
-    elif signal_type == "buy" and distance_to_resistance < NO_TRADE_NEAR_SR_PCT:
-        no_trade_reason = "No trade zone near resistance"
-        signal_text = "NO TRADE"
-        signal_type = "neutral"
-    elif signal_type == "sell" and distance_to_support < NO_TRADE_NEAR_SR_PCT:
-        no_trade_reason = "No trade zone near support"
-        signal_text = "NO TRADE"
-        signal_type = "neutral"
-
-    if no_trade_reason:
-        reasons.append(no_trade_reason)
-
+    no_trade_zone = candidate_no_trade_zone
+    no_trade_reason = "; ".join(selected_blockers) if selected_blockers else None
+    reasons.extend(selected_blockers if signal_type == "neutral" else [f"Entry approved: {signal_text}"])
+    regime = detect_market_regime(df)
+    gap_info = detect_gap_filter(df)
+    session_info = session_filter(df, timeframe_label)
     return {
-        "close_price": close_price,
-        "ema20": ema20,
-        "ema50": ema50,
-        "ema200": ema200,
-        "vwap": vwap,
-        "rsi": rsi,
-        "macd": macd,
-        "macd_signal": macd_signal,
-        "macd_hist": float(latest["MACD_Hist"]) if pd.notna(latest.get("MACD_Hist", np.nan)) else 0.0,
-        "candle_pattern": candle_pattern,
-        "candle_pattern_bias": candle_bias,
-        "candle_pattern_score": candle_pattern_score,
-        "atr": atr,
-        "stoch_k": stoch_k,
-        "stoch_d": stoch_d,
-        "adx": adx,
-        "support": support,
-        "resistance": resistance,
-        "volume_spike": volume_spike,
-        "breakout": breakout,
-        "breakdown": breakdown,
-        "body_strength": body_strength,
-        "sideways": sideways,
-        "signal_text": signal_text,
-        "signal_type": signal_type,
-        "strength": strength,
-        "confidence": confidence,
-        "win_chance": win_chance,
-        "stop_loss": stop_loss,
-        "partial_exit": partial_exit,
-        "target1": target1,
-        "target2": target2,
-        "target3": target3,
-        "trailing_stop": trailing_stop,
-        "rr_ratio": rr_ratio,
-        "reasons": reasons,
-        "bullish_score": bullish,
-        "bearish_score": bearish,
-        "session_message": session_info["message"],
-        "supertrend_direction": supertrend_dir,
-        "ha_bullish": ha_bullish,
-        "ha_bearish": ha_bearish,
-        "ha_trend_up": ha_trend_up,
-        "ha_trend_down": ha_trend_down,
-        "validation_score": validation_score,
-        "strategy_grade": strategy_grade,
-        "trade_quality_score": trade_quality_score,
-        "market_regime": regime["regime"],
-        "trending_market": regime["trending"],
-        "sideways_market": regime["sideways"],
-        "high_volatility_market": regime["high_volatility"],
-        "atr_pct": regime["atr_pct"],
-        "gap_up": gap_info["gap_up"],
-        "gap_down": gap_info["gap_down"],
-        "gap_pct": gap_info["gap_pct"],
-        "mtf_bull_ok": mtf_strict_bull_ok,
-        "mtf_bear_ok": mtf_strict_bear_ok,
-        "no_trade_zone": (
-            (signal_type == "buy" and distance_to_resistance < NO_TRADE_NEAR_SR_PCT) or
-            (signal_type == "sell" and distance_to_support < NO_TRADE_NEAR_SR_PCT)
-        ),
-        "oi_bias": oi_bias,
-        "pcr": pcr,
-        "long_unwinding": long_unwinding,
-        "short_covering": short_covering,
-        "news_message": news_info.get("message", "")
+        "close_price": close_price, "ema20": ema20, "ema50": ema50, "ema200": ema200,
+        "vwap": vwap_value, "rsi": rsi, "macd": macd, "macd_signal": macd_signal,
+        "macd_hist": macd_hist, "candle_pattern": candle_pattern, "candle_pattern_bias": candle_bias,
+        "candle_pattern_score": candle_pattern_score, "atr": atr, "stoch_k": stoch_k, "stoch_d": stoch_d,
+        "adx": adx, "support": support, "resistance": resistance, "volume_spike": volume_spike,
+        "breakout": breakout, "breakdown": breakdown, "body_strength": body_strength,
+        "sideways": sideways, "signal_text": signal_text, "signal_type": signal_type,
+        "strength": strength, "confidence": confidence, "win_chance": win_chance,
+        "win_chance_sample_size": int(backtest_trade_count or 0) if win_chance is not None else 0,
+        "setup_confidence_label": setup_confidence_label,
+        "stop_loss": stop_loss, "partial_exit": partial_exit, "target1": target1,
+        "target2": target2, "target3": target3, "trailing_stop": trailing_stop,
+        "rr_ratio": rr_ratio, "reasons": reasons, "no_trade_reason": no_trade_reason,
+        "no_trade_reasons": selected_blockers, "bullish_score": round(bullish, 1),
+        "bearish_score": round(bearish, 1), "directional_bias": directional_bias,
+        "directional_edge": round(directional_edge, 1), "session_message": session_info["message"],
+        "supertrend_direction": supertrend_dir, "ha_bullish": ha_bullish, "ha_bearish": ha_bearish,
+        "ha_trend_up": ha_trend_up, "ha_trend_down": ha_trend_down,
+        "validation_score": validation_score, "strategy_grade": strategy_grade,
+        "trade_quality_score": trade_quality_score, "market_regime": regime["regime"],
+        "trending_market": regime["trending"], "sideways_market": regime["sideways"],
+        "high_volatility_market": regime["high_volatility"], "atr_pct": regime["atr_pct"],
+        "gap_up": gap_info["gap_up"], "gap_down": gap_info["gap_down"], "gap_pct": gap_info["gap_pct"],
+        "mtf_bull_ok": mtf_available_count >= 2 and mtf_bull_count > mtf_bear_count,
+        "mtf_bear_ok": mtf_available_count >= 2 and mtf_bear_count > mtf_bull_count,
+        "no_trade_zone": no_trade_zone, "oi_bias": oi_bias, "pcr": pcr,
+        "long_unwinding": long_unwinding, "short_covering": short_covering,
+        "news_message": news_info.get("message", ""), "trade_allowed": signal_type in ("buy", "sell"),
+        "volume_data_available": volume_data_available, "mtf_available_count": mtf_available_count,
+        "ema200_available": ema200_available, "trend_vote_count": trend_vote_count,
+        "buy_trend_votes": int(buy_trend_votes), "sell_trend_votes": int(sell_trend_votes),
     }
 
 
@@ -3313,8 +3231,8 @@ def add_signal_audit(symbol, timeframe, analysis):
             "ValidationScore": analysis.get("validation_score", 0),
             "TradeQualityScore": analysis.get("trade_quality_score", 0),
             "StrategyGrade": analysis.get("strategy_grade", "D"),
-            "Confidence": analysis.get("confidence", 0),
-            "WinChance": analysis.get("win_chance", 0),
+            "Confidence": analysis.get("confidence") if analysis.get("confidence") is not None else np.nan,
+            "WinChance": analysis.get("win_chance") if analysis.get("win_chance") is not None else np.nan,
             "ReasonCount": len(analysis.get("reasons", [])),
             "ExpiryTime": expiry_time.strftime("%d-%m-%Y %H:%M:%S")
         }
@@ -4158,222 +4076,227 @@ def fallback_ema_backtest(df, symbol="", timeframe_label="", cost_bps=5.0):
 
 
 def simple_backtest(df, symbol="", timeframe_label="", option_metrics=None, news_info=None):
-    trades = []
-    df = df.copy()
+    """Causal same-timeframe backtest with next-bar fills and staged ATR exits.
+
+    Current-day PCR/option-chain values and fabricated MTF alignment are never
+    passed into historical candles. Stop is checked before targets when OHLC
+    cannot reveal intrabar order; this is the conservative assumption.
+    """
+    if df is None or df.empty or not {"Open", "High", "Low", "Close"}.issubset(df.columns):
+        return 0, 0, 0, 0.0, pd.DataFrame()
+    work = df.copy()
     required_cols = [
         "Open", "High", "Low", "Close", "EMA20", "EMA50", "EMA200", "VWAP", "RSI",
         "MACD", "SignalLine", "ATR", "ADX", "SuperTrendDirection", "Volume_Spike"
     ]
-    # Rebuild indicators if the incoming feed contains OHLC only or a partial set.
-    if not {"Open", "High", "Low", "Close"}.issubset(df.columns):
-        return 0, 0, 0, 0.0, pd.DataFrame()
-    if any(col not in df.columns for col in required_cols):
+    if any(col not in work.columns for col in required_cols):
         try:
-            df = add_indicators(df)
-        except Exception as e:
-            log_app_error("backtest_indicator_rebuild", e)
-
-    for col in required_cols:
-        if col not in df.columns:
+            work = add_indicators(work)
+        except Exception as exc:
+            log_app_error("backtest_indicator_rebuild", exc)
             return 0, 0, 0, 0.0, pd.DataFrame()
-
-    df.index = pd.to_datetime(df.index, errors="coerce")
-    df = df[~df.index.isna()].copy()
-    df = df.replace([np.inf, -np.inf], np.nan)
-    df = df.dropna(subset=["Open", "High", "Low", "Close", "EMA20", "EMA50", "EMA200", "RSI", "MACD", "SignalLine", "ATR", "ADX"]).copy()
-
-    if len(df) < 35:
+    if any(col not in work.columns for col in required_cols):
         return 0, 0, 0, 0.0, pd.DataFrame()
 
-    for i in range(30, len(df) - 10):
-        mini_df = df.iloc[:i + 1].copy()
-        latest = mini_df.iloc[-1]
-        ts = mini_df.index[-1]
-        htf_bias = "bullish" if latest["EMA20"] > latest["EMA50"] else "bearish"
+    work.index = pd.to_datetime(work.index, errors="coerce")
+    work = work[~work.index.isna()].copy()
+    work = work.replace([np.inf, -np.inf], np.nan)
+    work = work.dropna(subset=["Open", "High", "Low", "Close", "EMA20", "EMA50", "EMA200", "RSI", "MACD", "SignalLine", "ATR", "ADX"])
+    if len(work) < 70:
+        return 0, 0, 0, 0.0, pd.DataFrame()
 
+    trades = []
+    # EMA50 and the signal structure need a meaningful warm-up window.
+    for i in range(55, len(work) - 10):
+        mini_df = work.iloc[:i + 1].copy()
+        latest = mini_df.iloc[-1]
+        # Do not inject the current option chain or synthetic 4/4 MTF alignment
+        # into historical observations; those values were not known then.
+        historical_news = news_info if isinstance(news_info, dict) else {"allow_trade": True, "message": "No historical news replay"}
         analysis = analyze_signal(
             mini_df,
-            htf_bias=htf_bias,
+            htf_bias=None,
             timeframe_label=timeframe_label if timeframe_label else "1d",
-            backtest_win_rate=50,
-            mtf_bull_count=4 if htf_bias == "bullish" else 0,
-            mtf_bear_count=4 if htf_bias == "bearish" else 0,
-            option_metrics=option_metrics,
-            news_info=news_info
+            backtest_win_rate=0.0,
+            mtf_bull_count=0,
+            mtf_bear_count=0,
+            mtf_available_count=0,
+            option_metrics=None,
+            news_info=historical_news,
+            backtest_trade_count=0,
+            backtest_is_comparable=False,
         )
-
-        if analysis["signal_text"] not in ["STRONG BUY", "STRONG SELL"]:
+        if analysis["signal_text"] not in ("STRONG BUY", "STRONG SELL"):
             continue
 
-        entry = float(latest["Close"])
-        sl = analysis["stop_loss"]
-        t1 = analysis["target1"]
-        t2 = analysis["target2"]
-        t3 = analysis["target3"]
-
-        if sl is None or t1 is None:
-            continue
-
-        future = df.iloc[i + 1:i + 11]
+        future = work.iloc[i + 1:i + 11]
         if future.empty:
             continue
+        # A completed-bar signal is filled at the next candle OPEN.
+        entry = float(future.iloc[0]["Open"])
+        atr_value = float(analysis.get("atr") or 0.0)
+        if not np.isfinite(entry) or entry <= 0 or not np.isfinite(atr_value) or atr_value <= 0:
+            continue
+        risk = max(atr_value, entry * 0.001, 0.01)
+        side = "BUY" if analysis["signal_type"] == "buy" else "SELL"
+        is_long = side == "BUY"
+        sl = entry - risk if is_long else entry + risk
+        t1 = entry + 2*risk if is_long else entry - 2*risk
+        t2 = entry + 3*risk if is_long else entry - 3*risk
+        t3 = entry + 4*risk if is_long else entry - 4*risk
+        trail = sl
+        trail_gap = max(0.5 * atr_value, entry * 0.0005, 0.01)
+        remaining = 1.0
+        realized_points = 0.0
+        t1_hit = t2_hit = t3_hit = False
+        exit_reason = "TIME EXIT"
+        exit_time = future.index[-1]
+        final_exit_price = float(future.iloc[-1]["Close"])
 
-        signal = "BUY" if analysis["signal_type"] == "buy" else "SELL"
-        exit_price = None
-        result = None
-        t1_hit = False
-        t2_hit = False
-        t3_hit = False
+        for bar_time, bar in future.iterrows():
+            op = float(bar["Open"]); hi = float(bar["High"]); lo = float(bar["Low"]); cl = float(bar["Close"])
+            effective_stop = max(sl, trail) if is_long else min(sl, trail)
+            stop_hit = (lo <= effective_stop) if is_long else (hi >= effective_stop)
+            if stop_hit:
+                # If a candle gaps through the stop, assume the worse OPEN fill.
+                fill = min(op, effective_stop) if is_long else max(op, effective_stop)
+                realized_points += ((fill - entry) if is_long else (entry - fill)) * remaining
+                final_exit_price = float(fill)
+                remaining = 0.0
+                exit_reason = "STOP / TRAILING STOP"
+                exit_time = bar_time
+                break
 
-        for _, row in future.iterrows():
-            if signal == "BUY":
-                if row["Low"] <= sl:
-                    exit_price = sl
-                    result = "LOSS"
-                    break
-                if row["High"] >= t1:
+            # Process targets in sequence. If several are crossed in one candle,
+            # stop has priority; the scale-outs are applied at their target prices.
+            target_sequence = [
+                ("T1", t1, 0.34),
+                ("T2", t2, 0.33),
+                ("T3", t3, 1.00),
+            ]
+            for label, target, fraction in target_sequence:
+                flag_already_hit = {"T1": t1_hit, "T2": t2_hit, "T3": t3_hit}[label]
+                target_hit = (hi >= target) if is_long else (lo <= target)
+                if flag_already_hit or not target_hit or remaining <= 0:
+                    continue
+                qty_exit = remaining if label == "T3" else min(remaining, fraction)
+                realized_points += ((target - entry) if is_long else (entry - target)) * qty_exit
+                remaining -= qty_exit
+                if label == "T1":
                     t1_hit = True
-                if row["High"] >= t2:
+                    trail = max(trail, entry) if is_long else min(trail, entry)
+                elif label == "T2":
                     t2_hit = True
-                if row["High"] >= t3:
+                    trail = max(trail, t1) if is_long else min(trail, t1)
+                else:
                     t3_hit = True
-                if row["High"] >= t3:
-                    exit_price = t3
-                    result = "WIN"
+                    final_exit_price = float(target)
+                    exit_reason = "T3 FINAL EXIT"
+                    exit_time = bar_time
+                if remaining <= 1e-9:
+                    remaining = 0.0
                     break
-                elif row["High"] >= t2:
-                    exit_price = t2
-                    result = "WIN"
-                    break
-                elif row["High"] >= t1:
-                    exit_price = t1
-                    result = "WIN"
-                    break
-            else:
-                if row["High"] >= sl:
-                    exit_price = sl
-                    result = "LOSS"
-                    break
-                if row["Low"] <= t1:
-                    t1_hit = True
-                if row["Low"] <= t2:
-                    t2_hit = True
-                if row["Low"] <= t3:
-                    t3_hit = True
-                if row["Low"] <= t3:
-                    exit_price = t3
-                    result = "WIN"
-                    break
-                elif row["Low"] <= t2:
-                    exit_price = t2
-                    result = "WIN"
-                    break
-                elif row["Low"] <= t1:
-                    exit_price = t1
-                    result = "WIN"
-                    break
+            if remaining <= 0:
+                break
 
-        if exit_price is None:
-            exit_price = float(future.iloc[-1]["Close"])
-            if signal == "BUY":
-                result = "WIN" if exit_price > entry else "LOSS"
-            else:
-                result = "WIN" if exit_price < entry else "LOSS"
+            # Close-based dynamic trailing is applied for the NEXT bar, avoiding
+            # using a bar's final close to stop out earlier inside that same bar.
+            dynamic_trail = cl - trail_gap if is_long else cl + trail_gap
+            trail = max(trail, dynamic_trail) if is_long else min(trail, dynamic_trail)
 
-        pnl = round((exit_price - entry), 2) if signal == "BUY" else round((entry - exit_price), 2)
+        if remaining > 0:
+            last_bar = future.iloc[-1]
+            last_close = float(last_bar["Close"])
+            realized_points += ((last_close - entry) if is_long else (entry - last_close)) * remaining
+            final_exit_price = last_close
+            exit_time = future.index[-1]
+            exit_reason = "TIME EXIT"
+            remaining = 0.0
 
+        result = "WIN" if realized_points > 0 else "LOSS" if realized_points < 0 else "BREAKEVEN"
         trades.append({
-            "Date": pd.to_datetime(ts).strftime("%d-%m-%Y"),
-            "Time": pd.to_datetime(ts).strftime("%H:%M:%S"),
-            "Symbol": symbol,
-            "Timeframe": timeframe_label,
-            "Signal": signal,
-            "Entry": round(entry, 2),
-            "SL": round(sl, 2),
-            "T1": round(t1, 2),
-            "T2": round(t2, 2) if t2 is not None else np.nan,
-            "T3": round(t3, 2) if t3 is not None else np.nan,
-            "Exit": round(exit_price, 2),
-            "Result": result,
-            "PnL": pnl,
-            "T1_Hit": t1_hit,
-            "T2_Hit": t2_hit,
-            "T3_Hit": t3_hit
+            "Date": pd.to_datetime(work.index[i]).strftime("%d-%m-%Y"),
+            "Time": pd.to_datetime(work.index[i]).strftime("%H:%M:%S"),
+            "Symbol": symbol, "Timeframe": timeframe_label,
+            "Signal": side, "Entry": round(entry, 2), "SL": round(sl, 2),
+            "T1": round(t1, 2), "T2": round(t2, 2), "T3": round(t3, 2),
+            "Exit": round(float(final_exit_price), 2),
+            "Result": result, "PnL": round(realized_points, 2),
+            "T1_Hit": t1_hit, "T2_Hit": t2_hit, "T3_Hit": t3_hit,
+            "ExitReason": exit_reason, "ExitModel": "Next-open fill; 34/33/remainder scale-out; conservative stop-first OHLC"
         })
 
     trades_df = pd.DataFrame(trades)
-    # The strict composite signal can be very selective on short intraday history.
-    # If it yields no completed trades, run a clearly-labelled EMA fallback so
-    # the analytics can report measured historical results instead of all zeros.
+    # If the composite engine has no completed sample, expose a separate,
+    # explicitly labelled EMA fallback. The UI does not call that its win chance.
     if trades_df.empty:
-        trades_df = fallback_ema_backtest(df, symbol, timeframe_label)
+        trades_df = fallback_ema_backtest(work, symbol, timeframe_label)
     total = len(trades_df)
-    wins = len(trades_df[trades_df["Result"] == "WIN"]) if total else 0
-    losses = len(trades_df[trades_df["Result"] == "LOSS"]) if total else 0
-    win_rate = (wins / total * 100) if total else 0.0
+    wins = int((trades_df["Result"] == "WIN").sum()) if total else 0
+    losses = int((trades_df["Result"] == "LOSS").sum()) if total else 0
+    win_rate = (wins / total * 100.0) if total else 0.0
     return wins, losses, total, round(win_rate, 2), trades_df
 
 
 def walk_forward_validation(df, symbol="", timeframe_label="", option_metrics=None, news_info=None):
+    """Chronological walk-forward report; fallback EMA folds are labelled and excluded from composite averages."""
     try:
         if df.empty or len(df) < 150:
-            return {"folds": 0, "avg_win_rate": 0.0, "avg_profit_factor": 0.0, "avg_expectancy": 0.0, "table": pd.DataFrame()}
+            return {"folds": 0, "validated_folds": 0, "avg_win_rate": None, "avg_profit_factor": None, "avg_expectancy": None, "table": pd.DataFrame()}
 
         fold_results = []
         total_len = len(df)
         train_size = int(total_len * 0.6)
         test_size = int(total_len * 0.2)
-
         start = 0
         fold_no = 1
         while (start + train_size + test_size) <= total_len:
-            train_df = df.iloc[start:start + train_size].copy()
-            test_df = df.iloc[start + train_size:start + train_size + test_size].copy()
-
-            _, _, _, _, _ = simple_backtest(
-                train_df,
-                symbol=symbol,
-                timeframe_label=timeframe_label,
-                option_metrics=option_metrics,
-                news_info=news_info
-            )
-
+            test_start = start + train_size
+            test_end = test_start + test_size
+            # Include 55 prior candles only as indicator/warm-up context. The
+            # evaluator starts at index 55, so its first eligible signal is the
+            # first candle in this fold's test window, not in the warm-up window.
+            warmup_start = max(0, test_start - 55)
+            test_with_warmup = df.iloc[warmup_start:test_end].copy()
             wins, losses, total, win_rate, trades_df = simple_backtest(
-                test_df,
-                symbol=symbol,
-                timeframe_label=timeframe_label,
-                option_metrics=option_metrics,
-                news_info=news_info
+                test_with_warmup, symbol=symbol, timeframe_label=timeframe_label,
+                option_metrics=None,
+                news_info={"allow_trade": True, "message": "Historical news not replayed", "events": []},
             )
-
             stats = compute_trade_statistics(trades_df)
+            is_fallback = not trades_df.empty and "Method" in trades_df.columns
             fold_results.append({
                 "Fold": fold_no,
+                "TestStart": str(test_with_warmup.index[55].date()) if len(test_with_warmup) > 55 else "N/A",
+                "TestEnd": str(test_with_warmup.index[-1].date()) if not test_with_warmup.empty else "N/A",
                 "Trades": total,
                 "Wins": wins,
                 "Losses": losses,
-                "WinRate": win_rate,
-                "ProfitFactor": stats["profit_factor"],
-                "Expectancy": stats["expectancy"]
+                "WinRate": win_rate if total else np.nan,
+                "ProfitFactor": stats["profit_factor"] if total else np.nan,
+                "Expectancy": stats["expectancy"] if total else np.nan,
+                "Method": "EMA fallback — not comparable" if is_fallback else "Composite signal engine" if total else "No completed trades",
             })
-
             fold_no += 1
             start += test_size
 
         result_df = pd.DataFrame(fold_results)
-        if result_df.empty:
-            return {"folds": 0, "avg_win_rate": 0.0, "avg_profit_factor": 0.0, "avg_expectancy": 0.0, "table": pd.DataFrame()}
-
+        valid = result_df[result_df["Method"] == "Composite signal engine"].copy()
+        if valid.empty:
+            return {"folds": len(result_df), "validated_folds": 0, "avg_win_rate": None,
+                    "avg_profit_factor": None, "avg_expectancy": None, "table": result_df}
         return {
             "folds": len(result_df),
-            "avg_win_rate": round(result_df["WinRate"].mean(), 2),
-            "avg_profit_factor": round(result_df["ProfitFactor"].replace(999.0, 5.0).mean(), 2),
-            "avg_expectancy": round(result_df["Expectancy"].mean(), 2),
-            "table": result_df
+            "validated_folds": len(valid),
+            "avg_win_rate": round(float(valid["WinRate"].mean()), 2),
+            "avg_profit_factor": round(float(valid["ProfitFactor"].replace(999.0, 5.0).mean()), 2),
+            "avg_expectancy": round(float(valid["Expectancy"].mean()), 2),
+            "table": result_df,
         }
-    except Exception as e:
-        log_app_error("walk_forward_validation", e)
-        return {"folds": 0, "avg_win_rate": 0.0, "avg_profit_factor": 0.0, "avg_expectancy": 0.0, "table": pd.DataFrame()}
+    except Exception as exc:
+        log_app_error("walk_forward_validation", exc)
+        return {"folds": 0, "validated_folds": 0, "avg_win_rate": None,
+                "avg_profit_factor": None, "avg_expectancy": None, "table": pd.DataFrame()}
 
 
 # =========================================================
@@ -4587,8 +4510,8 @@ def get_mtf_signal(data_source, selected, ticker, tf, angel_creds):
     data = get_data_for_timeframe(data_source, selected, ticker, tf, angel_creds)
     if data.empty:
         return "⚪ N/A"
-    data = add_indicators(data).bfill().ffill()
-    if len(data) < 5:
+    data = add_indicators(data).replace([np.inf, -np.inf], np.nan).ffill()
+    if len(data) < 55:
         return "⚪ N/A"
     latest = data.iloc[-1]
     if latest["EMA20"] > latest["EMA50"]:
@@ -5164,7 +5087,7 @@ if not ok:
     st.error(f"Data integrity failed: {msg}")
     st.stop()
 
-data = add_indicators(data).replace([np.inf, -np.inf], np.nan).bfill().ffill()
+data = add_indicators(data).replace([np.inf, -np.inf], np.nan).ffill()
 backtest_data = data.copy()
 
 if len(data) < 35:
@@ -5175,8 +5098,8 @@ angel_creds = (angel_api_key, angel_client_code, angel_pin, angel_totp_secret)
 htf_data = get_data_for_timeframe(active_data_source, selected, ticker, htf_interval, angel_creds)
 
 if not htf_data.empty:
-    htf_data = add_indicators(htf_data).bfill().ffill()
-    if len(htf_data) > 20:
+    htf_data = add_indicators(htf_data).replace([np.inf, -np.inf], np.nan).ffill()
+    if len(htf_data) >= 55:
         htf_latest = htf_data.iloc[-1]
         htf_bias = "bullish" if htf_latest["EMA20"] > htf_latest["EMA50"] else "bearish"
     else:
@@ -5196,10 +5119,11 @@ mtf_table = pd.DataFrame({
 
 bull_count = sum("Bullish" in sig for sig in mtf_table["Trend"])
 bear_count = sum("Bearish" in sig for sig in mtf_table["Trend"])
+mtf_available_count = sum("N/A" not in str(sig) for sig in mtf_table["Trend"])
 
 dynamic_oc_symbol = get_dynamic_option_chain_symbol(selected)
 option_metrics = parse_option_chain_metrics(dynamic_oc_symbol) if dynamic_oc_symbol else {
-    "pcr": None, "oi_bias": "Neutral", "long_unwinding": False,
+    "pcr": None, "oi_bias": "N/A", "long_unwinding": False,
     "short_covering": False, "call_oi": 0, "put_oi": 0
 }
 
@@ -5231,6 +5155,11 @@ wins, losses, total_trades, backtest_win_rate, backtest_trades_df = simple_backt
     news_info=historical_news_context
 )
 
+backtest_is_comparable = bool(
+    total_trades >= 30 and
+    not backtest_trades_df.empty and
+    "Method" not in backtest_trades_df.columns
+)
 analysis = analyze_signal(
     data,
     htf_bias=htf_bias,
@@ -5238,8 +5167,11 @@ analysis = analyze_signal(
     backtest_win_rate=backtest_win_rate,
     mtf_bull_count=bull_count,
     mtf_bear_count=bear_count,
+    mtf_available_count=mtf_available_count,
     option_metrics=option_metrics,
-    news_info=news_info
+    news_info=news_info,
+    backtest_trade_count=total_trades,
+    backtest_is_comparable=backtest_is_comparable,
 )
 
 walk_forward_result = walk_forward_validation(
@@ -5253,12 +5185,15 @@ walk_forward_result = walk_forward_validation(
 stats = compute_trade_statistics(backtest_trades_df, initial_capital=DEFAULT_INITIAL_BALANCE)
 equity_curve_df, max_drawdown = compute_equity_curve_from_trades(backtest_trades_df, initial_capital=DEFAULT_INITIAL_BALANCE)
 
-health_score, health_label = strategy_health_monitor(
-    analysis["validation_score"],
-    backtest_win_rate,
-    stats["profit_factor"] if stats["profit_factor"] != 999.0 else 5.0,
-    max_drawdown
-)
+if backtest_is_comparable:
+    health_score, health_label = strategy_health_monitor(
+        analysis["validation_score"],
+        backtest_win_rate,
+        stats["profit_factor"] if stats["profit_factor"] != 999.0 else 5.0,
+        max_drawdown
+    )
+else:
+    health_score, health_label = None, "Insufficient comparable sample"
 
 best_hour, worst_hour, hour_perf_df = best_worst_time_of_day(backtest_trades_df)
 
@@ -5269,16 +5204,18 @@ elif bear_count >= 3:
 else:
     mtf_grade = "Mixed Timeframes"
 
-mtf_confirmation = "Neutral"
-if analysis["signal_type"] == "buy" and htf_bias == "bullish":
-    mtf_confirmation = "Bullish Alignment"
-elif analysis["signal_type"] == "sell" and htf_bias == "bearish":
-    mtf_confirmation = "Bearish Alignment"
-elif analysis["signal_type"] in ["buy", "sell"]:
-    mtf_confirmation = "Timeframe Conflict"
+mtf_confirmation = "Mixed / unavailable"
+if analysis["signal_type"] == "buy":
+    mtf_confirmation = "Bullish Alignment" if analysis.get("mtf_bull_ok") or htf_bias == "bullish" else "No bullish confirmation"
+elif analysis["signal_type"] == "sell":
+    mtf_confirmation = "Bearish Alignment" if analysis.get("mtf_bear_ok") or htf_bias == "bearish" else "No bearish confirmation"
+else:
+    mtf_confirmation = "No approved directional setup"
 
-quality_score = (analysis["win_chance"] + analysis["confidence"] + analysis["validation_score"]) / 3
-if quality_score >= 85:
+quality_score = float(analysis.get("trade_quality_score", 0) or 0)
+if not analysis.get("trade_allowed", False):
+    signal_quality = "No Valid Setup"
+elif quality_score >= 85:
     signal_quality = "Excellent"
 elif quality_score >= 70:
     signal_quality = "Strong"
@@ -5302,12 +5239,15 @@ closed_auto = 0
 option_suggestion = suggest_option_strike(selected, analysis["close_price"], analysis["signal_type"])
 expiry_seconds = get_signal_expiry_remaining(selected, timeframe, analysis["signal_text"])
 
+_confidence_text = f"{analysis['confidence']}%" if analysis.get("confidence") is not None else "N/A (no approved setup)"
+_win_rate_text = (f"{analysis['win_chance']:.1f}% from {analysis.get('win_chance_sample_size', 0)} comparable trades"
+                  if analysis.get("win_chance") is not None else "N/A (requires 30+ comparable trades)")
 alert_text = (
     f"{selected} | {timeframe} | {analysis['signal_text']} | "
     f"Grade: {analysis['strategy_grade']} | Validation: {analysis['validation_score']} | "
-    f"Quality: {analysis['trade_quality_score']} | Confidence: {analysis['confidence']}% | "
-    f"Win Chance: {analysis['win_chance']}% | Price: {round(current_display_price, 2)} | "
-    f"RR: {analysis['rr_ratio']} | OC: {dynamic_oc_symbol} | {option_suggestion['text']}"
+    f"Quality: {analysis['trade_quality_score']} | Setup Confidence: {_confidence_text} | "
+    f"Backtest Win Rate: {_win_rate_text} | Price: {round(current_display_price, 2)} | "
+    f"RR: {analysis['rr_ratio'] if analysis['rr_ratio'] is not None else 'N/A'} | OC: {dynamic_oc_symbol} | {option_suggestion['text']}"
 )
 
 current_signal_key = f"{selected}|{timeframe}|{analysis['signal_text']}|{round(analysis['close_price'], 2)}"
@@ -5397,6 +5337,19 @@ elif analysis["signal_type"] == "sell":
 else:
     st.warning(alert_text)
 
+with st.expander("Signal scoring breakdown and entry blockers", expanded=(analysis.get("signal_type") == "neutral")):
+    st.write(f"Directional bias: **{analysis.get('directional_bias', 'Neutral')}** | Bullish score: **{analysis.get('bullish_score', 0)}** | Bearish score: **{analysis.get('bearish_score', 0)}** | Edge: **{analysis.get('directional_edge', 0)}**")
+    st.write(f"Trend structure: **BUY {analysis.get('buy_trend_votes', 0)}/{analysis.get('trend_vote_count', 3)}** | **SELL {analysis.get('sell_trend_votes', 0)}/{analysis.get('trend_vote_count', 3)}**")
+    st.write(f"MTF data available: **{analysis.get('mtf_available_count', 0)}/4** | Volume data reliable: **{'Yes' if analysis.get('volume_data_available') else 'No'}** | PCR: **{analysis.get('pcr') if analysis.get('pcr') is not None else 'N/A'}**")
+    if analysis.get("no_trade_reasons"):
+        st.markdown("**Why no trade:**")
+        for _reason in analysis["no_trade_reasons"]:
+            st.write(f"• {_reason}")
+    else:
+        st.markdown("**Why this setup qualified:**")
+        for _reason in analysis.get("reasons", [])[-8:]:
+            st.write(f"• {_reason}")
+
 if expiry_seconds is not None:
     st.info(f"Signal Expiry Remaining: {expiry_seconds} sec")
 
@@ -5409,7 +5362,7 @@ with sv2:
 with sv3:
     st.metric("Trade Quality", analysis["trade_quality_score"])
 with sv4:
-    st.metric("Health Score", health_score)
+    st.metric("Health Score", health_score if health_score is not None else "N/A")
 with sv5:
     st.metric("Health Label", health_label)
 with sv6:
@@ -5438,15 +5391,17 @@ with top1:
 with top2:
     st.metric("Signal", analysis["signal_text"])
 with top3:
-    st.metric("Win Chance %", analysis["win_chance"])
+    st.metric("Backtest Win Rate", f"{analysis['win_chance']:.1f}%" if analysis.get("win_chance") is not None else "N/A")
 with top4:
-    st.metric("Confidence %", analysis["confidence"])
+    st.metric("Setup Confidence", f"{analysis['confidence']}%" if analysis.get("confidence") is not None else "N/A")
+st.caption("Setup confidence is a structural score, not a predicted probability. Backtest win rate is shown only after 30+ comparable same-engine trades.")
 
 a1, a2, a3, a4, a5, a6 = st.columns(6)
 with a1:
     st.metric("ADX", round(analysis["adx"], 2))
 with a2:
-    st.metric("EMA200 Confirm", "Yes" if ((analysis["signal_type"] == "buy" and analysis["close_price"] > analysis["ema200"]) or (analysis["signal_type"] == "sell" and analysis["close_price"] < analysis["ema200"])) else "No")
+    _ema200_position = ("Above / bullish" if analysis["close_price"] > analysis["ema200"] else "Below / bearish" if analysis["close_price"] < analysis["ema200"] else "At EMA200") if analysis.get("ema200_available") else "Not mature"
+    st.metric("Price vs EMA200", _ema200_position)
 with a3:
     st.metric("SuperTrend", "Bullish" if analysis["supertrend_direction"] == 1 else "Bearish" if analysis["supertrend_direction"] == -1 else "Neutral")
 with a4:
@@ -5470,7 +5425,7 @@ with b2:
 with b3:
     st.metric("EMA50", round(analysis["ema50"], 2))
 with b4:
-    st.metric("EMA200", round(analysis["ema200"], 2))
+    st.metric("EMA200", round(analysis["ema200"], 2) if analysis.get("ema200_available") else "N/A — need 200 bars")
 with b5:
     st.metric("RSI", round(analysis["rsi"], 2))
 with b6:
@@ -5496,7 +5451,7 @@ with score3:
 with score4:
     st.metric("OI Bias", analysis["oi_bias"])
 
-c1, c2, c3, c4, c5, c6 = st.columns(6)
+c1, c2, c3, c4 = st.columns(4)
 with c1:
     st.metric("Support", round(analysis["support"], 2))
 with c2:
@@ -5504,10 +5459,6 @@ with c2:
 with c3:
     st.metric("Gap %", analysis["gap_pct"])
 with c4:
-    st.metric("OI Bias", analysis["oi_bias"])
-with c5:
-    st.metric("PCR", analysis["pcr"] if analysis["pcr"] is not None else "N/A")
-with c6:
     st.metric("No Trade Zone", "Yes" if analysis["no_trade_zone"] else "No")
 
 r1, r2, r3, r4 = st.columns(4)
@@ -5782,6 +5733,8 @@ if backtest_trades_df.empty:
 else:
     method_note = "EMA trend/pullback fallback" if ("Method" in backtest_trades_df.columns and backtest_trades_df["Method"].eq("EMA trend/pullback fallback").any()) else "Composite signal engine"
     st.caption(f"Trades generated: {len(backtest_trades_df)} | Engine: {method_note}. Results are historical simulations, not guaranteed future performance.")
+    if not backtest_is_comparable:
+        st.info("This sample is not eligible for the dashboard's historical win-rate estimate. It is a fallback or has fewer than 30 comparable composite-engine trades.")
 ba1, ba2, ba3, ba4, ba5, ba6 = st.columns(6)
 with ba1:
     st.metric("Backtest Wins", wins)
@@ -5790,7 +5743,7 @@ with ba2:
 with ba3:
     st.metric("Total Trades", total_trades)
 with ba4:
-    st.metric("Backtest Win Rate", f"{backtest_win_rate:.1f}%")
+    st.metric("Backtest Win Rate", f"{backtest_win_rate:.1f}%" if backtest_is_comparable else "N/A")
 with ba5:
     st.metric("Profit Factor", stats["profit_factor"])
 with ba6:
@@ -5825,12 +5778,14 @@ wf1, wf2, wf3, wf4 = st.columns(4)
 with wf1:
     st.metric("Folds", walk_forward_result["folds"])
 with wf2:
-    st.metric("Avg Win Rate", walk_forward_result["avg_win_rate"])
+    st.metric("Validated Folds", walk_forward_result.get("validated_folds", 0))
 with wf3:
-    st.metric("Avg Profit Factor", walk_forward_result["avg_profit_factor"])
+    st.metric("Avg Win Rate", f"{walk_forward_result['avg_win_rate']:.2f}%" if walk_forward_result.get("avg_win_rate") is not None else "N/A")
 with wf4:
-    st.metric("Avg Expectancy", walk_forward_result["avg_expectancy"])
+    st.metric("Avg Profit Factor", f"{walk_forward_result['avg_profit_factor']:.2f}" if walk_forward_result.get("avg_profit_factor") is not None else "N/A")
 
+if walk_forward_result.get("avg_expectancy") is not None:
+    st.caption(f"Average validated-fold expectancy: {walk_forward_result['avg_expectancy']:.2f} points per unit")
 if not walk_forward_result["table"].empty:
     st.dataframe(walk_forward_result["table"], use_container_width=True)
 else:
