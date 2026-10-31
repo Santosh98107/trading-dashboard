@@ -13,6 +13,9 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 import yfinance as yf
+
+# Visible deployment marker: confirms which source file Streamlit Cloud is running.
+APP_BUILD_ID = "2026-11-01-ANGEL-PIN-DIAGNOSTIC-01"
 # Optional integrations: Yahoo mode must still start if Angel SDK/TOTP or
 # the auto-refresh helper is not installed.
 try:
@@ -3168,6 +3171,7 @@ ANGEL_TRADING_SYMBOLS = {
 
 st.title("Elite Trading Dashboard Final Ultimate")
 st.caption("Polling First | Walk Forward | Auto Exit | News Filter | Dynamic Option Chain")
+st.sidebar.caption(f"App build: {APP_BUILD_ID}")
 
 debug_mode = st.sidebar.checkbox("Debug Mode", value=False)
 selected = st.selectbox("Select Stock / Index", list(stocks.keys()))
@@ -3256,6 +3260,35 @@ if all((angel_api_key, angel_client_code, angel_pin, angel_totp_secret)):
     st.session_state["angel_saved_client_code"] = angel_client_code
     st.session_state["angel_saved_pin"] = angel_pin
     st.session_state["angel_saved_totp_secret"] = angel_totp_secret
+
+# Debug only: expose presence flags, never credential contents. This helps distinguish
+# a stale Cloud deployment from Streamlit session-state loss after a successful login.
+if debug_mode:
+    _debug_api = str(angel_api_key or "").strip()
+    _debug_client = str(angel_client_code or "").strip()
+    _debug_pin = str(angel_pin or "").strip()
+    _debug_totp = str(angel_totp_secret or "").strip()
+    _debug_expected_cache_key = f"{_debug_client}_{_debug_api}"
+    _debug_cached_session = st.session_state.get("angel_session")
+    _debug_cached_session_data = (
+        _debug_cached_session.get("data")
+        if isinstance(_debug_cached_session, dict) else None
+    )
+    _debug_cache_match = bool(
+        st.session_state.get("angel_api") is not None
+        and _debug_cached_session_data
+        and st.session_state.get("angel_cache_key") == _debug_expected_cache_key
+    )
+    st.sidebar.markdown("**Angel credential diagnostics (presence only)**")
+    st.sidebar.write({
+        "API Key present": bool(_debug_api),
+        "Client Code present": bool(_debug_client),
+        "PIN present in current/session values": bool(_debug_pin),
+        "PIN saved in app session": bool(st.session_state.get("angel_saved_pin")),
+        "TOTP Secret present": bool(_debug_totp),
+        "Authenticated Angel session present": bool(_debug_cached_session_data),
+        "Session matches API Key + Client Code": _debug_cache_match,
+    })
 
 ticker = stocks[selected]
 
