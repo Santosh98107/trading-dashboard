@@ -3,6 +3,7 @@ import json
 import math
 import shutil
 import hashlib
+import hmac
 from datetime import datetime, timedelta, time, timezone
 import threading
 import time as pytime
@@ -15,7 +16,7 @@ import streamlit as st
 import yfinance as yf
 
 # Visible deployment marker: confirms which source file Streamlit Cloud is running.
-APP_BUILD_ID = "2026-11-01-LIVE-GLOBAL-INDIA-BOARD-10"
+APP_BUILD_ID = "2026-11-01-MANUAL-AUTO-PASSWORD-11"
 # Optional integrations: Yahoo mode must still start if Angel SDK/TOTP or
 # the auto-refresh helper is not installed.
 try:
@@ -393,6 +394,43 @@ def save_signal_audit(df):
     safe_write_csv(df, SIGNAL_AUDIT_FILE)
 
 
+def update_logged_in_password(username, current_password, new_password, confirm_password):
+    """Change the current user's password after verifying the existing password."""
+    username = str(username or "").strip()
+    current_password = str(current_password or "")
+    new_password = str(new_password or "")
+    confirm_password = str(confirm_password or "")
+
+    if not username:
+        return False, "No logged-in username was found. Please log in again."
+    if not current_password or not new_password or not confirm_password:
+        return False, "Fill all password fields."
+    if len(new_password) < 8:
+        return False, "New password must contain at least 8 characters."
+    if new_password != confirm_password:
+        return False, "New password and confirmation do not match."
+    if hmac.compare_digest(new_password, current_password):
+        return False, "New password must be different from the current password."
+
+    users = safe_read_csv(USERS_FILE, pd.DataFrame(columns=["username", "password"]))
+    if users.empty or not {"username", "password"}.issubset(users.columns):
+        return False, "User database is unavailable or has an invalid format."
+
+    user_mask = users["username"].astype(str).str.strip() == username
+    if not user_mask.any():
+        return False, "The logged-in user was not found in the user database."
+
+    stored_hash = str(users.loc[user_mask, "password"].iloc[0]).strip()
+    if not hmac.compare_digest(stored_hash, hash_password(current_password)):
+        return False, "Current password is incorrect."
+
+    users.loc[user_mask, "password"] = hash_password(new_password)
+    if not safe_write_csv(users, USERS_FILE):
+        return False, "Password could not be saved. Check app file permissions and error log."
+
+    return True, "Password updated successfully. Use the new password next time you log in."
+
+
 # =========================================================
 # AUTH
 # =========================================================
@@ -427,7 +465,26 @@ def login_panel():
         st.stop()
 
     st.sidebar.success(f"Logged in as: {st.session_state.username}")
-    if st.sidebar.button("Logout"):
+
+    # Password reset/change is available only inside an authenticated session.
+    # The current password is verified before the stored hash is replaced.
+    with st.sidebar.expander("Change / Reset Password", expanded=False):
+        with st.form("change_logged_in_password_form", clear_on_submit=True):
+            current_password = st.text_input("Current password", type="password", key="pwd_reset_current")
+            new_password = st.text_input("New password (minimum 8 characters)", type="password", key="pwd_reset_new")
+            confirm_password = st.text_input("Confirm new password", type="password", key="pwd_reset_confirm")
+            submit_password_change = st.form_submit_button("Update Password", use_container_width=True)
+        if submit_password_change:
+            changed, message = update_logged_in_password(
+                st.session_state.username, current_password, new_password, confirm_password
+            )
+            if changed:
+                st.success(message)
+            else:
+                st.error(message)
+        st.caption("For account security, the current password is required. Passwords are stored as hashes, not plain text.")
+
+    if st.sidebar.button("Logout", key="logout_button"):
         st.session_state.logged_in = False
         st.session_state.username = ""
         st.rerun()
@@ -3890,14 +3947,50 @@ debug_mode = st.sidebar.checkbox("Debug Mode", value=False)
 selected = st.selectbox("Select Stock / Index", list(stocks.keys()))
 data_source = st.radio("Data Source", ["Yahoo", "Angel"], horizontal=True)
 timeframe = st.selectbox("Select Time Frame", ["1m", "3m", "5m", "10m", "15m", "30m", "1h", "1d"])
-auto_refresh = st.checkbox("Enable Auto Refresh", value=False, help="Keep OFF during the first data connection test. Turn ON after candles load.")
-refresh_seconds = st.selectbox("Refresh Every (seconds)", [5, 10, 15, 30, 60], index=1)
-refresh_market_now = st.button("Refresh market data now", key="refresh_primary_market_data")
+
+st.subheader("Market Data Refresh Controls")
+refresh_col1, refresh_col2, refresh_col3 = st.columns([1.25, 1.0, 1.0])
+with refresh_col1:
+    refresh_market_now = st.button(
+        "🔄 Manual Refresh Now", key="refresh_primary_market_data",
+        type="primary", use_container_width=True,
+        help="Clear market-data caches and request fresh data from the selected provider."
+    )
+with refresh_col2:
+    auto_refresh = st.toggle(
+        "Enable Auto Refresh", value=False, key="auto_refresh_enabled",
+        help="Turn automatic page refresh ON or OFF. Manual refresh remains available either way."
+    )
+with refresh_col3:
+    refresh_seconds = st.selectbox(
+        "Auto interval (seconds)", [5, 10, 15, 30, 60], index=1,
+        key="auto_refresh_interval_seconds", disabled=not auto_refresh
+    )
+
 if refresh_market_now:
-    fetch_data.clear()
-    fetch_yahoo_batch.clear()
-    build_nifty_top30_scanner.clear()
+    # Flush every market-data cache used by the board, scanner, chart and context panels.
+    for _cached_fn in (
+        fetch_data, fetch_yahoo_batch, build_nifty_top30_scanner,
+        get_news_events, get_option_chain_snapshot
+    ):
+        try:
+            _cached_fn.clear()
+        except Exception as _cache_clear_error:
+            log_app_error("manual_refresh_cache_clear", _cache_clear_error)
     st.session_state["angel_history_cache"] = {}
+    st.session_state["last_manual_refresh_at"] = now_str()
+    st.session_state["force_market_refresh"] = True
+else:
+    st.session_state["force_market_refresh"] = False
+
+if st.session_state.get("last_manual_refresh_at"):
+    st.caption("Last manual refresh: " + str(st.session_state["last_manual_refresh_at"]))
+if auto_refresh and AUTO_REFRESH_AVAILABLE:
+    st.caption(f"Auto refresh is ON — every {refresh_seconds} seconds. Manual refresh is still available.")
+elif auto_refresh and not AUTO_REFRESH_AVAILABLE:
+    st.warning("Auto refresh is enabled in the UI, but streamlit-autorefresh is unavailable. Reinstall requirements.txt and redeploy.")
+else:
+    st.caption("Auto refresh is OFF. Use Manual Refresh Now whenever you want fresh data.")
 
 # Keep this above the OHLC no-data guard: the global/macro and Indian share
 # boards must continue to refresh even if the selected primary chart feed fails.
@@ -4141,7 +4234,7 @@ if data_source == "Angel":
             angel_candles_response = get_angel_candles_cached(
                 angel_api_key, angel_client_code, angel_pin,
                 angel_totp_secret, selected, angel_interval,
-                force_refresh=refresh_market_now
+                force_refresh=bool(refresh_market_now or st.session_state.get("force_market_refresh", False))
             )
         angel_candle_diagnostics = summarize_angel_candle_response(angel_candles_response)
         data = candles_to_df(angel_candles_response)
@@ -4183,7 +4276,7 @@ else:
         angel_candles_response = get_angel_candles_cached(
             angel_api_key, angel_client_code, angel_pin,
             angel_totp_secret, selected, angel_interval,
-            force_refresh=refresh_market_now
+            force_refresh=bool(refresh_market_now or st.session_state.get("force_market_refresh", False))
         )
         angel_candle_diagnostics = summarize_angel_candle_response(angel_candles_response)
         angel_fallback = candles_to_df(angel_candles_response)
