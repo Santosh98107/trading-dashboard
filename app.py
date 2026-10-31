@@ -16,7 +16,7 @@ import streamlit as st
 import yfinance as yf
 
 # Visible deployment marker: confirms which source file Streamlit Cloud is running.
-APP_BUILD_ID = "2026-11-01-PAPER-EXIT-MODE-CLEAN-13"
+APP_BUILD_ID = "2026-11-01-MARKETAUX-NEWS-INTEGRATION-14"
 # Optional integrations: Yahoo mode must still start if Angel SDK/TOTP or
 # the auto-refresh helper is not installed.
 try:
@@ -2051,60 +2051,330 @@ def render_nifty_scanner_result(scanner_df):
 
 
 # =========================================================
-# NEWS FILTER API
+# NEWS FILTER API — MARKETaux PRIMARY, NEWSAPI LEGACY
 # =========================================================
-@st.cache_data(ttl=300)
-def get_news_events(news_api_key, symbol):
-    if not news_api_key:
-        return {"allow_trade": True, "message": "News API key not configured", "events": []}
+MARKETAUX_NEWS_URL = "https://api.marketaux.com/v1/news/all"
+
+NEWS_SEARCH_ALIASES = {
+    "NIFTY": '"NIFTY 50"|NIFTY|"Indian stock market"|"NSE India"|RBI',
+    "BANKNIFTY": '"Bank Nifty"|"NIFTY Bank"|BANKNIFTY|"Indian banks"',
+    "SENSEX": 'SENSEX|"BSE Sensex"|"Bombay Stock Exchange"|"Indian stock market"',
+    "RELIANCE": '"Reliance Industries"|RELIANCE',
+    "HDFCBANK": '"HDFC Bank"|HDFCBANK',
+    "ICICIBANK": '"ICICI Bank"|ICICIBANK',
+    "SBIN": '"State Bank of India"|SBIN|"SBI Bank"',
+    "AXISBANK": '"Axis Bank"|AXISBANK',
+    "KOTAKBANK": '"Kotak Mahindra Bank"|KOTAKBANK|"Kotak Bank"',
+    "TCS": '"Tata Consultancy Services"|TCS',
+    "INFY": '"Infosys Limited"|INFY|Infosys',
+    "HCLTECH": '"HCL Technologies"|HCLTECH',
+    "WIPRO": 'Wipro|WIPRO',
+    "TECHM": '"Tech Mahindra"|TECHM',
+    "TMPV": '"Tata Motors"|TMPV',
+    "MARUTI": '"Maruti Suzuki"|MARUTI',
+    "M&M": '"Mahindra and Mahindra"|"Mahindra & Mahindra"|M&M',
+    "BAJAJ-AUTO": '"Bajaj Auto"|BAJAJ-AUTO',
+    "HEROMOTOCO": '"Hero MotoCorp"|HEROMOTOCO',
+    "ITC": '"ITC Limited"|ITC India',
+    "LT": '"Larsen and Toubro"|"Larsen & Toubro"',
+    "BHARTIARTL": '"Bharti Airtel"|BHARTIARTL',
+    "SUNPHARMA": '"Sun Pharmaceutical"|SUNPHARMA|"Sun Pharma"',
+    "TITAN": '"Titan Company"|TITAN',
+    "NTPC": 'NTPC|"National Thermal Power Corporation"',
+    "BEL": '"Bharat Electronics"|BEL India',
+    "ONGC": 'ONGC|"Oil and Natural Gas Corporation"',
+    "ADANIPORTS": '"Adani Ports"|ADANIPORTS',
+    "POWERGRID": '"Power Grid Corporation"|POWERGRID',
+    "TRENT": 'Trent Limited|TRENT India',
+    "JSWSTEEL": '"JSW Steel"|JSWSTEEL',
+    "TATASTEEL": '"Tata Steel"|TATASTEEL',
+}
+
+NEWS_ENTITY_MATCH_ALIASES = {
+    "NIFTY": ("NIFTY", "NIFTY 50"),
+    "BANKNIFTY": ("BANKNIFTY", "BANK NIFTY", "NIFTY BANK"),
+    "SENSEX": ("SENSEX", "BSE SENSEX"),
+    "RELIANCE": ("RELIANCE", "RELIANCE INDUSTRIES"),
+    "HDFCBANK": ("HDFCBANK", "HDFC BANK"),
+    "ICICIBANK": ("ICICIBANK", "ICICI BANK"),
+    "SBIN": ("SBIN", "STATE BANK OF INDIA"),
+    "AXISBANK": ("AXISBANK", "AXIS BANK"),
+    "KOTAKBANK": ("KOTAKBANK", "KOTAK MAHINDRA BANK", "KOTAK BANK"),
+    "TCS": ("TCS", "TATA CONSULTANCY SERVICES"),
+    "INFY": ("INFY", "INFOSYS"),
+    "HCLTECH": ("HCLTECH", "HCL TECHNOLOGIES"),
+    "WIPRO": ("WIPRO",),
+    "TECHM": ("TECHM", "TECH MAHINDRA"),
+    "TMPV": ("TMPV", "TATA MOTORS"),
+    "MARUTI": ("MARUTI", "MARUTI SUZUKI"),
+    "M&M": ("M&M", "MAHINDRA AND MAHINDRA", "MAHINDRA & MAHINDRA"),
+    "BAJAJ-AUTO": ("BAJAJ-AUTO", "BAJAJ AUTO"),
+    "HEROMOTOCO": ("HEROMOTOCO", "HERO MOTOCORP"),
+    "ITC": ("ITC", "ITC LIMITED"),
+    "LT": ("LARSEN AND TOUBRO", "LARSEN & TOUBRO"),
+    "BHARTIARTL": ("BHARTIARTL", "BHARTI AIRTEL"),
+    "SUNPHARMA": ("SUNPHARMA", "SUN PHARMACEUTICAL", "SUN PHARMA"),
+    "TITAN": ("TITAN", "TITAN COMPANY"),
+    "NTPC": ("NTPC",),
+    "BEL": ("BEL", "BHARAT ELECTRONICS"),
+    "ONGC": ("ONGC", "OIL AND NATURAL GAS CORPORATION"),
+    "ADANIPORTS": ("ADANIPORTS", "ADANI PORTS"),
+    "POWERGRID": ("POWERGRID", "POWER GRID CORPORATION"),
+    "TRENT": ("TRENT", "TRENT LIMITED"),
+    "JSWSTEEL": ("JSWSTEEL", "JSW STEEL"),
+    "TATASTEEL": ("TATASTEEL", "TATA STEEL"),
+}
+
+NEWS_HIGH_IMPACT_TERMS = (
+    "rbi policy", "reserve bank", "monetary policy", "interest rate", "rate hike",
+    "rate cut", "inflation", "quarterly results", "earnings", "profit warning",
+    "revenue warning", "guidance", "sebi", "regulatory action", "investigation",
+    "fraud", "default", "bankruptcy", "downgrade", "credit rating", "merger",
+    "acquisition", "sanction", "tariff", "war", "geopolitical", "terror attack",
+    "market crash", "trading halt", "trading suspension", "liquidity crisis",
+    "government budget", "union budget", "fomc", "federal reserve", "ceasefire",
+)
+
+
+def _read_news_secret(secret_name):
+    """Read optional deployment secret without exposing it in the UI or logs."""
+    value = os.getenv(secret_name, "")
+    if value:
+        return str(value).strip()
     try:
-        query = symbol
-        url = "https://newsapi.org/v2/everything"
-        params = {
-            "q": query,
-            "sortBy": "publishedAt",
-            "pageSize": 10,
-            "language": "en",
-            "apiKey": news_api_key
-        }
-        resp = requests.get(url, params=params, timeout=10)
-        if resp.status_code != 200:
-            return {"allow_trade": True, "message": f"News API unavailable ({resp.status_code})", "events": []}
+        value = st.secrets.get(secret_name, "")
+    except Exception:
+        value = ""
+    return str(value or "").strip()
 
-        data = resp.json()
-        articles = data.get("articles", [])
-        important = []
-        keywords = ["results", "earnings", "fed", "inflation", "policy", "rbi", "rate", "war", "crash", "merger", "acquisition", "guidance"]
 
-        now_dt = datetime.utcnow()
-        for a in articles:
-            title = (a.get("title") or "").lower()
-            published = a.get("publishedAt")
-            try:
-                pub_dt = datetime.fromisoformat(published.replace("Z", "+00:00")).replace(tzinfo=None)
-            except Exception:
-                pub_dt = None
+def _news_failure(provider, message):
+    # Fail closed when the news filter is explicitly enabled but the provider
+    # cannot be checked. This prevents silently bypassing the selected filter.
+    return {
+        "allow_trade": False,
+        "message": str(message),
+        "events": [],
+        "provider": provider,
+        "status": "error",
+        "article_count": 0,
+        "sentiment_bias": "N/A",
+        "average_sentiment": None,
+    }
 
-            recent = False
-            if pub_dt is not None:
-                recent = (now_dt - pub_dt) <= timedelta(hours=6)
 
-            if any(k in title for k in keywords) and recent:
-                important.append({
-                    "title": a.get("title"),
-                    "source": a.get("source", {}).get("name", ""),
-                    "publishedAt": published
-                })
+def _news_parse_datetime(value):
+    if not value:
+        return None
+    try:
+        parsed = pd.to_datetime(value, utc=True, errors="coerce")
+        if pd.isna(parsed):
+            return None
+        return parsed.to_pydatetime()
+    except Exception:
+        return None
 
-        allow_trade = len(important) == 0
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_news_events(api_key, symbol, provider="Marketaux", lookback_hours=6, article_limit=10):
+    """Fetch recent financial news and derive a transparent event-risk summary.
+
+    Marketaux is the preferred provider. NewsAPI remains available as a legacy
+    option. API tokens are only request parameters and are never written to disk.
+    """
+    provider = str(provider or "Marketaux").strip()
+    provider_key = provider.lower()
+    symbol = str(symbol or "NIFTY").strip().upper()
+    try:
+        lookback_hours = max(1, min(int(lookback_hours), 72))
+    except Exception:
+        lookback_hours = 6
+    try:
+        article_limit = max(1, min(int(article_limit), 50))
+    except Exception:
+        article_limit = 10
+
+    if not str(api_key or "").strip():
+        return _news_failure(provider, f"{provider} API token is missing. Enter the key in News Filter API settings or configure it in Streamlit secrets.")
+
+    now_utc = datetime.now(timezone.utc)
+    after_utc = now_utc - timedelta(hours=lookback_hours)
+    articles = []
+
+    try:
+        if provider_key == "marketaux":
+            search_terms = NEWS_SEARCH_ALIASES.get(symbol, f'"{symbol}"|{symbol}')
+            # Marketaux /v1/news/all accepts api_token, search, country,
+            # language, published_after, group_similar and limit parameters.
+            params = {
+                "api_token": str(api_key).strip(),
+                "search": search_terms,
+                "countries": "in",
+                "language": "en",
+                "published_after": after_utc.strftime("%Y-%m-%dT%H:%M"),
+                "group_similar": "true",
+                "limit": article_limit,
+            }
+            response = requests.get(MARKETAUX_NEWS_URL, params=params, timeout=12)
+            if response.status_code != 200:
+                detail = ""
+                try:
+                    payload = response.json()
+                    err = payload.get("error") or payload.get("errors") or payload.get("message")
+                    if isinstance(err, (dict, list)):
+                        detail = json.dumps(err, ensure_ascii=False)[:240]
+                    elif err:
+                        detail = str(err)[:240]
+                except Exception:
+                    detail = ""
+                if detail and str(api_key).strip():
+                    detail = detail.replace(str(api_key).strip(), "[redacted]")
+                suffix = f": {detail}" if detail else ""
+                return _news_failure("Marketaux", f"Marketaux API returned HTTP {response.status_code}{suffix}. Check the token, plan limit and API availability.")
+            payload = response.json()
+            if not isinstance(payload, dict):
+                return _news_failure("Marketaux", "Marketaux returned an unexpected response format.")
+            articles = payload.get("data") or []
+            if not isinstance(articles, list):
+                return _news_failure("Marketaux", "Marketaux response did not contain a valid article list.")
+
+        elif provider_key in ("newsapi", "newsapi (legacy)"):
+            params = {
+                "q": symbol,
+                "sortBy": "publishedAt",
+                "pageSize": min(article_limit, 100),
+                "language": "en",
+                "from": after_utc.strftime("%Y-%m-%dT%H:%M:%S"),
+                "apiKey": str(api_key).strip(),
+            }
+            response = requests.get("https://newsapi.org/v2/everything", params=params, timeout=12)
+            if response.status_code != 200:
+                try:
+                    payload = response.json()
+                    detail = str(payload.get("message") or payload.get("code") or "")[:240]
+                except Exception:
+                    detail = ""
+                suffix = f": {detail}" if detail else ""
+                return _news_failure("NewsAPI", f"NewsAPI returned HTTP {response.status_code}{suffix}.")
+            payload = response.json()
+            if not isinstance(payload, dict) or payload.get("status") != "ok":
+                return _news_failure("NewsAPI", "NewsAPI returned an unsuccessful or unexpected response.")
+            articles = payload.get("articles") or []
+        else:
+            return _news_failure(provider, "Unsupported news provider selected.")
+
+        events = []
+        sentiment_values = []
+        high_impact_count = 0
+        strong_negative_count = 0
+        for article in articles[:article_limit]:
+            title = str(article.get("title") or "Untitled news article").strip()
+            description = str(article.get("description") or article.get("snippet") or "").strip()
+            published = article.get("published_at") or article.get("publishedAt")
+            published_dt = _news_parse_datetime(published)
+            is_recent = bool(published_dt and after_utc <= published_dt <= now_utc + timedelta(minutes=5))
+
+            if provider_key == "marketaux":
+                source = str(article.get("source") or "Marketaux")
+                article_url = str(article.get("url") or "")
+                entity_rows = article.get("entities") or []
+                entity_labels = []
+                selected_scores = []
+                relevant_aliases = NEWS_ENTITY_MATCH_ALIASES.get(symbol, (symbol,))
+                for entity in entity_rows:
+                    if not isinstance(entity, dict):
+                        continue
+                    entity_symbol = str(entity.get("symbol") or "").upper()
+                    entity_name = str(entity.get("name") or "")
+                    entity_labels.append(entity_symbol or entity_name)
+                    entity_identity = f"{entity_symbol} {entity_name}".upper()
+                    is_selected_entity = any(alias.upper() in entity_identity for alias in relevant_aliases)
+                    raw_score = entity.get("sentiment_score")
+                    try:
+                        score = float(raw_score)
+                        if is_selected_entity and math.isfinite(score) and -1.0 <= score <= 1.0:
+                            selected_scores.append(score)
+                    except (TypeError, ValueError):
+                        pass
+                sentiment_score = float(np.mean(selected_scores)) if selected_scores else None
+            else:
+                source_obj = article.get("source") or {}
+                source = str(source_obj.get("name") or "NewsAPI") if isinstance(source_obj, dict) else "NewsAPI"
+                article_url = str(article.get("url") or "")
+                entity_labels = []
+                sentiment_score = None
+
+            combined_text = f"{title} {description}".lower()
+            matched_terms = [term for term in NEWS_HIGH_IMPACT_TERMS if term in combined_text]
+            negative_sentiment = sentiment_score is not None and sentiment_score <= -0.55
+            high_impact = bool(is_recent and matched_terms)
+            strong_negative = bool(is_recent and negative_sentiment)
+            risk_flag = high_impact or strong_negative
+            if high_impact:
+                high_impact_count += 1
+            if strong_negative:
+                strong_negative_count += 1
+            if is_recent and sentiment_score is not None:
+                sentiment_values.append(sentiment_score)
+
+            events.append({
+                "Title": title,
+                "Source": source,
+                "Published (UTC)": published or "N/A",
+                "Sentiment": round(sentiment_score, 3) if sentiment_score is not None else "N/A",
+                "Entities": ", ".join(dict.fromkeys([x for x in entity_labels if x])) or "N/A",
+                "Risk Flag": "HIGH IMPACT / NEGATIVE" if risk_flag else "Normal",
+                "Risk Reason": (", ".join(matched_terms) if high_impact else ("Strong negative entity sentiment" if strong_negative else "")),
+                "Article": article_url,
+                "Description": description[:500],
+                "_recent": is_recent,
+            })
+
+        # Keep the visible event list recent; the API already filters by time,
+        # but this extra check avoids provider-side date boundary surprises.
+        recent_events = [event for event in events if event.get("_recent")]
+        for event in recent_events:
+            event.pop("_recent", None)
+        average_sentiment = float(np.mean(sentiment_values)) if sentiment_values else None
+        if average_sentiment is None:
+            sentiment_bias = "N/A"
+        elif average_sentiment >= 0.15:
+            sentiment_bias = "Positive"
+        elif average_sentiment <= -0.15:
+            sentiment_bias = "Negative"
+        else:
+            sentiment_bias = "Neutral"
+
+        allow_trade = not any(
+            str(event.get("Risk Flag", "Normal")) != "Normal" for event in recent_events
+        )
+        if high_impact_count or strong_negative_count:
+            message = f"News risk detected: {high_impact_count} high-impact headline(s), {strong_negative_count} strongly negative sentiment item(s) within {lookback_hours}h. New signal entries are blocked by the news filter."
+        elif recent_events:
+            message = f"{len(recent_events)} recent relevant article(s); no configured high-impact or strong-negative risk flag detected."
+        else:
+            message = f"No recent relevant articles returned for {symbol} in the last {lookback_hours}h."
+
         return {
             "allow_trade": allow_trade,
-            "message": "No high-impact recent news" if allow_trade else "High-impact recent news detected",
-            "events": important
+            "message": message,
+            "events": recent_events,
+            "provider": "Marketaux" if provider_key == "marketaux" else "NewsAPI",
+            "status": "ok",
+            "article_count": len(recent_events),
+            "sentiment_bias": sentiment_bias,
+            "average_sentiment": round(average_sentiment, 3) if average_sentiment is not None else None,
         }
-    except Exception as e:
-        log_app_error("get_news_events", e)
-        return {"allow_trade": True, "message": "News filter fallback", "events": []}
+    except requests.Timeout:
+        log_app_error("get_news_events", f"{provider} request timed out")
+        return _news_failure(provider, f"{provider} request timed out. News filter is unavailable; new signal entries are paused.")
+    except requests.RequestException as exc:
+        # Avoid logging request URLs: providers receive API tokens in query params.
+        log_app_error("get_news_events", f"{provider} network error: {type(exc).__name__}")
+        return _news_failure(provider, f"{provider} network error ({type(exc).__name__}). News filter is unavailable; new signal entries are paused.")
+    except Exception as exc:
+        log_app_error("get_news_events", f"{provider} parsing error: {type(exc).__name__}")
+        return _news_failure(provider, f"{provider} response could not be processed ({type(exc).__name__}). News filter is unavailable; new signal entries are paused.")
 
 
 # =========================================================
@@ -4345,8 +4615,55 @@ with st.expander("Telegram Alert Settings"):
     auto_send_telegram = st.checkbox("Auto-send only High Quality New Signals", value=False)
 
 with st.expander("News Filter API"):
-    news_api_key = st.text_input("NewsAPI Key", type="password")
-    news_filter_enabled = st.checkbox("Enable News Filter", value=False)
+    news_provider = st.selectbox(
+        "News Provider", ["Marketaux", "NewsAPI (legacy)"], index=0,
+        key="news_provider_selection",
+        help="Marketaux is the primary financial-news provider. NewsAPI is retained as a legacy fallback option."
+    )
+    if news_provider == "Marketaux":
+        if "marketaux_api_token_input" not in st.session_state:
+            st.session_state["marketaux_api_token_input"] = (
+                st.session_state.get("marketaux_api_token_saved") or _read_news_secret("MARKETAUX_API_TOKEN")
+            )
+        marketaux_api_token = st.text_input(
+            "Marketaux API Token", type="password", key="marketaux_api_token_input",
+            help="Paste the API token from your Marketaux account. It is kept in this Streamlit session only."
+        )
+        news_api_key = str(
+            marketaux_api_token or st.session_state.get("marketaux_api_token_saved") or ""
+        ).strip()
+        if marketaux_api_token:
+            st.session_state["marketaux_api_token_saved"] = news_api_key
+    else:
+        if "newsapi_legacy_key_input" not in st.session_state:
+            st.session_state["newsapi_legacy_key_input"] = (
+                st.session_state.get("newsapi_legacy_key_saved") or _read_news_secret("NEWSAPI_API_KEY")
+            )
+        newsapi_legacy_key = st.text_input(
+            "NewsAPI Key (legacy provider)", type="password", key="newsapi_legacy_key_input"
+        )
+        news_api_key = str(
+            newsapi_legacy_key or st.session_state.get("newsapi_legacy_key_saved") or ""
+        ).strip()
+        if newsapi_legacy_key:
+            st.session_state["newsapi_legacy_key_saved"] = news_api_key
+
+    news_filter_enabled = st.checkbox(
+        "Enable News Filter", value=False, key="news_filter_enabled"
+    )
+    news_lookback_hours = st.selectbox(
+        "News risk lookback (hours)", [3, 6, 12, 24], index=1,
+        key="news_lookback_hours"
+    )
+    news_article_limit = st.selectbox(
+        "Maximum articles", [5, 10, 15, 20], index=1,
+        key="news_article_limit"
+    )
+    if news_filter_enabled:
+        if news_api_key:
+            st.caption(f"{news_provider} news filter is enabled. Token is masked and is not saved to a CSV file.")
+        else:
+            st.warning(f"Enter your {news_provider} API key. The news filter will pause new signal entries until the provider can be checked.")
 
 with st.expander("Angel One API Settings"):
     # Submit the four credentials together. A Streamlit form prevents partial
@@ -4708,16 +5025,32 @@ option_metrics = parse_option_chain_metrics(dynamic_oc_symbol) if dynamic_oc_sym
     "short_covering": False, "call_oi": 0, "put_oi": 0
 }
 
-news_info = {"allow_trade": True, "message": "News filter disabled", "events": []}
+news_info = {
+    "allow_trade": True, "message": "News filter disabled", "events": [],
+    "provider": news_provider, "status": "disabled", "article_count": 0,
+    "sentiment_bias": "N/A", "average_sentiment": None
+}
 if news_filter_enabled:
-    news_info = get_news_events(news_api_key, selected)
+    with st.spinner(f"Fetching {news_provider} financial news for {selected}…"):
+        news_info = get_news_events(
+            news_api_key, selected, provider=news_provider,
+            lookback_hours=news_lookback_hours, article_limit=news_article_limit
+        )
 
+# The current live Marketaux/NewsAPI snapshot must not be injected into past
+# candles; doing so would create look-ahead bias in historical backtest results.
+historical_news_context = {
+    "allow_trade": True,
+    "message": "Live news is not replayed in historical tests; no look-ahead news filter applied.",
+    "events": [],
+    "status": "historical_not_replayed",
+}
 wins, losses, total_trades, backtest_win_rate, backtest_trades_df = simple_backtest(
     backtest_data,
     symbol=selected,
     timeframe_label=timeframe,
     option_metrics=option_metrics,
-    news_info=news_info
+    news_info=historical_news_context
 )
 
 analysis = analyze_signal(
@@ -4736,7 +5069,7 @@ walk_forward_result = walk_forward_validation(
     symbol=selected,
     timeframe_label=timeframe,
     option_metrics=option_metrics,
-    news_info=news_info
+    news_info=historical_news_context
 )
 
 stats = compute_trade_statistics(backtest_trades_df, initial_capital=DEFAULT_INITIAL_BALANCE)
@@ -4943,7 +5276,13 @@ with a4:
 with a5:
     st.metric("Dynamic OC", dynamic_oc_symbol)
 with a6:
-    st.metric("News Filter", "Blocked" if not news_info["allow_trade"] else "Clear")
+    if not news_filter_enabled:
+        _news_metric_value = "OFF"
+    elif news_info.get("status") == "error":
+        _news_metric_value = "UNAVAILABLE"
+    else:
+        _news_metric_value = "BLOCKED" if not news_info.get("allow_trade", False) else "CLEAR"
+    st.metric("News Filter", _news_metric_value)
 
 b1, b2, b3, b4, b5, b6 = st.columns(6)
 with b1:
@@ -5215,10 +5554,28 @@ with st.expander("Why this signal?"):
 
 if news_filter_enabled:
     st.subheader("News Filter Events")
-    if news_info["events"]:
-        st.dataframe(pd.DataFrame(news_info["events"]), use_container_width=True)
+    st.caption(
+        f"Provider: {news_info.get('provider', news_provider)} | "
+        f"Articles: {news_info.get('article_count', 0)} | "
+        f"Sentiment: {news_info.get('sentiment_bias', 'N/A')} "
+        f"({news_info.get('average_sentiment') if news_info.get('average_sentiment') is not None else 'N/A'})"
+    )
+    if news_info.get("status") == "error":
+        st.warning(news_info.get("message", "News provider unavailable. New signal entries are paused."))
+    elif news_info.get("events"):
+        _news_df = pd.DataFrame(news_info["events"])
+        _news_columns = [c for c in ["Title", "Source", "Published (UTC)", "Sentiment", "Entities", "Risk Flag", "Risk Reason", "Article"] if c in _news_df.columns]
+        st.dataframe(
+            _news_df[_news_columns],
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Article": st.column_config.LinkColumn("Article", display_text="Open article")
+            }
+        )
+        st.caption(news_info.get("message", "News events loaded."))
     else:
-        st.info(news_info["message"])
+        st.info(news_info.get("message", "No recent relevant news."))
 
 st.subheader("Major Stocks Scanner — NIFTY Top 30 | CMP & % Change")
 st.caption("30 major NIFTY constituents scanned on 3m, 5m, 10m and 15m. Yahoo Finance is independent of the primary Angel/Yahoo candle selection.")
