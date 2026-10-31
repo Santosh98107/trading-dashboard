@@ -3189,10 +3189,17 @@ with st.expander("Angel One API Settings"):
         if not all((angel_api_key, angel_client_code, angel_pin, angel_totp_secret)):
             st.error("Please fill all four Angel One fields before testing login.")
         else:
+            # Keep a server-session copy separate from widget state. Streamlit can
+            # clean up widget keys during reruns; the data loader must not depend
+            # exclusively on those UI keys after a successful login.
+            st.session_state["angel_saved_api_key"] = angel_api_key
+            st.session_state["angel_saved_client_code"] = angel_client_code
+            st.session_state["angel_saved_pin"] = angel_pin
+            st.session_state["angel_saved_totp_secret"] = angel_totp_secret
             angel, session = angel_login(angel_api_key, angel_client_code, angel_pin, angel_totp_secret, force_refresh=True)
             if angel and session:
                 st.session_state["angel_credentials_login_ok"] = True
-                st.success("Angel One Login Successful. Credentials retained for this app session.")
+                st.success("Angel One Login Successful. Credentials retained in this app session.")
             else:
                 st.session_state["angel_credentials_login_ok"] = False
                 st.error("Angel login failed. Check API key, Client Code, PIN and TOTP Secret.")
@@ -3202,11 +3209,37 @@ with st.expander("Angel One API Settings"):
         sync_ws_state_to_session()
         st.warning("WebSocket stop requested.")
 
-# Always retrieve credentials from the stable keyed widgets after the expander.
-angel_api_key = str(st.session_state.get("angel_api_key_input", angel_api_key or "")).strip()
-angel_client_code = str(st.session_state.get("angel_client_code_input", angel_client_code or "")).strip()
-angel_pin = str(st.session_state.get("angel_pin_input", angel_pin or "")).strip()
-angel_totp_secret = str(st.session_state.get("angel_totp_secret_input", angel_totp_secret or "")).strip()
+# Resolve credentials from the visible widgets first, then the independent
+# server-session copy saved during Test Angel Login. This avoids losing them
+# when Streamlit cleans up widget state during reruns/auto-refresh.
+angel_api_key = str(
+    st.session_state.get("angel_api_key_input")
+    or st.session_state.get("angel_saved_api_key")
+    or angel_api_key or ""
+).strip()
+angel_client_code = str(
+    st.session_state.get("angel_client_code_input")
+    or st.session_state.get("angel_saved_client_code")
+    or angel_client_code or ""
+).strip()
+angel_pin = str(
+    st.session_state.get("angel_pin_input")
+    or st.session_state.get("angel_saved_pin")
+    or angel_pin or ""
+).strip()
+angel_totp_secret = str(
+    st.session_state.get("angel_totp_secret_input")
+    or st.session_state.get("angel_saved_totp_secret")
+    or angel_totp_secret or ""
+).strip()
+
+# Mirror any currently entered widget values into the session copy as well.
+# Nothing is written to disk; these values live only in the Streamlit session.
+if all((angel_api_key, angel_client_code, angel_pin, angel_totp_secret)):
+    st.session_state["angel_saved_api_key"] = angel_api_key
+    st.session_state["angel_saved_client_code"] = angel_client_code
+    st.session_state["angel_saved_pin"] = angel_pin
+    st.session_state["angel_saved_totp_secret"] = angel_totp_secret
 
 ticker = stocks[selected]
 
