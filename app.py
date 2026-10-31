@@ -1170,7 +1170,7 @@ def load_selected_data(
 
     Yahoo data and Angel One data are kept separate.
     No fabricated price fallback is used.
-    """
+    
 
     if source == "Yahoo Finance":
         return yahoo(ticker, period, interval), {
