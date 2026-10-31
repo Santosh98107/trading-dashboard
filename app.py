@@ -1,9 +1,5 @@
 import os
-import json
-import math
-import shutil
-import hashlib
-from datetime import datetime, timedelta, time, timezone
+from datetime import datetime, time, timedelta, timezone
 import threading
 import time as pytime
 
@@ -17,6 +13,7 @@ import pyotp
 from SmartApi import SmartConnect
 from streamlit_autorefresh import st_autorefresh
 
+# Optional WebSocket import
 SMART_WS_AVAILABLE = False
 try:
     from SmartApi.smartWebSocketV2 import SmartWebSocketV2
@@ -24,378 +21,99 @@ try:
 except Exception:
     SMART_WS_AVAILABLE = False
 
-st.set_page_config(page_title="Elite Trading Dashboard Final Ultimate", layout="wide")
 
-# =========================================================
-# FILES / CONFIG
-# =========================================================
-DATA_DIR = "elite_data"
-BACKUP_DIR = os.path.join(DATA_DIR, "backup")
-os.makedirs(DATA_DIR, exist_ok=True)
-os.makedirs(BACKUP_DIR, exist_ok=True)
+st.set_page_config(page_title="Elite Trading Dashboard Ultimate V6", layout="wide")
 
-JOURNAL_FILE = os.path.join(DATA_DIR, "trade_journal.csv")
-USERS_FILE = os.path.join(DATA_DIR, "users.csv")
-PAPER_STATE_FILE = os.path.join(DATA_DIR, "paper_trade_state.csv")
-DAILY_SUMMARY_FILE = os.path.join(DATA_DIR, "daily_summary.csv")
-WEEKLY_SUMMARY_FILE = os.path.join(DATA_DIR, "weekly_summary.csv")
-MONTHLY_SUMMARY_FILE = os.path.join(DATA_DIR, "monthly_summary.csv")
-SIGNAL_AUDIT_FILE = os.path.join(DATA_DIR, "signal_audit.csv")
-ERROR_LOG_FILE = os.path.join(DATA_DIR, "app_error_log.csv")
-SIGNAL_STATE_FILE = os.path.join(DATA_DIR, "last_signal_state.txt")
-RISK_STATE_FILE = os.path.join(DATA_DIR, "risk_state.csv")
-WEEKLY_RISK_FILE = os.path.join(DATA_DIR, "weekly_risk_state.csv")
-MONTHLY_RISK_FILE = os.path.join(DATA_DIR, "monthly_risk_state.csv")
-OPTION_CHAIN_FILE = os.path.join(DATA_DIR, "option_chain_cache.json")
-NEWS_CACHE_FILE = os.path.join(DATA_DIR, "news_cache.json")
+JOURNAL_FILE = "trade_journal.csv"
+SIGNAL_STATE_FILE = "last_signal_state.txt"
+PAPER_STATE_FILE = "paper_trade_state.csv"
+USERS_FILE = "users.csv"
+SESSION_SUMMARY_FILE = "daily_summary.csv"
+RISK_STATE_FILE = "risk_state.csv"
 
 MAX_WS_RETRIES = 5
 WS_RETRY_DELAY_SEC = 5
 
-MIN_RR_REQUIRED = 2.0
-IDEAL_RR = 3.0
-STRICT_TRADE_ONLY_STRONG = False
-DISABLE_BUY_BIAS_TRADING = False
-DISABLE_SELL_BIAS_TRADING = False
-MANDATORY_ADX = 20
-MANDATORY_MTF_ALIGN_COUNT = 2
-SIGNAL_EXPIRY_MINUTES = 3
-HIGH_QUALITY_SIGNAL_MIN_SCORE = 75
-MAX_SIGNAL_DUPLICATE_WINDOW_MIN = 10
-NO_TRADE_NEAR_SR_PCT = 0.5
-GAP_FILTER_PCT = 0.75
-HIGH_VOL_ATR_PCT = 1.8
-SIDEWAYS_ADX_MAX = 18
-TRENDING_ADX_MIN = 25
-MIN_VALIDATION_SCORE_FOR_ALERT = 70
-DEFAULT_INITIAL_BALANCE = 100000.0
-DATA_INTEGRITY_MIN_ROWS = 30
-BACKUP_RETENTION_COUNT = 30
-USE_POLLING_AS_PRIMARY = True
 
-WS_STATE_LOCK = threading.Lock()
-WS_SHARED_STATE = {
-    "running": False,
-    "connected": False,
-    "error": "",
-    "last_tick": None,
-    "live_price": None,
-    "retries": 0,
-    "should_run": False,
-    "thread_started": False,
-    "symbol": None,
-    "socket": None,
-    "last_data_time": None,
-    "log": []
-}
-
-# =========================================================
-# BASIC UTILITIES
-# =========================================================
-def now_str():
-    return datetime.now().strftime("%d-%m-%Y %H:%M:%S")
-
-
-def hash_password(password: str) -> str:
-    return hashlib.sha256(password.encode()).hexdigest()
-
-
-def backup_file(path):
-    try:
-        if os.path.exists(path):
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            name = os.path.basename(path)
-            shutil.copy(path, os.path.join(BACKUP_DIR, f"{ts}_{name}"))
-            enforce_backup_retention()
-    except Exception as e:
-        log_app_error("backup_file", e)
-
-
-def enforce_backup_retention():
-    try:
-        files = []
-        for f in os.listdir(BACKUP_DIR):
-            full = os.path.join(BACKUP_DIR, f)
-            if os.path.isfile(full):
-                files.append((full, os.path.getmtime(full)))
-        files = sorted(files, key=lambda x: x[1], reverse=True)
-        if len(files) > BACKUP_RETENTION_COUNT:
-            for old_file, _ in files[BACKUP_RETENTION_COUNT:]:
-                try:
-                    os.remove(old_file)
-                except Exception as e:
-                    log_app_error("enforce_backup_retention_remove", e)
-    except Exception as e:
-        log_app_error("enforce_backup_retention", e)
-
-
-def log_app_error(source, message):
-    try:
-        row = pd.DataFrame([{
-            "DateTime": now_str(),
-            "Source": str(source),
-            "Message": str(message)
-        }])
-        if os.path.exists(ERROR_LOG_FILE):
-            old = pd.read_csv(ERROR_LOG_FILE)
-            old = pd.concat([old, row], ignore_index=True)
-            old.to_csv(ERROR_LOG_FILE, index=False)
-        else:
-            row.to_csv(ERROR_LOG_FILE, index=False)
-    except Exception:
-        pass
-
-
-def safe_read_csv(path, default_df=None):
-    try:
-        if os.path.exists(path):
-            return pd.read_csv(path)
-        return default_df.copy() if default_df is not None else pd.DataFrame()
-    except Exception as e:
-        log_app_error("safe_read_csv", f"{path} -> {e}")
-        return default_df.copy() if default_df is not None else pd.DataFrame()
-
-
-def safe_write_csv(df, path):
-    try:
-        backup_file(path)
-        df.to_csv(path, index=False)
-        return True
-    except Exception as e:
-        log_app_error("safe_write_csv", f"{path} -> {e}")
-        return False
-
-
-def data_integrity_check(df, required_cols=None, min_rows=1):
-    try:
-        if df is None or df.empty:
-            return False, "Empty dataframe"
-        if len(df) < min_rows:
-            return False, f"Insufficient rows: {len(df)}"
-        if required_cols:
-            missing = [c for c in required_cols if c not in df.columns]
-            if missing:
-                return False, f"Missing columns: {missing}"
-        return True, "OK"
-    except Exception as e:
-        return False, str(e)
-
-
-# =========================================================
+# ----------------------------
 # INIT FILES
-# =========================================================
+# ----------------------------
 def init_users():
     if not os.path.exists(USERS_FILE):
-        df = pd.DataFrame([{
-            "username": "admin",
-            "password": hash_password("admin123")
-        }])
-        safe_write_csv(df, USERS_FILE)
+        pd.DataFrame([
+            {"username": "admin", "password": "admin123"}
+        ]).to_csv(USERS_FILE, index=False)
         return
+
     try:
         users = pd.read_csv(USERS_FILE)
         if "username" not in users.columns or "password" not in users.columns:
             raise ValueError("Invalid users file structure")
     except Exception:
-        df = pd.DataFrame([{
-            "username": "admin",
-            "password": hash_password("admin123")
-        }])
-        safe_write_csv(df, USERS_FILE)
+        pd.DataFrame([
+            {"username": "admin", "password": "admin123"}
+        ]).to_csv(USERS_FILE, index=False)
 
 
 def init_journal():
     if not os.path.exists(JOURNAL_FILE):
         cols = [
-            "DateTime", "Symbol", "Timeframe", "Signal", "EntryPrice", "ExitPrice",
-            "Quantity", "StopLoss", "Target1", "Target2", "Target3", "TrailingStop",
-            "Status", "PnL", "PnLPercent", "Notes", "Result", "T1_Hit", "T2_Hit", "T3_Hit",
-            "TradeQualityScore", "ValidationScore", "StrategyGrade"
+            "DateTime", "Symbol", "Timeframe", "Signal", "EntryPrice",
+            "ExitPrice", "Quantity", "StopLoss", "Target1", "Target2",
+            "TrailingStop", "Status", "PnL", "PnLPercent", "Notes"
         ]
-        safe_write_csv(pd.DataFrame(columns=cols), JOURNAL_FILE)
+        pd.DataFrame(columns=cols).to_csv(JOURNAL_FILE, index=False)
 
 
 def init_paper_state():
     if not os.path.exists(PAPER_STATE_FILE):
-        df = pd.DataFrame([{
-            "Balance": DEFAULT_INITIAL_BALANCE,
+        pd.DataFrame([{
+            "Balance": 100000.0,
             "UsedMargin": 0.0,
-            "OpenPositions": 0,
-            "InitialBalance": DEFAULT_INITIAL_BALANCE
-        }])
-        safe_write_csv(df, PAPER_STATE_FILE)
+            "OpenPositions": 0
+        }]).to_csv(PAPER_STATE_FILE, index=False)
 
 
 def init_daily_summary():
-    if not os.path.exists(DAILY_SUMMARY_FILE):
-        safe_write_csv(pd.DataFrame(columns=[
+    if not os.path.exists(SESSION_SUMMARY_FILE):
+        pd.DataFrame(columns=[
             "Date", "TotalTrades", "Wins", "Losses", "RealizedPnL", "WinRate"
-        ]), DAILY_SUMMARY_FILE)
-
-
-def init_weekly_summary():
-    if not os.path.exists(WEEKLY_SUMMARY_FILE):
-        safe_write_csv(pd.DataFrame(columns=[
-            "WeekKey", "TotalTrades", "Wins", "Losses", "RealizedPnL", "WinRate"
-        ]), WEEKLY_SUMMARY_FILE)
-
-
-def init_monthly_summary():
-    if not os.path.exists(MONTHLY_SUMMARY_FILE):
-        safe_write_csv(pd.DataFrame(columns=[
-            "MonthKey", "TotalTrades", "Wins", "Losses", "RealizedPnL", "WinRate"
-        ]), MONTHLY_SUMMARY_FILE)
+        ]).to_csv(SESSION_SUMMARY_FILE, index=False)
 
 
 def init_risk_state():
     if not os.path.exists(RISK_STATE_FILE):
-        df = pd.DataFrame([{
+        pd.DataFrame([{
             "DailyLossLimit": 2000.0,
             "MaxTradesPerDay": 5,
             "RiskPerTradePct": 1.0,
-            "TradingEnabled": True,
-            "DailyLock": False,
-            "CapitalProtectionPct": 20.0
-        }])
-        safe_write_csv(df, RISK_STATE_FILE)
+            "TradingEnabled": True
+        }]).to_csv(RISK_STATE_FILE, index=False)
 
 
-def init_weekly_risk():
-    if not os.path.exists(WEEKLY_RISK_FILE):
-        df = pd.DataFrame([{
-            "WeekKey": datetime.now().strftime("%Y-W%U"),
-            "WeeklyLossLimit": 5000.0,
-            "WeeklyPnL": 0.0,
-            "WeeklyLock": False
-        }])
-        safe_write_csv(df, WEEKLY_RISK_FILE)
-
-
-def init_monthly_risk():
-    if not os.path.exists(MONTHLY_RISK_FILE):
-        df = pd.DataFrame([{
-            "MonthKey": datetime.now().strftime("%Y-%m"),
-            "MonthlyLossLimit": 15000.0,
-            "MonthlyPnL": 0.0,
-            "MonthlyLock": False
-        }])
-        safe_write_csv(df, MONTHLY_RISK_FILE)
-
-
-def init_signal_audit():
-    if not os.path.exists(SIGNAL_AUDIT_FILE):
-        df = pd.DataFrame(columns=[
-            "DateTime", "Symbol", "Timeframe", "Signal", "SignalType", "Price",
-            "ValidationScore", "TradeQualityScore", "StrategyGrade",
-            "Confidence", "WinChance", "ReasonCount", "ExpiryTime"
-        ])
-        safe_write_csv(df, SIGNAL_AUDIT_FILE)
-
-
-# =========================================================
-# LOAD / SAVE
-# =========================================================
-def load_journal():
-    init_journal()
-    return safe_read_csv(JOURNAL_FILE, pd.DataFrame())
-
-
-def save_journal(df):
-    safe_write_csv(df, JOURNAL_FILE)
-
-
-def load_paper_state():
-    init_paper_state()
-    return safe_read_csv(PAPER_STATE_FILE, pd.DataFrame([{
-        "Balance": DEFAULT_INITIAL_BALANCE,
-        "UsedMargin": 0.0,
-        "OpenPositions": 0,
-        "InitialBalance": DEFAULT_INITIAL_BALANCE
-    }]))
-
-
-def save_paper_state(df):
-    safe_write_csv(df, PAPER_STATE_FILE)
-
-
-def load_risk_state():
-    init_risk_state()
-    return safe_read_csv(RISK_STATE_FILE)
-
-
-def save_risk_state(df):
-    safe_write_csv(df, RISK_STATE_FILE)
-
-
-def load_weekly_risk():
-    init_weekly_risk()
-    df = safe_read_csv(WEEKLY_RISK_FILE)
-    current_key = datetime.now().strftime("%Y-W%U")
-    if df.empty or str(df.loc[0, "WeekKey"]) != current_key:
-        df = pd.DataFrame([{
-            "WeekKey": current_key,
-            "WeeklyLossLimit": 5000.0,
-            "WeeklyPnL": 0.0,
-            "WeeklyLock": False
-        }])
-        save_weekly_risk(df)
-    return df
-
-
-def save_weekly_risk(df):
-    safe_write_csv(df, WEEKLY_RISK_FILE)
-
-
-def load_monthly_risk():
-    init_monthly_risk()
-    df = safe_read_csv(MONTHLY_RISK_FILE)
-    current_key = datetime.now().strftime("%Y-%m")
-    if df.empty or str(df.loc[0, "MonthKey"]) != current_key:
-        df = pd.DataFrame([{
-            "MonthKey": current_key,
-            "MonthlyLossLimit": 15000.0,
-            "MonthlyPnL": 0.0,
-            "MonthlyLock": False
-        }])
-        save_monthly_risk(df)
-    return df
-
-
-def save_monthly_risk(df):
-    safe_write_csv(df, MONTHLY_RISK_FILE)
-
-
-def load_signal_audit():
-    init_signal_audit()
-    return safe_read_csv(SIGNAL_AUDIT_FILE, pd.DataFrame())
-
-
-def save_signal_audit(df):
-    safe_write_csv(df, SIGNAL_AUDIT_FILE)
-
-
-# =========================================================
-# AUTH
-# =========================================================
+# ----------------------------
+# LOGIN
+# ----------------------------
 def login_panel():
     init_users()
+
     if "logged_in" not in st.session_state:
         st.session_state.logged_in = False
+
     if "username" not in st.session_state:
         st.session_state.username = ""
 
     if not st.session_state.logged_in:
-        st.sidebar.subheader("Login")
+        st.sidebar.subheader("🔐 Login")
         username = st.sidebar.text_input("Username")
         password = st.sidebar.text_input("Password", type="password")
 
         if st.sidebar.button("Login"):
             try:
                 users = pd.read_csv(USERS_FILE)
-                hashed = hash_password(password.strip())
                 match = users[
                     (users["username"].astype(str).str.strip() == username.strip()) &
-                    (users["password"].astype(str).str.strip() == hashed)
+                    (users["password"].astype(str).str.strip() == password.strip())
                 ]
                 if not match.empty:
                     st.session_state.logged_in = True
@@ -405,6 +123,35 @@ def login_panel():
                     st.sidebar.error("Invalid credentials")
             except Exception as e:
                 st.sidebar.error(f"Login error: {e}")
+
+        with st.sidebar.expander("Reset Password"):
+            reset_user = st.text_input("Username for reset", key="reset_user")
+            old_pass = st.text_input("Old Password", type="password", key="old_pass")
+            new_pass = st.text_input("New Password", type="password", key="new_pass")
+            confirm_pass = st.text_input("Confirm New Password", type="password", key="confirm_pass")
+
+            if st.button("Reset Password"):
+                try:
+                    if not reset_user or not old_pass or not new_pass or not confirm_pass:
+                        st.sidebar.warning("Please fill all password reset fields.")
+                    elif new_pass != confirm_pass:
+                        st.sidebar.error("New password and confirm password do not match.")
+                    else:
+                        users = pd.read_csv(USERS_FILE)
+                        match_idx = users[
+                            (users["username"].astype(str).str.strip() == reset_user.strip()) &
+                            (users["password"].astype(str).str.strip() == old_pass.strip())
+                        ].index
+
+                        if len(match_idx) == 0:
+                            st.sidebar.error("Username / old password invalid.")
+                        else:
+                            users.loc[match_idx[0], "password"] = new_pass.strip()
+                            users.to_csv(USERS_FILE, index=False)
+                            st.sidebar.success("Password reset successful. Please login.")
+                except Exception as e:
+                    st.sidebar.error(f"Password reset error: {e}")
+
         st.stop()
 
     st.sidebar.success(f"Logged in as: {st.session_state.username}")
@@ -414,364 +161,282 @@ def login_panel():
         st.rerun()
 
 
-# =========================================================
-# DATA FETCH
-# =========================================================
-@st.cache_data(ttl=30)
+# ----------------------------
+# FILE HELPERS
+# ----------------------------
+def load_journal():
+    init_journal()
+    return pd.read_csv(JOURNAL_FILE)
+
+
+def save_journal(df):
+    df.to_csv(JOURNAL_FILE, index=False)
+
+
+def load_paper_state():
+    init_paper_state()
+    return pd.read_csv(PAPER_STATE_FILE)
+
+
+def save_paper_state(df):
+    df.to_csv(PAPER_STATE_FILE, index=False)
+
+
+def load_risk_state():
+    init_risk_state()
+    return pd.read_csv(RISK_STATE_FILE)
+
+
+def save_risk_state(df):
+    df.to_csv(RISK_STATE_FILE, index=False)
+
+
+def add_trade_to_journal(symbol, timeframe, signal, entry_price, quantity, stop_loss, target1, target2, trailing_stop, notes=""):
+    journal = load_journal()
+    new_row = {
+        "DateTime": datetime.now().strftime("%d-%m-%Y %H:%M:%S"),
+        "Symbol": symbol,
+        "Timeframe": timeframe,
+        "Signal": signal,
+        "EntryPrice": entry_price,
+        "ExitPrice": np.nan,
+        "Quantity": quantity,
+        "StopLoss": stop_loss,
+        "Target1": target1,
+        "Target2": target2,
+        "TrailingStop": trailing_stop,
+        "Status": "OPEN",
+        "PnL": np.nan,
+        "PnLPercent": np.nan,
+        "Notes": notes
+    }
+    journal = pd.concat([journal, pd.DataFrame([new_row])], ignore_index=True)
+    save_journal(journal)
+
+
+def close_trade_in_journal(index_id, exit_price):
+    journal = load_journal()
+    if index_id in journal.index:
+        row = journal.loc[index_id]
+        entry = float(row["EntryPrice"])
+        qty = float(row["Quantity"])
+        signal = str(row["Signal"]).upper()
+
+        if "BUY" in signal or "CALL" in signal:
+            pnl = (exit_price - entry) * qty
+            pnl_pct = ((exit_price - entry) / entry) * 100 if entry else 0
+        else:
+            pnl = (entry - exit_price) * qty
+            pnl_pct = ((entry - exit_price) / entry) * 100 if entry else 0
+
+        journal.at[index_id, "ExitPrice"] = exit_price
+        journal.at[index_id, "Status"] = "CLOSED"
+        journal.at[index_id, "PnL"] = round(pnl, 2)
+        journal.at[index_id, "PnLPercent"] = round(pnl_pct, 2)
+        save_journal(journal)
+
+
+def update_daily_summary():
+    init_daily_summary()
+    journal = load_journal()
+    closed = journal[journal["Status"] == "CLOSED"].copy()
+
+    if closed.empty:
+        return
+
+    closed["DateOnly"] = pd.to_datetime(
+        closed["DateTime"],
+        format="%d-%m-%Y %H:%M:%S",
+        errors="coerce"
+    ).dt.date
+
+    today = datetime.now().date()
+    day_df = closed[closed["DateOnly"] == today]
+
+    if day_df.empty:
+        return
+
+    total = len(day_df)
+    wins = (pd.to_numeric(day_df["PnL"], errors="coerce").fillna(0) > 0).sum()
+    losses = total - wins
+    pnl = pd.to_numeric(day_df["PnL"], errors="coerce").fillna(0).sum()
+    win_rate = (wins / total * 100) if total > 0 else 0
+
+    summary = pd.read_csv(SESSION_SUMMARY_FILE)
+    summary = summary[summary["Date"] != str(today)]
+
+    new_row = {
+        "Date": str(today),
+        "TotalTrades": total,
+        "Wins": wins,
+        "Losses": losses,
+        "RealizedPnL": round(pnl, 2),
+        "WinRate": round(win_rate, 2)
+    }
+
+    summary = pd.concat([summary, pd.DataFrame([new_row])], ignore_index=True)
+    summary.to_csv(SESSION_SUMMARY_FILE, index=False)
+
+
+def get_today_closed_trades():
+    journal = load_journal()
+    if journal.empty:
+        return pd.DataFrame()
+
+    closed = journal[journal["Status"] == "CLOSED"].copy()
+    if closed.empty:
+        return closed
+
+    closed["DateOnly"] = pd.to_datetime(
+        closed["DateTime"],
+        format="%d-%m-%Y %H:%M:%S",
+        errors="coerce"
+    ).dt.date
+
+    today = datetime.now().date()
+    return closed[closed["DateOnly"] == today].copy()
+
+
+def risk_check_before_trade():
+    risk_state = load_risk_state()
+    journal_today = get_today_closed_trades()
+
+    trading_enabled = bool(risk_state.loc[0, "TradingEnabled"])
+    daily_loss_limit = float(risk_state.loc[0, "DailyLossLimit"])
+    max_trades_per_day = int(risk_state.loc[0, "MaxTradesPerDay"])
+
+    if not trading_enabled:
+        return False, "Trading disabled by Risk Management module."
+
+    realized_pnl_today = pd.to_numeric(journal_today.get("PnL", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()
+    trades_today = len(journal_today)
+
+    if realized_pnl_today <= -abs(daily_loss_limit):
+        return False, f"Daily loss limit hit. Realized PnL today: {round(realized_pnl_today, 2)}"
+
+    if trades_today >= max_trades_per_day:
+        return False, f"Max trades per day reached ({max_trades_per_day})."
+
+    return True, "Risk checks passed."
+
+
+def calculate_position_size(entry_price, stop_loss, paper_balance):
+    risk_state = load_risk_state()
+    risk_pct = float(risk_state.loc[0, "RiskPerTradePct"])
+
+    if entry_price is None or stop_loss is None:
+        return 1
+
+    risk_amount = paper_balance * (risk_pct / 100.0)
+    per_unit_risk = abs(float(entry_price) - float(stop_loss))
+
+    if per_unit_risk <= 0:
+        return 1
+
+    qty = int(risk_amount // per_unit_risk)
+    return max(1, qty)
+
+
+# ----------------------------
+# PAPER TRADE
+# ----------------------------
+def paper_trade_entry(price, quantity):
+    state = load_paper_state()
+    bal = float(state.loc[0, "Balance"])
+    used = float(state.loc[0, "UsedMargin"])
+    cost = price * quantity
+
+    if bal >= cost:
+        state.loc[0, "Balance"] = bal - cost
+        state.loc[0, "UsedMargin"] = used + cost
+        state.loc[0, "OpenPositions"] = int(state.loc[0, "OpenPositions"]) + 1
+        save_paper_state(state)
+        return True
+    return False
+
+
+def paper_trade_exit(entry_price, exit_price, quantity, signal):
+    state = load_paper_state()
+    bal = float(state.loc[0, "Balance"])
+    used = float(state.loc[0, "UsedMargin"])
+    invested = entry_price * quantity
+
+    if "BUY" in signal.upper() or "CALL" in signal.upper():
+        pnl = (exit_price - entry_price) * quantity
+    else:
+        pnl = (entry_price - exit_price) * quantity
+
+    state.loc[0, "Balance"] = bal + invested + pnl
+    state.loc[0, "UsedMargin"] = max(0.0, used - invested)
+    state.loc[0, "OpenPositions"] = max(0, int(state.loc[0, "OpenPositions"]) - 1)
+    save_paper_state(state)
+    return pnl
+
+
+# ----------------------------
+# MARKET DATA
+# ----------------------------
+@st.cache_data(ttl=60)
 def fetch_data(ticker, interval, period):
     try:
-        df = yf.download(ticker, interval=interval, period=period, progress=False, auto_adjust=False)
-        if df.empty:
-            return pd.DataFrame()
-
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-
-        needed = ["Open", "High", "Low", "Close", "Volume"]
-        if any(c not in df.columns for c in needed):
-            return pd.DataFrame()
-
-        df = df[needed].copy()
-        df.index = pd.to_datetime(df.index, errors="coerce")
-        df = df[~df.index.isna()].copy()
-        df = df.dropna(subset=["Open", "High", "Low", "Close"])
-        df["Volume"] = pd.to_numeric(df["Volume"], errors="coerce").fillna(0)
-        return df
-    except Exception as e:
-        log_app_error("fetch_data", e)
+        df = yf.download(
+            ticker,
+            interval=interval,
+            period=period,
+            progress=False,
+            auto_adjust=False
+        )
+    except Exception:
         return pd.DataFrame()
+
+    if df.empty:
+        return df
+
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+
+    needed = ["Open", "High", "Low", "Close", "Volume"]
+    missing = [c for c in needed if c not in df.columns]
+    if missing:
+        return pd.DataFrame()
+
+    df = df[needed].copy()
+    df.index = pd.to_datetime(df.index, errors="coerce")
+    df = df[~df.index.isna()].copy()
+    df = df.dropna(subset=["Open", "High", "Low", "Close"])
+    df["Volume"] = pd.to_numeric(df["Volume"], errors="coerce").fillna(0)
+    return df
 
 
 def resample_ohlcv(df, rule):
-    try:
-        df = df.copy()
-        df.index = pd.to_datetime(df.index, errors="coerce")
-        df = df[~df.index.isna()].copy()
-        if df.empty:
-            return df
-        return df.resample(rule).agg({
-            "Open": "first",
-            "High": "max",
-            "Low": "min",
-            "Close": "last",
-            "Volume": "sum"
-        }).dropna()
-    except Exception as e:
-        log_app_error("resample_ohlcv", e)
-        return pd.DataFrame()
+    df = df.copy()
+    df.index = pd.to_datetime(df.index, errors="coerce")
+    df = df[~df.index.isna()].copy()
 
-
-def map_angel_interval(timeframe):
-    mapping = {
-        "1m": "ONE_MINUTE",
-        "3m": "ONE_MINUTE",
-        "5m": "FIVE_MINUTE",
-        "10m": "FIVE_MINUTE",
-        "15m": "FIFTEEN_MINUTE",
-        "30m": "THIRTY_MINUTE",
-        "1h": "ONE_HOUR",
-        "1d": "ONE_DAY"
-    }
-    return mapping.get(timeframe, "FIVE_MINUTE")
-
-
-def angel_login(api_key, client_code, pin, totp_secret, force_refresh=False):
-    try:
-        cache_key = f"{client_code}_{api_key}"
-        if (
-            not force_refresh and
-            "angel_api" in st.session_state and
-            "angel_session" in st.session_state and
-            st.session_state.get("angel_cache_key") == cache_key
-        ):
-            return st.session_state["angel_api"], st.session_state["angel_session"]
-
-        smart_api = SmartConnect(api_key=api_key)
-        totp = pyotp.TOTP(totp_secret).now()
-        session = smart_api.generateSession(client_code, pin, totp)
-
-        if session and session.get("status"):
-            st.session_state["angel_api"] = smart_api
-            st.session_state["angel_session"] = session
-            st.session_state["angel_cache_key"] = cache_key
-            return smart_api, session
-        return None, None
-    except Exception as e:
-        log_app_error("angel_login", e)
-        return None, None
-
-
-def get_angel_candles(api_key, client_code, pin, totp_secret, symbol_name, interval="FIVE_MINUTE"):
-    try:
-        angel, session = angel_login(api_key, client_code, pin, totp_secret)
-        if angel is None or not session or not session.get("data"):
-            return None
-
-        symbol_token = ANGEL_TOKENS.get(symbol_name)
-        if not symbol_token:
-            return {"status": False, "message": f"Missing Angel token for {symbol_name}"}
-
-        ist = timezone(timedelta(hours=5, minutes=30))
-        to_date = datetime.now(ist)
-        from_date = to_date - timedelta(days=10)
-
-        params = {
-            "exchange": "NSE",
-            "symboltoken": symbol_token,
-            "interval": interval,
-            "fromdate": from_date.strftime("%Y-%m-%d %H:%M"),
-            "todate": to_date.strftime("%Y-%m-%d %H:%M")
-        }
-        return angel.getCandleData(params)
-    except Exception as e:
-        log_app_error("get_angel_candles", e)
-        return {"status": False, "message": str(e)}
-
-
-def candles_to_df(candles):
-    try:
-        if not isinstance(candles, dict) or not candles.get("data"):
-            return pd.DataFrame()
-        df = pd.DataFrame(candles["data"], columns=["Datetime", "Open", "High", "Low", "Close", "Volume"])
-        df["Datetime"] = pd.to_datetime(df["Datetime"], errors="coerce")
-        df = df.dropna(subset=["Datetime"]).set_index("Datetime")
-        for col in ["Open", "High", "Low", "Close", "Volume"]:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-        df = df.dropna(subset=["Open", "High", "Low", "Close"])
-        df["Volume"] = df["Volume"].fillna(0)
+    if df.empty:
         return df
-    except Exception as e:
-        log_app_error("candles_to_df", e)
-        return pd.DataFrame()
+
+    resampled = df.resample(rule).agg({
+        "Open": "first",
+        "High": "max",
+        "Low": "min",
+        "Close": "last",
+        "Volume": "sum"
+    }).dropna()
+
+    return resampled
 
 
-def get_angel_ltp_polling(api_key, client_code, pin, totp_secret, symbol_name):
-    try:
-        candles = get_angel_candles(api_key, client_code, pin, totp_secret, symbol_name, "ONE_MINUTE")
-        df = candles_to_df(candles)
-        if not df.empty:
-            return float(df["Close"].iloc[-1])
-        return None
-    except Exception as e:
-        log_app_error("get_angel_ltp_polling", e)
-        return None
-
-
-# =========================================================
-# OPTIONAL WEBSOCKET
-# =========================================================
-def ws_log(msg):
-    with WS_STATE_LOCK:
-        ts = datetime.now().strftime("%H:%M:%S")
-        WS_SHARED_STATE["log"].append(f"[{ts}] {msg}")
-        WS_SHARED_STATE["log"] = WS_SHARED_STATE["log"][-100:]
-
-
-def ws_set_state(**kwargs):
-    with WS_STATE_LOCK:
-        for k, v in kwargs.items():
-            WS_SHARED_STATE[k] = v
-
-
-def ws_get_state():
-    with WS_STATE_LOCK:
-        return dict(WS_SHARED_STATE)
-
-
-def sync_ws_state_to_session():
-    state = ws_get_state()
-    for k, v in {
-        "ws_running": state["running"],
-        "ws_connected": state["connected"],
-        "ws_error": state["error"],
-        "ws_last_tick": state["last_tick"],
-        "live_price": state["live_price"],
-        "ws_retries": state["retries"],
-        "ws_should_run": state["should_run"],
-        "ws_thread_started": state["thread_started"],
-        "ws_log": state["log"]
-    }.items():
-        st.session_state[k] = v
-
-
-def init_ws_state():
-    defaults = {
-        "ws_running": False,
-        "ws_connected": False,
-        "ws_error": "",
-        "ws_last_tick": None,
-        "ws_thread_started": False,
-        "live_price": None,
-        "ws_retries": 0,
-        "ws_should_run": False,
-        "ws_log": []
-    }
-    for k, v in defaults.items():
-        if k not in st.session_state:
-            st.session_state[k] = v
-    sync_ws_state_to_session()
-
-
-def stop_angel_websocket():
-    try:
-        ws_log("Stop requested")
-        ws_set_state(should_run=False, connected=False, running=False, error="WebSocket stopped")
-        state = ws_get_state()
-        sws = state.get("socket")
-        if sws is not None:
-            try:
-                if hasattr(sws, "close_connection"):
-                    sws.close_connection()
-                elif hasattr(sws, "close"):
-                    sws.close()
-            except Exception as e:
-                ws_log(f"Socket close error: {e}")
-        ws_set_state(socket=None, thread_started=False)
-    except Exception as e:
-        ws_set_state(error=f"Stop error: {e}")
-        log_app_error("stop_angel_websocket", e)
-
-
-def extract_ltp_from_message(message):
-    if not isinstance(message, dict):
-        return None
-    keys = ["last_traded_price", "ltp", "lastTradedPrice", "last_traded_price_int", "close"]
-    for key in keys:
-        if key in message and message.get(key) is not None:
-            try:
-                val = float(message[key])
-                if val > 10000:
-                    val /= 100.0
-                return val
-            except Exception:
-                return None
-    return None
-
-
-def start_angel_websocket(api_key, client_code, pin, totp_secret, symbol_name):
-    init_ws_state()
-    ws_log("Entered start_angel_websocket")
-
-    if not SMART_WS_AVAILABLE:
-        ws_set_state(error="SmartWebSocketV2 not available")
-        sync_ws_state_to_session()
-        return
-
-    symbol_token = ANGEL_TOKENS.get(symbol_name)
-    if not symbol_token:
-        ws_set_state(error=f"Missing token for {symbol_name}")
-        sync_ws_state_to_session()
-        return
-
-    state = ws_get_state()
-    if state.get("thread_started") and state.get("symbol") == symbol_name and state.get("should_run"):
-        sync_ws_state_to_session()
-        return
-
-    ws_set_state(should_run=True, thread_started=True, symbol=symbol_name, error="", retries=0)
-
-    def run_socket():
-        retry_count = 0
-        while True:
-            state_now = ws_get_state()
-            if not state_now.get("should_run"):
-                break
-            if retry_count >= MAX_WS_RETRIES:
-                ws_set_state(error="Max reconnect attempts reached", running=False, connected=False, retries=retry_count, thread_started=False, socket=None)
-                break
-
-            try:
-                angel, session = angel_login(api_key, client_code, pin, totp_secret, force_refresh=True)
-                if angel is None or session is None or not session.get("data"):
-                    raise Exception("Angel login failed during reconnect")
-
-                auth_token = session["data"].get("jwtToken")
-                if not auth_token:
-                    raise Exception("JWT missing")
-
-                feed_token_resp = angel.getfeedToken()
-                if isinstance(feed_token_resp, dict):
-                    feed_token = feed_token_resp.get("data", {}).get("feedToken") or feed_token_resp.get("feedToken")
-                else:
-                    feed_token = feed_token_resp
-
-                if not feed_token:
-                    raise Exception("Feed token missing")
-
-                sws = SmartWebSocketV2(auth_token, api_key, client_code, feed_token)
-                ws_set_state(socket=sws, running=True, connected=False, retries=retry_count, error="")
-
-                correlation_id = f"elite_feed_{symbol_name}"
-                mode = 1
-                token_list = [{"exchangeType": 1, "tokens": [str(symbol_token)]}]
-
-                def on_data(wsapp, message):
-                    ltp = extract_ltp_from_message(message)
-                    current_state = ws_get_state()
-                    ws_set_state(
-                        last_tick=message,
-                        connected=True,
-                        running=True,
-                        error="",
-                        live_price=ltp if ltp is not None else current_state.get("live_price"),
-                        last_data_time=now_str()
-                    )
-
-                def on_open(wsapp):
-                    try:
-                        ws_set_state(connected=True, running=True, error="")
-                        sws.subscribe(correlation_id, mode, token_list)
-                    except Exception as e:
-                        ws_set_state(error=f"Subscribe error: {e}", connected=False)
-
-                def on_error(wsapp, error):
-                    ws_set_state(error=f"WS error: {error}", connected=False, running=False)
-
-                def on_close(wsapp, *args):
-                    reason = " | ".join([str(x) for x in args if x is not None]) if args else ""
-                    ws_set_state(connected=False, running=False, error=f"WS closed {reason}")
-
-                sws.on_open = on_open
-                sws.on_data = on_data
-                sws.on_error = on_error
-                sws.on_close = on_close
-
-                try:
-                    sws.connect()
-                finally:
-                    ws_set_state(connected=False, running=False, socket=None)
-
-            except Exception as e:
-                ws_set_state(
-                    error=f"Reconnect attempt {retry_count + 1}/{MAX_WS_RETRIES}: {e}",
-                    connected=False, running=False, socket=None
-                )
-                log_app_error("start_angel_websocket", e)
-
-            retry_count += 1
-            ws_set_state(retries=retry_count)
-            if not ws_get_state().get("should_run"):
-                break
-            pytime.sleep(WS_RETRY_DELAY_SEC)
-
-        ws_set_state(running=False, connected=False, socket=None, thread_started=False)
-
-    threading.Thread(target=run_socket, daemon=True).start()
-    sync_ws_state_to_session()
-
-
-# =========================================================
-# INDICATORS
-# =========================================================
 def compute_rsi(series, window=14):
     delta = series.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1 / window, min_periods=window, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1 / window, min_periods=window, adjust=False).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
+
+    avg_gain = gain.rolling(window=window).mean()
+    avg_loss = loss.rolling(window=window).mean().replace(0, np.nan)
+    rs = avg_gain / avg_loss
     rsi = 100 - (100 / (1 + rs))
-    return rsi.fillna(50).clip(1, 99)
+    return rsi.fillna(50).clip(lower=1, upper=99)
 
 
 def compute_stochastic(df, k_window=14, d_window=3):
@@ -799,115 +464,53 @@ def compute_adx(df, period=14):
     tr3 = (low - close.shift(1)).abs()
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
 
-    atr = tr.ewm(alpha=1 / period, min_periods=period, adjust=False).mean().replace(0, 1e-10)
-    plus_di = 100 * (pd.Series(plus_dm, index=df.index).ewm(alpha=1 / period, min_periods=period, adjust=False).mean() / atr)
-    minus_di = 100 * (pd.Series(minus_dm, index=df.index).ewm(alpha=1 / period, min_periods=period, adjust=False).mean() / atr)
+    atr = tr.rolling(period).mean().replace(0, 1e-10)
+    plus_di = 100 * (pd.Series(plus_dm, index=df.index).rolling(period).mean() / atr)
+    minus_di = 100 * (pd.Series(minus_dm, index=df.index).rolling(period).mean() / atr)
+
     dx = ((plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, 1e-10)) * 100
-    adx = dx.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    adx = dx.rolling(period).mean()
+
     return adx, plus_di, minus_di
 
 
 def compute_vwap(df):
     df = df.copy()
+
     if df.empty:
         df["VWAP"] = np.nan
         return df
 
     df.index = pd.to_datetime(df.index, errors="coerce")
     df = df[~df.index.isna()].copy()
+
     for col in ["High", "Low", "Close", "Volume"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
+
     df["Volume"] = df["Volume"].fillna(0)
 
     tp = (df["High"] + df["Low"] + df["Close"]) / 3
+
     if df["Volume"].sum() <= 0:
-        df["VWAP"] = tp.expanding().mean().bfill().ffill()
+        df["VWAP"] = tp.expanding().mean()
+        df["VWAP"] = df["VWAP"].bfill().ffill()
         return df
 
     trade_date = pd.Series(df.index.date, index=df.index)
     cum_pv = (tp * df["Volume"]).groupby(trade_date).cumsum()
     cum_vol = df["Volume"].groupby(trade_date).cumsum()
-    df["VWAP"] = np.where(cum_vol > 0, cum_pv / cum_vol, tp.expanding().mean())
-    df["VWAP"] = pd.to_numeric(df["VWAP"], errors="coerce").replace([np.inf, -np.inf], np.nan).bfill().ffill()
+
+    df["VWAP"] = np.where(
+        cum_vol > 0,
+        cum_pv / cum_vol,
+        tp.expanding().mean()
+    )
+
+    df["VWAP"] = pd.to_numeric(df["VWAP"], errors="coerce")
+    df["VWAP"] = df["VWAP"].replace([np.inf, -np.inf], np.nan)
+    df["VWAP"] = df["VWAP"].bfill().ffill()
+
     return df
-
-
-def convert_to_heikin_ashi(df):
-    ha = df.copy()
-    if ha.empty:
-        return ha
-    ha["HA_Close"] = (ha["Open"] + ha["High"] + ha["Low"] + ha["Close"]) / 4
-    ha_open = [(ha["Open"].iloc[0] + ha["Close"].iloc[0]) / 2]
-    for i in range(1, len(ha)):
-        ha_open.append((ha_open[i - 1] + ha["HA_Close"].iloc[i - 1]) / 2)
-    ha["HA_Open"] = ha_open
-    ha["HA_High"] = ha[["High", "HA_Open", "HA_Close"]].max(axis=1)
-    ha["HA_Low"] = ha[["Low", "HA_Open", "HA_Close"]].min(axis=1)
-    return ha
-
-
-def compute_supertrend(df, period=10, multiplier=3):
-    data = df.copy()
-    if data.empty:
-        data["SuperTrend"] = np.nan
-        data["SuperTrendDirection"] = 0
-        return data
-
-    high = data["High"]
-    low = data["Low"]
-    close = data["Close"]
-
-    tr1 = high - low
-    tr2 = (high - close.shift(1)).abs()
-    tr3 = (low - close.shift(1)).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    atr = tr.rolling(period).mean()
-
-    hl2 = (high + low) / 2
-    upperband = hl2 + (multiplier * atr)
-    lowerband = hl2 - (multiplier * atr)
-
-    final_upperband = upperband.copy()
-    final_lowerband = lowerband.copy()
-
-    for i in range(1, len(data)):
-        if pd.notna(close.iloc[i - 1]) and pd.notna(final_upperband.iloc[i - 1]):
-            if close.iloc[i - 1] <= final_upperband.iloc[i - 1]:
-                final_upperband.iloc[i] = min(upperband.iloc[i], final_upperband.iloc[i - 1])
-            else:
-                final_upperband.iloc[i] = upperband.iloc[i]
-
-        if pd.notna(close.iloc[i - 1]) and pd.notna(final_lowerband.iloc[i - 1]):
-            if close.iloc[i - 1] >= final_lowerband.iloc[i - 1]:
-                final_lowerband.iloc[i] = max(lowerband.iloc[i], final_lowerband.iloc[i - 1])
-            else:
-                final_lowerband.iloc[i] = lowerband.iloc[i]
-
-    supertrend = pd.Series(index=data.index, dtype=float)
-    direction = pd.Series(index=data.index, dtype=float)
-
-    for i in range(len(data)):
-        if i == 0:
-            supertrend.iloc[i] = final_upperband.iloc[i]
-            direction.iloc[i] = -1
-            continue
-
-        prev_upper = final_upperband.iloc[i - 1]
-        prev_lower = final_lowerband.iloc[i - 1]
-        curr_close = close.iloc[i]
-
-        if pd.notna(prev_upper) and curr_close > prev_upper:
-            direction.iloc[i] = 1
-        elif pd.notna(prev_lower) and curr_close < prev_lower:
-            direction.iloc[i] = -1
-        else:
-            direction.iloc[i] = direction.iloc[i - 1]
-
-        supertrend.iloc[i] = final_lowerband.iloc[i] if direction.iloc[i] == 1 else final_upperband.iloc[i]
-
-    data["SuperTrend"] = supertrend
-    data["SuperTrendDirection"] = direction.fillna(0).astype(int)
-    return data
 
 
 def add_indicators(df):
@@ -915,9 +518,9 @@ def add_indicators(df):
 
     df["EMA20"] = df["Close"].ewm(span=20, adjust=False).mean()
     df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
-    df["EMA200"] = df["Close"].ewm(span=200, adjust=False).mean()
 
     df = compute_vwap(df)
+
     df["RSI"] = compute_rsi(df["Close"], 14)
 
     ema12 = df["Close"].ewm(span=12, adjust=False).mean()
@@ -931,8 +534,6 @@ def add_indicators(df):
     low_close = (df["Low"] - df["Close"].shift(1)).abs()
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     df["ATR"] = tr.rolling(14).mean()
-
-    df = compute_supertrend(df, period=10, multiplier=3)
 
     df["SMA20"] = df["Close"].rolling(20).mean()
     std20 = df["Close"].rolling(20).std()
@@ -948,307 +549,173 @@ def add_indicators(df):
     df["Breakdown"] = df["Close"] < df["PivotLow"].shift(1)
 
     df["RetestBull"] = (
-        df["Breakout"].shift(1) &
-        (df["Low"] <= df["PivotHigh"].shift(1)) &
-        (df["Close"] > df["PivotHigh"].shift(1))
+        df["Breakout"].shift(1)
+        & (df["Low"] <= df["PivotHigh"].shift(1))
+        & (df["Close"] > df["PivotHigh"].shift(1))
     )
 
     df["RetestBear"] = (
-        df["Breakdown"].shift(1) &
-        (df["High"] >= df["PivotLow"].shift(1)) &
-        (df["Close"] < df["PivotLow"].shift(1))
+        df["Breakdown"].shift(1)
+        & (df["High"] >= df["PivotLow"].shift(1))
+        & (df["Close"] < df["PivotLow"].shift(1))
     )
 
     k, d = compute_stochastic(df)
     df["StochK"] = k.rolling(3).mean()
     df["StochD"] = d.rolling(3).mean()
+
     df["ADX"], df["PlusDI"], df["MinusDI"] = compute_adx(df)
 
     candle_body = (df["Close"] - df["Open"]).abs()
     candle_range = (df["High"] - df["Low"]).replace(0, 1e-10)
+
     upper_shadow = df["High"] - df[["Open", "Close"]].max(axis=1)
     lower_shadow = df[["Open", "Close"]].min(axis=1) - df["Low"]
 
-    df["Hammer"] = ((lower_shadow > candle_body * 2) & (upper_shadow < candle_body))
-    df["ShootingStar"] = ((upper_shadow > candle_body * 2) & (lower_shadow < candle_body))
+    df["BullishMarubozu"] = (
+        (df["Close"] > df["Open"])
+        & (upper_shadow < candle_body * 0.1)
+        & (lower_shadow < candle_body * 0.1)
+    )
+
+    df["BearishMarubozu"] = (
+        (df["Close"] < df["Open"])
+        & (upper_shadow < candle_body * 0.1)
+        & (lower_shadow < candle_body * 0.1)
+    )
+
     df["BullishEngulfing"] = (
-        (df["Close"] > df["Open"]) &
-        (df["Close"].shift(1) < df["Open"].shift(1)) &
-        (df["Open"] <= df["Close"].shift(1)) &
-        (df["Close"] >= df["Open"].shift(1))
+        (df["Close"] > df["Open"])
+        & (df["Close"].shift(1) < df["Open"].shift(1))
+        & (df["Open"] <= df["Close"].shift(1))
+        & (df["Close"] >= df["Open"].shift(1))
     )
+
     df["BearishEngulfing"] = (
-        (df["Close"] < df["Open"]) &
-        (df["Close"].shift(1) > df["Open"].shift(1)) &
-        (df["Open"] >= df["Close"].shift(1)) &
-        (df["Close"] <= df["Open"].shift(1))
+        (df["Close"] < df["Open"])
+        & (df["Close"].shift(1) > df["Open"].shift(1))
+        & (df["Open"] >= df["Close"].shift(1))
+        & (df["Close"] <= df["Open"].shift(1))
     )
+
+    df["PiercingPattern"] = (
+        (df["Close"].shift(1) < df["Open"].shift(1))
+        & (df["Close"] > df["Open"])
+        & (df["Close"] > ((df["Open"].shift(1) + df["Close"].shift(1)) / 2))
+    )
+
+    df["DarkCloudCover"] = (
+        (df["Close"].shift(1) > df["Open"].shift(1))
+        & (df["Close"] < df["Open"])
+        & (df["Close"] < ((df["Open"].shift(1) + df["Close"].shift(1)) / 2))
+    )
+
+    df["TweezerBottom"] = (
+        abs(df["Low"] - df["Low"].shift(1)) <= (df["ATR"] * 0.1)
+    )
+
+    df["BullishHarami"] = (
+        (df["Close"].shift(1) < df["Open"].shift(1))
+        & (df["Close"] > df["Open"])
+        & (df["Open"] > df["Close"].shift(1))
+        & (df["Close"] < df["Open"].shift(1))
+    )
+
+    df["BearishHarami"] = (
+        (df["Close"].shift(1) > df["Open"].shift(1))
+        & (df["Close"] < df["Open"])
+        & (df["Open"] < df["Close"].shift(1))
+        & (df["Close"] > df["Open"].shift(1))
+    )
+
     df["Doji"] = candle_body <= (candle_range * 0.1)
+
+    df["TweezerTop"] = (
+        abs(df["High"] - df["High"].shift(1)) <= (df["ATR"] * 0.1)
+    )
+
+    df["Hammer"] = (
+        (lower_shadow > candle_body * 2)
+        & (upper_shadow < candle_body)
+    )
+
+    df["ShootingStar"] = (
+        (upper_shadow > candle_body * 2)
+        & (lower_shadow < candle_body)
+    )
+
+    df["InvertedHammer"] = (
+        (upper_shadow > candle_body * 2)
+        & (lower_shadow < candle_body * 0.5)
+        & (df["Close"] > df["Open"])
+    )
+
+    df["HangingMan"] = (
+        (lower_shadow > candle_body * 2)
+        & (upper_shadow < candle_body * 0.5)
+        & (df["Close"] < df["Open"])
+    )
+
+    df["DragonflyDoji"] = (
+        (candle_body <= candle_range * 0.05)
+        & (lower_shadow > candle_body * 3)
+    )
+
+    df["GravestoneDoji"] = (
+        (candle_body <= candle_range * 0.05)
+        & (upper_shadow > candle_body * 3)
+    )
+
+    df["ThreeWhiteSoldiers"] = (
+        (df["Close"] > df["Open"])
+        & (df["Close"].shift(1) > df["Open"].shift(1))
+        & (df["Close"].shift(2) > df["Open"].shift(2))
+        & (df["Close"] > df["Close"].shift(1))
+        & (df["Close"].shift(1) > df["Close"].shift(2))
+    )
+
+    df["ThreeBlackCrows"] = (
+        (df["Close"] < df["Open"])
+        & (df["Close"].shift(1) < df["Open"].shift(1))
+        & (df["Close"].shift(2) < df["Open"].shift(2))
+        & (df["Close"] < df["Close"].shift(1))
+        & (df["Close"].shift(1) < df["Close"].shift(2))
+    )
+
+    df["MorningStar"] = (
+        (df["Close"].shift(2) < df["Open"].shift(2))
+        & (abs(df["Close"].shift(1) - df["Open"].shift(1)) < candle_body.shift(1))
+        & (df["Close"] > df["Open"])
+    )
+
+    df["EveningStar"] = (
+        (df["Close"].shift(2) > df["Open"].shift(2))
+        & (abs(df["Close"].shift(1) - df["Open"].shift(1)) < candle_body.shift(1))
+        & (df["Close"] < df["Open"])
+    )
+
     df["BodyStrength"] = candle_body / candle_range
+
+    df["BuyMarker"] = np.where(
+        (df["EMA20"] > df["EMA50"]) &
+        (df["EMA20"].shift(1) <= df["EMA50"].shift(1)),
+        df["Low"] * 0.995,
+        np.nan
+    )
+
+    df["SellMarker"] = np.where(
+        (df["EMA20"] < df["EMA50"]) &
+        (df["EMA20"].shift(1) >= df["EMA50"].shift(1)),
+        df["High"] * 1.005,
+        np.nan
+    )
+
     return df
 
 
-# =========================================================
-# NEWS FILTER API
-# =========================================================
-@st.cache_data(ttl=300)
-def get_news_events(news_api_key, symbol):
-    if not news_api_key:
-        return {"allow_trade": True, "message": "News API key not configured", "events": []}
-    try:
-        query = symbol
-        url = "https://newsapi.org/v2/everything"
-        params = {
-            "q": query,
-            "sortBy": "publishedAt",
-            "pageSize": 10,
-            "language": "en",
-            "apiKey": news_api_key
-        }
-        resp = requests.get(url, params=params, timeout=10)
-        if resp.status_code != 200:
-            return {"allow_trade": True, "message": f"News API unavailable ({resp.status_code})", "events": []}
-
-        data = resp.json()
-        articles = data.get("articles", [])
-        important = []
-        keywords = ["results", "earnings", "fed", "inflation", "policy", "rbi", "rate", "war", "crash", "merger", "acquisition", "guidance"]
-
-        now_dt = datetime.utcnow()
-        for a in articles:
-            title = (a.get("title") or "").lower()
-            published = a.get("publishedAt")
-            try:
-                pub_dt = datetime.fromisoformat(published.replace("Z", "+00:00")).replace(tzinfo=None)
-            except Exception:
-                pub_dt = None
-
-            recent = False
-            if pub_dt is not None:
-                recent = (now_dt - pub_dt) <= timedelta(hours=6)
-
-            if any(k in title for k in keywords) and recent:
-                important.append({
-                    "title": a.get("title"),
-                    "source": a.get("source", {}).get("name", ""),
-                    "publishedAt": published
-                })
-
-        allow_trade = len(important) == 0
-        return {
-            "allow_trade": allow_trade,
-            "message": "No high-impact recent news" if allow_trade else "High-impact recent news detected",
-            "events": important
-        }
-    except Exception as e:
-        log_app_error("get_news_events", e)
-        return {"allow_trade": True, "message": "News filter fallback", "events": []}
-
-
-# =========================================================
-# OPTION CHAIN / PCR / OI
-# =========================================================
-@st.cache_data(ttl=120)
-def get_option_chain_snapshot(symbol="NIFTY"):
-    try:
-        url = f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}"
-        headers = {
-            "User-Agent": "Mozilla/5.0",
-            "Accept": "application/json,text/plain,*/*",
-            "Referer": "https://www.nseindia.com/option-chain",
-            "Accept-Language": "en-US,en;q=0.9"
-        }
-        session = requests.Session()
-        session.get("https://www.nseindia.com", headers=headers, timeout=10)
-        resp = session.get(url, headers=headers, timeout=10)
-        if resp.status_code != 200:
-            return None
-        data = resp.json()
-        with open(OPTION_CHAIN_FILE, "w") as f:
-            json.dump({"symbol": symbol, "data": data}, f)
-        return data
-    except Exception as e:
-        log_app_error("get_option_chain_snapshot", e)
-        try:
-            if os.path.exists(OPTION_CHAIN_FILE):
-                with open(OPTION_CHAIN_FILE, "r") as f:
-                    cache = json.load(f)
-                    if cache.get("symbol") == symbol:
-                        return cache.get("data")
-        except Exception:
-            pass
-        return None
-
-
-def get_dynamic_option_chain_symbol(selected_symbol):
-    if selected_symbol == "BANKNIFTY":
-        return "BANKNIFTY"
-    return "NIFTY"
-
-
-def parse_option_chain_metrics(symbol="NIFTY"):
-    data = get_option_chain_snapshot(symbol)
-    if not data:
-        return {
-            "pcr": None,
-            "oi_bias": "Neutral",
-            "long_unwinding": False,
-            "short_covering": False,
-            "call_oi": 0,
-            "put_oi": 0
-        }
-    try:
-        total_ce, total_pe = 0, 0
-        ce_change_oi, pe_change_oi = 0, 0
-
-        for item in data.get("records", {}).get("data", []):
-            if "CE" in item:
-                total_ce += item["CE"].get("openInterest", 0)
-                ce_change_oi += item["CE"].get("changeinOpenInterest", 0)
-            if "PE" in item:
-                total_pe += item["PE"].get("openInterest", 0)
-                pe_change_oi += item["PE"].get("changeinOpenInterest", 0)
-
-        pcr = round(total_pe / total_ce, 2) if total_ce > 0 else None
-        oi_bias = "Bullish" if total_pe > total_ce else "Bearish" if total_ce > total_pe else "Neutral"
-        long_unwinding = ce_change_oi < 0 and pe_change_oi > 0
-        short_covering = ce_change_oi > 0 and pe_change_oi < 0
-
-        return {
-            "pcr": pcr,
-            "oi_bias": oi_bias,
-            "long_unwinding": long_unwinding,
-            "short_covering": short_covering,
-            "call_oi": total_ce,
-            "put_oi": total_pe
-        }
-    except Exception as e:
-        log_app_error("parse_option_chain_metrics", e)
-        return {
-            "pcr": None,
-            "oi_bias": "Neutral",
-            "long_unwinding": False,
-            "short_covering": False,
-            "call_oi": 0,
-            "put_oi": 0
-        }
-
-
-# =========================================================
-# SIGNAL ANALYSIS HELPERS
-# =========================================================
-def detect_gap_filter(df):
-    try:
-        if len(df) < 2:
-            return {"gap_up": False, "gap_down": False, "gap_pct": 0.0, "allow_trade": True}
-        latest = df.iloc[-1]
-        prev = df.iloc[-2]
-        prev_close = float(prev["Close"])
-        current_open = float(latest["Open"])
-        gap_pct = ((current_open - prev_close) / prev_close) * 100 if prev_close else 0.0
-        return {
-            "gap_up": gap_pct >= GAP_FILTER_PCT,
-            "gap_down": gap_pct <= -GAP_FILTER_PCT,
-            "gap_pct": round(gap_pct, 2),
-            "allow_trade": abs(gap_pct) < 2.5
-        }
-    except Exception as e:
-        log_app_error("detect_gap_filter", e)
-        return {"gap_up": False, "gap_down": False, "gap_pct": 0.0, "allow_trade": True}
-
-
-def detect_market_regime(df):
-    try:
-        latest = df.iloc[-1]
-        close_price = float(latest["Close"])
-        adx = float(latest["ADX"]) if pd.notna(latest["ADX"]) else 0.0
-        atr = float(latest["ATR"]) if pd.notna(latest["ATR"]) else 0.0
-        ema20 = float(latest["EMA20"])
-        ema50 = float(latest["EMA50"])
-
-        atr_pct = (atr / close_price) * 100 if close_price else 0.0
-        ema_spread_pct = (abs(ema20 - ema50) / close_price) * 100 if close_price else 0.0
-
-        trending = adx >= TRENDING_ADX_MIN and ema_spread_pct >= 0.3
-        sideways = adx <= SIDEWAYS_ADX_MAX and ema_spread_pct < 0.3
-        high_volatility = atr_pct >= HIGH_VOL_ATR_PCT
-
-        if trending and high_volatility:
-            regime = "Trending High Volatility"
-        elif trending:
-            regime = "Trending"
-        elif sideways:
-            regime = "Sideways"
-        elif high_volatility:
-            regime = "High Volatility"
-        else:
-            regime = "Balanced"
-
-        return {
-            "regime": regime,
-            "trending": trending,
-            "sideways": sideways,
-            "high_volatility": high_volatility,
-            "atr_pct": round(atr_pct, 2),
-            "ema_spread_pct": round(ema_spread_pct, 2)
-        }
-    except Exception as e:
-        log_app_error("detect_market_regime", e)
-        return {
-            "regime": "Unknown",
-            "trending": False,
-            "sideways": False,
-            "high_volatility": False,
-            "atr_pct": 0.0,
-            "ema_spread_pct": 0.0
-        }
-
-
-def classify_strategy_grade(score):
-    if score >= 90:
-        return "A+"
-    if score >= 80:
-        return "A"
-    if score >= 70:
-        return "B"
-    if score >= 55:
-        return "C"
-    return "D"
-
-
-def strategy_health_monitor(validation_score, win_rate, profit_factor, max_drawdown):
-    health = 50
-    if validation_score >= 80:
-        health += 20
-    elif validation_score >= 65:
-        health += 10
-    if win_rate >= 60:
-        health += 15
-    elif win_rate < 45:
-        health -= 10
-    if profit_factor >= 1.8:
-        health += 10
-    elif profit_factor < 1.2:
-        health -= 10
-    if max_drawdown <= 5:
-        health += 10
-    elif max_drawdown > 15:
-        health -= 15
-
-    health = max(0, min(100, health))
-    if health >= 85:
-        label = "Excellent"
-    elif health >= 70:
-        label = "Healthy"
-    elif health >= 55:
-        label = "Average"
-    elif health >= 40:
-        label = "Weak"
-    else:
-        label = "Critical"
-    return health, label
-
-
+# ----------------------------
+# SIGNAL UTILS
+# ----------------------------
 def get_higher_timeframe(tf):
     if tf == "1m":
         return "3m", "7d"
@@ -1270,14 +737,17 @@ def get_higher_timeframe(tf):
 def session_filter(df, tf):
     if tf == "1d":
         return {"valid": True, "message": "Daily timeframe - session filter skipped"}
+
     try:
         last_ts = pd.to_datetime(df.index[-1])
         current_t = last_ts.time()
+
         if current_t < time(9, 20):
-            return {"valid": False, "message": "Avoid first few minutes after open"}
+            return {"valid": False, "message": "Avoid first few minutes after market open"}
         if time(12, 15) <= current_t <= time(13, 15):
-            return {"valid": False, "message": "Lunch low momentum zone"}
-        return {"valid": True, "message": "Session timing okay"}
+            return {"valid": False, "message": "Lunch/session low momentum zone"}
+
+        return {"valid": True, "message": "Session timing looks okay"}
     except Exception:
         return {"valid": True, "message": "Session filter unavailable"}
 
@@ -1285,10 +755,12 @@ def session_filter(df, tf):
 def calculate_win_chance(bullish, bearish, adx, volume_spike, breakout, breakdown, htf_bias, sideways, rr_ratio, backtest_win_rate):
     score = 50
     score += (bullish - bearish) * 4
+
     if adx > 25:
         score += 8
     elif adx < 18:
         score -= 10
+
     if volume_spike:
         score += 5
     if breakout:
@@ -1299,46 +771,109 @@ def calculate_win_chance(bullish, bearish, adx, volume_spike, breakout, breakdow
         score += 5
     if sideways:
         score -= 12
+
     if rr_ratio is not None:
         if rr_ratio >= 2:
             score += 6
         elif rr_ratio < 1.2:
             score -= 8
+
     if backtest_win_rate >= 60:
         score += 8
     elif backtest_win_rate < 45:
         score -= 8
+
     return int(max(5, min(score, 95)))
 
 
-def analyze_signal(
-    df,
-    htf_bias=None,
-    timeframe_label="1d",
-    backtest_win_rate=50,
-    mtf_bull_count=0,
-    mtf_bear_count=0,
-    option_metrics=None,
-    news_info=None
-):
+def suggest_option_strike(symbol, spot_price, signal_type):
+    if symbol == "NIFTY":
+        step = 50
+    elif symbol == "BANKNIFTY":
+        step = 100
+    else:
+        step = 10
+
+    atm = round(spot_price / step) * step
+
+    if signal_type == "buy":
+        return {
+            "type": "CALL",
+            "atm": atm,
+            "otm": atm + step,
+            "text": f"Suggested CALL strikes: ATM {atm} CE, OTM {atm + step} CE"
+        }
+    elif signal_type == "sell":
+        return {
+            "type": "PUT",
+            "atm": atm,
+            "otm": atm - step,
+            "text": f"Suggested PUT strikes: ATM {atm} PE, OTM {atm - step} PE"
+        }
+
+    return {
+        "type": "NONE",
+        "atm": None,
+        "otm": None,
+        "text": "No option strike suggestion"
+    }
+
+
+@st.cache_data(ttl=60)
+def get_pcr():
+    try:
+        url = "https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY"
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "application/json,text/plain,*/*",
+            "Referer": "https://www.nseindia.com/option-chain",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Connection": "keep-alive"
+        }
+
+        session = requests.Session()
+        session.get("https://www.nseindia.com", headers=headers, timeout=10)
+
+        resp = None
+        for _ in range(3):
+            try:
+                resp = session.get(url, headers=headers, timeout=10)
+                if resp.status_code == 200:
+                    break
+            except Exception:
+                continue
+
+        if resp is None or resp.status_code != 200:
+            return None
+
+        data = resp.json()
+        total_ce = 0
+        total_pe = 0
+
+        for item in data.get("records", {}).get("data", []):
+            if "CE" in item:
+                total_ce += item["CE"].get("openInterest", 0)
+            if "PE" in item:
+                total_pe += item["PE"].get("openInterest", 0)
+
+        if total_ce <= 0:
+            return None
+
+        return round(total_pe / total_ce, 2)
+
+    except Exception:
+        return None
+
+
+def analyze_signal(df, htf_bias=None, timeframe_label="1d", backtest_win_rate=50):
     latest = df.iloc[-1]
     prev = df.iloc[-2]
-
-    ha_df = convert_to_heikin_ashi(df.tail(10))
-    ha_latest = ha_df.iloc[-1]
-    ha_prev = ha_df.iloc[-2]
-
-    ha_bullish = ha_latest["HA_Close"] > ha_latest["HA_Open"]
-    ha_bearish = ha_latest["HA_Close"] < ha_latest["HA_Open"]
-    ha_trend_up = ha_bullish and (ha_prev["HA_Close"] > ha_prev["HA_Open"])
-    ha_trend_down = ha_bearish and (ha_prev["HA_Close"] < ha_prev["HA_Open"])
 
     close_price = float(latest["Close"])
     ema20 = float(latest["EMA20"])
     ema50 = float(latest["EMA50"])
-    ema200 = float(latest["EMA200"]) if pd.notna(latest["EMA200"]) else close_price
     ema20_slope = ema20 - float(prev["EMA20"])
-    vwap = float(latest["VWAP"]) if pd.notna(latest["VWAP"]) else close_price
+    vwap = float(latest["VWAP"]) if pd.notna(latest["VWAP"]) else float(close_price)
     rsi = float(latest["RSI"])
     macd = float(latest["MACD"])
     macd_signal = float(latest["SignalLine"])
@@ -1348,21 +883,40 @@ def analyze_signal(
     adx = float(latest["ADX"]) if pd.notna(latest["ADX"]) else 0.0
     support = float(latest["PivotLow"]) if pd.notna(latest["PivotLow"]) else close_price
     resistance = float(latest["PivotHigh"]) if pd.notna(latest["PivotHigh"]) else close_price
-    supertrend_dir = int(latest["SuperTrendDirection"]) if pd.notna(latest["SuperTrendDirection"]) else 0
-    plus_di = float(latest["PlusDI"]) if pd.notna(latest["PlusDI"]) else 0
-    minus_di = float(latest["MinusDI"]) if pd.notna(latest["MinusDI"]) else 0
 
     distance_to_resistance = ((resistance - close_price) / close_price) * 100 if close_price else 0
     distance_to_support = ((close_price - support) / close_price) * 100 if close_price else 0
+    trend_strength = abs(ema20 - ema50) / close_price * 100 if close_price else 0
 
     volume_spike = bool(latest["Volume_Spike"])
     breakout = bool(latest["Breakout"])
     breakdown = bool(latest["Breakdown"])
     body_strength = float(latest["BodyStrength"]) if pd.notna(latest["BodyStrength"]) else 0
 
+    hammer = bool(latest.get("Hammer", False))
+    shooting_star = bool(latest.get("ShootingStar", False))
+    bull_maru = bool(latest.get("BullishMarubozu", False))
+    bear_maru = bool(latest.get("BearishMarubozu", False))
+    doji = bool(latest.get("Doji", False))
+    bull_engulf = bool(latest.get("BullishEngulfing", False))
+    bear_engulf = bool(latest.get("BearishEngulfing", False))
+    retest_bull = bool(latest.get("RetestBull", False))
+    retest_bear = bool(latest.get("RetestBear", False))
+    plus_di = float(latest["PlusDI"]) if pd.notna(latest["PlusDI"]) else 0
+    minus_di = float(latest["MinusDI"]) if pd.notna(latest["MinusDI"]) else 0
+
     bullish = 0
     bearish = 0
     reasons = []
+
+    pcr = get_pcr()
+    if pcr is not None:
+        if pcr > 1.2:
+            bullish += 1
+            reasons.append(f"PCR Bullish ({pcr})")
+        elif pcr < 0.8:
+            bearish += 1
+            reasons.append(f"PCR Bearish ({pcr})")
 
     if ema20 > ema50:
         bullish += 1
@@ -1374,6 +928,7 @@ def analyze_signal(
     if close_price > ema20 > ema50:
         bullish += 1
         reasons.append("Perfect bullish EMA alignment")
+
     if close_price < ema20 < ema50:
         bearish += 1
         reasons.append("Perfect bearish EMA alignment")
@@ -1385,19 +940,13 @@ def analyze_signal(
         bearish += 1
         reasons.append("Price below EMA20")
 
-    if close_price > ema200:
-        bullish += 2
-        reasons.append("Price above EMA200")
-    elif close_price < ema200:
-        bearish += 2
-        reasons.append("Price below EMA200")
-
-    if close_price > vwap:
-        bullish += 1
-        reasons.append("Price above VWAP")
-    else:
-        bearish += 1
-        reasons.append("Price below VWAP")
+    if pd.notna(vwap):
+        if close_price > vwap:
+            bullish += 1
+            reasons.append("Price above VWAP")
+        else:
+            bearish += 1
+            reasons.append("Price below VWAP")
 
     if rsi > 60:
         bullish += 1
@@ -1432,7 +981,7 @@ def analyze_signal(
     if ema20_slope > 0:
         bullish += 1
         reasons.append("EMA20 rising")
-    elif ema20_slope < 0:
+    if ema20_slope < 0:
         bearish += 1
         reasons.append("EMA20 falling")
 
@@ -1449,7 +998,7 @@ def analyze_signal(
         if plus_di > minus_di:
             bullish += 1
             reasons.append("Strong bullish trend")
-        else:
+        elif minus_di > plus_di:
             bearish += 1
             reasons.append("Strong bearish trend")
 
@@ -1463,65 +1012,125 @@ def analyze_signal(
     if prev["EMA20"] <= prev["EMA50"] and latest["EMA20"] > latest["EMA50"]:
         bullish += 2
         reasons.append("Fresh bullish EMA crossover")
+
     if prev["EMA20"] >= prev["EMA50"] and latest["EMA20"] < latest["EMA50"]:
         bearish += 2
         reasons.append("Fresh bearish EMA crossover")
 
-    if supertrend_dir == 1:
-        bullish += 3
-        reasons.append("SuperTrend bullish")
-    elif supertrend_dir == -1:
-        bearish += 3
-        reasons.append("SuperTrend bearish")
-
-    if ha_bullish:
-        bullish += 1
-        reasons.append("Heikin Ashi bullish candle")
-    if ha_bearish:
-        bearish += 1
-        reasons.append("Heikin Ashi bearish candle")
-    if ha_trend_up:
-        bullish += 2
-        reasons.append("Heikin Ashi bullish continuation")
-    if ha_trend_down:
-        bearish += 2
-        reasons.append("Heikin Ashi bearish continuation")
-
     if breakout:
         bullish += 2
         reasons.append("Resistance breakout")
-        if volume_spike:
-            bullish += 2
-            reasons.append("Breakout with volume")
+        if volume_spike and htf_bias == "bullish":
+            bullish += 3
+            reasons.append("High quality breakout")
 
     if breakdown:
         bearish += 2
         reasons.append("Support breakdown")
-        if volume_spike:
-            bearish += 2
-            reasons.append("Breakdown with volume")
+        if volume_spike and htf_bias == "bearish":
+            bearish += 3
+            reasons.append("High quality breakdown")
 
-    if bool(latest.get("RetestBull", False)):
+    if retest_bull:
         bullish += 3
-        reasons.append("Bullish retest confirmed")
-    if bool(latest.get("RetestBear", False)):
-        bearish += 3
-        reasons.append("Bearish retest confirmed")
+        reasons.append("Bullish breakout retest confirmed")
 
-    if bool(latest.get("Hammer", False)):
+    if retest_bear:
+        bearish += 3
+        reasons.append("Bearish breakdown retest confirmed")
+
+    if hammer:
         bullish += 2
-        reasons.append("Hammer pattern")
-    if bool(latest.get("ShootingStar", False)):
+        reasons.append("Hammer pattern detected")
+
+    if bool(latest.get("InvertedHammer", False)):
+        bullish += 2
+        reasons.append("Inverted Hammer detected")
+
+    if bool(latest.get("HangingMan", False)):
         bearish += 2
-        reasons.append("Shooting Star pattern")
-    if bool(latest.get("BullishEngulfing", False)):
+        reasons.append("Hanging Man detected")
+
+    if bool(latest.get("DragonflyDoji", False)):
+        bullish += 2
+        reasons.append("Dragonfly Doji detected")
+
+    if bool(latest.get("GravestoneDoji", False)):
+        bearish += 2
+        reasons.append("Gravestone Doji detected")
+
+    if bull_maru:
+        bullish += 4
+        bearish = max(0, bearish - 2)
+        reasons.append("Strong Bullish Marubozu detected")
+
+    if shooting_star:
+        bearish += 2
+        reasons.append("Shooting Star detected")
+
+    if bear_maru:
+        bearish += 4
+        bullish = max(0, bullish - 2)
+        reasons.append("Strong Bearish Marubozu detected")
+
+    if bool(latest.get("ThreeWhiteSoldiers", False)):
+        bullish += 4
+        reasons.append("Three White Soldiers detected")
+
+    if bool(latest.get("ThreeBlackCrows", False)):
+        bearish += 4
+        reasons.append("Three Black Crows detected")
+
+    if doji:
+        reasons.append("Doji pattern (market indecision)")
+
+    if bull_engulf:
         bullish += 3
-        reasons.append("Bullish Engulfing")
-    if bool(latest.get("BearishEngulfing", False)):
+        reasons.append("Bullish Engulfing detected")
+
+    if bear_engulf:
         bearish += 3
-        reasons.append("Bearish Engulfing")
-    if bool(latest.get("Doji", False)):
-        reasons.append("Doji indecision")
+        reasons.append("Bearish Engulfing detected")
+
+    if bool(latest.get("PiercingPattern", False)):
+        bullish += 3
+        reasons.append("Piercing Pattern detected")
+
+    if bool(latest.get("DarkCloudCover", False)):
+        bearish += 3
+        reasons.append("Dark Cloud Cover detected")
+
+    if bool(latest.get("BullishHarami", False)):
+        bullish += 3
+        reasons.append("Bullish Harami detected")
+
+    if bool(latest.get("BearishHarami", False)):
+        bearish += 3
+        reasons.append("Bearish Harami detected")
+
+    if bool(latest.get("TweezerBottom", False)):
+        bullish += 2
+        reasons.append("Tweezer Bottom detected")
+
+    if bool(latest.get("TweezerTop", False)):
+        bearish += 2
+        reasons.append("Tweezer Top detected")
+
+    if bool(latest.get("MorningStar", False)):
+        bullish += 4
+        reasons.append("Morning Star detected")
+
+    if bool(latest.get("EveningStar", False)):
+        bearish += 4
+        reasons.append("Evening Star detected")
+
+    if bull_engulf and volume_spike:
+        bullish += 2
+        reasons.append("Bullish Engulfing with Volume Confirmation")
+
+    if bear_engulf and volume_spike:
+        bearish += 2
+        reasons.append("Bearish Engulfing with Volume Confirmation")
 
     if volume_spike:
         reasons.append("Volume spike present")
@@ -1536,63 +1145,34 @@ def analyze_signal(
             bullish += 1
         else:
             bearish += 1
+    else:
+        reasons.append("Weak candle body")
 
-    if bullish > bearish and distance_to_resistance < NO_TRADE_NEAR_SR_PCT:
+    if bullish > bearish and distance_to_resistance < 0.5:
         bullish -= 2
         reasons.append("Too close to resistance")
-    if bearish > bullish and distance_to_support < NO_TRADE_NEAR_SR_PCT:
+
+    if bearish > bullish and distance_to_support < 0.5:
         bearish -= 2
         reasons.append("Too close to support")
 
     if htf_bias == "bullish":
-        bullish += 3
+        bullish += 2
         reasons.append("Higher timeframe bullish confirmation")
     elif htf_bias == "bearish":
-        bearish += 3
+        bearish += 2
         reasons.append("Higher timeframe bearish confirmation")
 
-    regime = detect_market_regime(df)
-    gap_info = detect_gap_filter(df)
+    if bullish > bearish and htf_bias == "bearish":
+        bullish -= 2
+        reasons.append("Higher timeframe conflict")
+
+    if bearish > bullish and htf_bias == "bullish":
+        bearish -= 2
+        reasons.append("Higher timeframe conflict")
+
+    sideways = bool(adx < 18 and trend_strength < 0.3)
     session_info = session_filter(df, timeframe_label)
-    news_info = news_info or {"allow_trade": True, "message": "News filter unavailable", "events": []}
-
-    sideways = bool(regime["sideways"])
-    mtf_strict_bull_ok = mtf_bull_count >= MANDATORY_MTF_ALIGN_COUNT
-    mtf_strict_bear_ok = mtf_bear_count >= MANDATORY_MTF_ALIGN_COUNT
-
-    option_metrics = option_metrics or {
-        "pcr": None,
-        "oi_bias": "Neutral",
-        "long_unwinding": False,
-        "short_covering": False
-    }
-
-    pcr = option_metrics.get("pcr")
-    oi_bias = option_metrics.get("oi_bias")
-    long_unwinding = option_metrics.get("long_unwinding", False)
-    short_covering = option_metrics.get("short_covering", False)
-
-    if pcr is not None:
-        if pcr > 1.2:
-            bullish += 1
-            reasons.append(f"PCR bullish ({pcr})")
-        elif pcr < 0.8:
-            bearish += 1
-            reasons.append(f"PCR bearish ({pcr})")
-
-    if oi_bias == "Bullish":
-        bullish += 1
-        reasons.append("OI bias bullish")
-    elif oi_bias == "Bearish":
-        bearish += 1
-        reasons.append("OI bias bearish")
-
-    if short_covering:
-        bullish += 1
-        reasons.append("Short covering detected")
-    if long_unwinding:
-        bearish += 1
-        reasons.append("Long unwinding detected")
 
     signal_text = "NO TRADE"
     signal_type = "neutral"
@@ -1601,158 +1181,67 @@ def analyze_signal(
     partial_exit = None
     target1 = None
     target2 = None
-    target3 = None
     trailing_stop = None
     rr_ratio = None
 
     if atr and atr > 0:
-        rr_ratio = IDEAL_RR
+        rr_ratio = 2.0
 
-    buy_mandatory_ok = all([
-        adx >= MANDATORY_ADX,
-        close_price > ema200,
-        supertrend_dir == 1,
-        ha_trend_up,
-        volume_spike,
-        htf_bias == "bullish",
-        mtf_strict_bull_ok,
-        not sideways,
-        session_info["valid"],
-        gap_info["allow_trade"],
-        news_info["allow_trade"]
-    ])
-
-    sell_mandatory_ok = all([
-        adx >= MANDATORY_ADX,
-        close_price < ema200,
-        supertrend_dir == -1,
-        ha_trend_down,
-        volume_spike,
-        htf_bias == "bearish",
-        mtf_strict_bear_ok,
-        not sideways,
-        session_info["valid"],
-        gap_info["allow_trade"],
-        news_info["allow_trade"]
-    ])
-
-    if atr and atr > 0:
-        buy_sl = close_price - atr
-        buy_t1 = close_price + 2 * atr
-        buy_t2 = close_price + 3 * atr
-        buy_t3 = close_price + 4 * atr
-        buy_rr = (buy_t1 - close_price) / (close_price - buy_sl) if close_price > buy_sl else None
-
-        sell_sl = close_price + atr
-        sell_t1 = close_price - 2 * atr
-        sell_t2 = close_price - 3 * atr
-        sell_t3 = close_price - 4 * atr
-        sell_rr = (close_price - sell_t1) / (sell_sl - close_price) if sell_sl > close_price else None
-
-        if bullish >= 10 and (bullish - bearish) >= 4 and rsi > 55 and macd > macd_signal and buy_mandatory_ok and buy_rr is not None and buy_rr >= MIN_RR_REQUIRED:
+    if not sideways and session_info["valid"] and atr > 0:
+        if bullish >= 8 and (bullish - bearish) >= 3 and rsi > 55 and macd > macd_signal and adx > 25:
             signal_text = "STRONG BUY"
             signal_type = "buy"
             strength = "High"
-            stop_loss = buy_sl
-            target1 = buy_t1
-            target2 = buy_t2
-            target3 = buy_t3
-            partial_exit = target1
+            stop_loss = close_price - atr
+            partial_exit = close_price + (0.8 * atr)
+            target1 = close_price + atr
+            target2 = close_price + (2 * atr)
             trailing_stop = close_price - (0.5 * atr)
-            rr_ratio = round(buy_rr, 2)
 
-        elif bearish >= 10 and (bearish - bullish) >= 4 and rsi < 45 and macd < macd_signal and sell_mandatory_ok and sell_rr is not None and sell_rr >= MIN_RR_REQUIRED:
+        elif bearish >= 8 and (bearish - bullish) >= 3 and rsi < 45 and macd < macd_signal and adx > 25:
             signal_text = "STRONG SELL"
             signal_type = "sell"
             strength = "High"
-            stop_loss = sell_sl
-            target1 = sell_t1
-            target2 = sell_t2
-            target3 = sell_t3
-            partial_exit = target1
+            stop_loss = close_price + atr
+            partial_exit = close_price - (0.8 * atr)
+            target1 = close_price - atr
+            target2 = close_price - (2 * atr)
             trailing_stop = close_price + (0.5 * atr)
-            rr_ratio = round(sell_rr, 2)
 
-        elif not STRICT_TRADE_ONLY_STRONG:
-            if bullish > bearish and bullish >= 7 and supertrend_dir == 1 and not DISABLE_BUY_BIAS_TRADING:
-                signal_text = "BUY BIAS"
-                signal_type = "buy"
-                strength = "Medium"
-            elif bearish > bullish and bearish >= 7 and supertrend_dir == -1 and not DISABLE_SELL_BIAS_TRADING:
-                signal_text = "SELL BIAS"
-                signal_type = "sell"
-                strength = "Medium"
+        elif bullish > bearish and bullish >= 6:
+            signal_text = "BUY BIAS"
+            signal_type = "buy"
+            strength = "Medium"
+            stop_loss = close_price - atr
+            partial_exit = close_price + (0.7 * atr)
+            target1 = close_price + atr
+            trailing_stop = close_price - (0.4 * atr)
 
-    confidence = min(100, max(40, int((max(bullish, bearish) / 18) * 100)))
-    if supertrend_dir == 1 and bullish > bearish:
-        confidence += 3
-    elif supertrend_dir == -1 and bearish > bullish:
-        confidence += 3
-    if ha_trend_up and bullish > bearish:
-        confidence += 3
-    elif ha_trend_down and bearish > bullish:
-        confidence += 3
-    confidence = min(100, confidence)
+        elif bearish > bullish and bearish >= 6:
+            signal_text = "SELL BIAS"
+            signal_type = "sell"
+            strength = "Medium"
+            stop_loss = close_price + atr
+            partial_exit = close_price - (0.7 * atr)
+            target1 = close_price - atr
+            trailing_stop = close_price + (0.4 * atr)
 
-    validation_score = 0
-    validation_score += min(25, max(0, (max(bullish, bearish) * 2)))
-    validation_score += 10 if adx >= MANDATORY_ADX else 0
-    validation_score += 10 if volume_spike else 0
-    validation_score += 10 if ((signal_type == "buy" and close_price > ema200) or (signal_type == "sell" and close_price < ema200)) else 0
-    validation_score += 10 if ((signal_type == "buy" and supertrend_dir == 1) or (signal_type == "sell" and supertrend_dir == -1)) else 0
-    validation_score += 10 if ((signal_type == "buy" and ha_trend_up) or (signal_type == "sell" and ha_trend_down)) else 0
-    validation_score += 10 if ((signal_type == "buy" and htf_bias == "bullish") or (signal_type == "sell" and htf_bias == "bearish")) else 0
-    validation_score += 10 if ((signal_type == "buy" and mtf_strict_bull_ok) or (signal_type == "sell" and mtf_strict_bear_ok)) else 0
-    validation_score += 5 if rr_ratio is not None and rr_ratio >= MIN_RR_REQUIRED else 0
-    validation_score += 5 if oi_bias != "Neutral" else 0
-    if not gap_info["allow_trade"]:
-        validation_score -= 10
-    if sideways:
-        validation_score -= 15
-    if not news_info["allow_trade"]:
-        validation_score -= 10
-    validation_score = max(0, min(100, validation_score))
-
-    strategy_grade = classify_strategy_grade(validation_score)
-    trade_quality_score = int((validation_score + confidence + min(95, backtest_win_rate)) / 3)
-    trade_quality_score = max(0, min(100, trade_quality_score))
+    confidence = min(100, max(40, int((max(bullish, bearish) / 15) * 100)))
 
     win_chance = calculate_win_chance(
-        bullish, bearish, adx, volume_spike, breakout, breakdown, htf_bias, sideways, rr_ratio, backtest_win_rate
+        bullish, bearish, adx, volume_spike, breakout, breakdown,
+        htf_bias, sideways, rr_ratio, backtest_win_rate
     )
 
-    no_trade_reason = None
-    if signal_type in ["buy", "sell"] and rr_ratio is not None and rr_ratio < MIN_RR_REQUIRED:
-        no_trade_reason = "Risk Reward below 1:2"
-    elif signal_type == "buy" and not buy_mandatory_ok:
-        no_trade_reason = "BUY mandatory confirmations failed"
-        signal_text = "NO TRADE"
-        signal_type = "neutral"
-    elif signal_type == "sell" and not sell_mandatory_ok:
-        no_trade_reason = "SELL mandatory confirmations failed"
-        signal_text = "NO TRADE"
-        signal_type = "neutral"
-    elif validation_score < MIN_VALIDATION_SCORE_FOR_ALERT and signal_type in ["buy", "sell"]:
-        no_trade_reason = "Validation score below threshold"
-        signal_text = "NO TRADE"
-        signal_type = "neutral"
-    elif signal_type == "buy" and distance_to_resistance < NO_TRADE_NEAR_SR_PCT:
-        no_trade_reason = "No trade zone near resistance"
-        signal_text = "NO TRADE"
-        signal_type = "neutral"
-    elif signal_type == "sell" and distance_to_support < NO_TRADE_NEAR_SR_PCT:
-        no_trade_reason = "No trade zone near support"
-        signal_text = "NO TRADE"
-        signal_type = "neutral"
-
-    if no_trade_reason:
-        reasons.append(no_trade_reason)
+    if bear_maru:
+        win_chance = max(5, win_chance - 10)
+    if bull_maru:
+        win_chance = min(95, win_chance + 10)
 
     return {
         "close_price": close_price,
         "ema20": ema20,
         "ema50": ema50,
-        "ema200": ema200,
         "vwap": vwap,
         "rsi": rsi,
         "macd": macd,
@@ -1777,897 +1266,594 @@ def analyze_signal(
         "partial_exit": partial_exit,
         "target1": target1,
         "target2": target2,
-        "target3": target3,
         "trailing_stop": trailing_stop,
         "rr_ratio": rr_ratio,
         "reasons": reasons,
         "bullish_score": bullish,
         "bearish_score": bearish,
-        "session_message": session_info["message"],
-        "supertrend_direction": supertrend_dir,
-        "ha_bullish": ha_bullish,
-        "ha_bearish": ha_bearish,
-        "ha_trend_up": ha_trend_up,
-        "ha_trend_down": ha_trend_down,
-        "validation_score": validation_score,
-        "strategy_grade": strategy_grade,
-        "trade_quality_score": trade_quality_score,
-        "market_regime": regime["regime"],
-        "trending_market": regime["trending"],
-        "sideways_market": regime["sideways"],
-        "high_volatility_market": regime["high_volatility"],
-        "atr_pct": regime["atr_pct"],
-        "gap_up": gap_info["gap_up"],
-        "gap_down": gap_info["gap_down"],
-        "gap_pct": gap_info["gap_pct"],
-        "mtf_bull_ok": mtf_strict_bull_ok,
-        "mtf_bear_ok": mtf_strict_bear_ok,
-        "no_trade_zone": (
-            (signal_type == "buy" and distance_to_resistance < NO_TRADE_NEAR_SR_PCT) or
-            (signal_type == "sell" and distance_to_support < NO_TRADE_NEAR_SR_PCT)
-        ),
-        "oi_bias": oi_bias,
-        "pcr": pcr,
-        "long_unwinding": long_unwinding,
-        "short_covering": short_covering,
-        "news_message": news_info.get("message", "")
+        "session_message": session_info["message"]
     }
 
 
-# =========================================================
-# SIGNAL AUDIT / DUPLICATE / EXPIRY
-# =========================================================
-def add_signal_audit(symbol, timeframe, analysis):
-    try:
-        audit = load_signal_audit()
-        expiry_time = datetime.now() + timedelta(minutes=SIGNAL_EXPIRY_MINUTES)
-        row = {
-            "DateTime": now_str(),
-            "Symbol": symbol,
-            "Timeframe": timeframe,
-            "Signal": analysis["signal_text"],
-            "SignalType": analysis["signal_type"],
-            "Price": round(float(analysis["close_price"]), 2),
-            "ValidationScore": analysis.get("validation_score", 0),
-            "TradeQualityScore": analysis.get("trade_quality_score", 0),
-            "StrategyGrade": analysis.get("strategy_grade", "D"),
-            "Confidence": analysis.get("confidence", 0),
-            "WinChance": analysis.get("win_chance", 0),
-            "ReasonCount": len(analysis.get("reasons", [])),
-            "ExpiryTime": expiry_time.strftime("%d-%m-%Y %H:%M:%S")
-        }
-        audit = pd.concat([audit, pd.DataFrame([row])], ignore_index=True)
-        save_signal_audit(audit)
-    except Exception as e:
-        log_app_error("add_signal_audit", e)
-
-
-def is_duplicate_signal(symbol, timeframe, analysis):
-    try:
-        audit = load_signal_audit()
-        if audit.empty:
-            return False
-        audit["DateTimeParsed"] = pd.to_datetime(audit["DateTime"], format="%d-%m-%Y %H:%M:%S", errors="coerce")
-        cutoff = datetime.now() - timedelta(minutes=MAX_SIGNAL_DUPLICATE_WINDOW_MIN)
-        recent = audit[
-            (audit["DateTimeParsed"] >= cutoff) &
-            (audit["Symbol"] == symbol) &
-            (audit["Timeframe"] == timeframe) &
-            (audit["Signal"] == analysis["signal_text"])
-        ]
-        return not recent.empty
-    except Exception as e:
-        log_app_error("is_duplicate_signal", e)
-        return False
-
-
-def get_signal_expiry_remaining(symbol, timeframe, signal_text):
-    try:
-        audit = load_signal_audit()
-        if audit.empty:
-            return None
-        rows = audit[
-            (audit["Symbol"] == symbol) &
-            (audit["Timeframe"] == timeframe) &
-            (audit["Signal"] == signal_text)
-        ].copy()
-        if rows.empty:
-            return None
-        rows["ExpiryParsed"] = pd.to_datetime(rows["ExpiryTime"], format="%d-%m-%Y %H:%M:%S", errors="coerce")
-        expiry = rows["ExpiryParsed"].max()
-        if pd.isna(expiry):
-            return None
-        diff = expiry - datetime.now()
-        return max(0, int(diff.total_seconds()))
-    except Exception as e:
-        log_app_error("get_signal_expiry_remaining", e)
-        return None
-
-
-# =========================================================
-# RISK / PAPER TRADING
-# =========================================================
-def get_today_closed_trades():
-    journal = load_journal()
-    if journal.empty:
-        return pd.DataFrame()
-    closed = journal[journal["Status"] == "CLOSED"].copy()
-    if closed.empty:
-        return closed
-    closed["DateOnly"] = pd.to_datetime(closed["DateTime"], format="%d-%m-%Y %H:%M:%S", errors="coerce").dt.date
-    today = datetime.now().date()
-    return closed[closed["DateOnly"] == today].copy()
-
-
-def get_week_closed_trades():
-    journal = load_journal()
-    if journal.empty:
-        return pd.DataFrame()
-    closed = journal[journal["Status"] == "CLOSED"].copy()
-    if closed.empty:
-        return closed
-    closed["DateOnly"] = pd.to_datetime(closed["DateTime"], format="%d-%m-%Y %H:%M:%S", errors="coerce")
-    start_week = datetime.now() - timedelta(days=datetime.now().weekday())
-    start_week = datetime(start_week.year, start_week.month, start_week.day)
-    return closed[closed["DateOnly"] >= start_week].copy()
-
-
-def get_month_closed_trades():
-    journal = load_journal()
-    if journal.empty:
-        return pd.DataFrame()
-    closed = journal[journal["Status"] == "CLOSED"].copy()
-    if closed.empty:
-        return closed
-    closed["DateOnly"] = pd.to_datetime(closed["DateTime"], format="%d-%m-%Y %H:%M:%S", errors="coerce")
-    start_month = datetime(datetime.now().year, datetime.now().month, 1)
-    return closed[closed["DateOnly"] >= start_month].copy()
-
-
-def update_risk_locks():
-    try:
-        daily_trades = get_today_closed_trades()
-        weekly_trades = get_week_closed_trades()
-        monthly_trades = get_month_closed_trades()
-
-        risk_state = load_risk_state()
-        weekly = load_weekly_risk()
-        monthly = load_monthly_risk()
-        paper = load_paper_state()
-
-        daily_pnl = pd.to_numeric(daily_trades.get("PnL", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()
-        weekly_pnl = pd.to_numeric(weekly_trades.get("PnL", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()
-        monthly_pnl = pd.to_numeric(monthly_trades.get("PnL", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()
-
-        daily_limit = float(risk_state.loc[0, "DailyLossLimit"])
-        weekly_limit = float(weekly.loc[0, "WeeklyLossLimit"])
-        monthly_limit = float(monthly.loc[0, "MonthlyLossLimit"])
-        capital_protection_pct = float(risk_state.loc[0, "CapitalProtectionPct"])
-
-        balance = float(paper.loc[0, "Balance"])
-        initial_balance = float(paper.loc[0, "InitialBalance"])
-        capital_floor = initial_balance * (1 - capital_protection_pct / 100)
-
-        risk_state.loc[0, "DailyLock"] = bool(daily_pnl <= -abs(daily_limit) or balance <= capital_floor)
-        weekly.loc[0, "WeeklyPnL"] = weekly_pnl
-        weekly.loc[0, "WeeklyLock"] = bool(weekly_pnl <= -abs(weekly_limit))
-        monthly.loc[0, "MonthlyPnL"] = monthly_pnl
-        monthly.loc[0, "MonthlyLock"] = bool(monthly_pnl <= -abs(monthly_limit))
-
-        save_risk_state(risk_state)
-        save_weekly_risk(weekly)
-        save_monthly_risk(monthly)
-    except Exception as e:
-        log_app_error("update_risk_locks", e)
-
-
-def risk_check_before_trade():
-    update_risk_locks()
-    risk_state = load_risk_state()
-    weekly_risk = load_weekly_risk()
-    monthly_risk = load_monthly_risk()
-    journal_today = get_today_closed_trades()
-
-    trading_enabled = bool(risk_state.loc[0, "TradingEnabled"])
-    daily_lock = bool(risk_state.loc[0, "DailyLock"])
-    weekly_lock = bool(weekly_risk.loc[0, "WeeklyLock"])
-    monthly_lock = bool(monthly_risk.loc[0, "MonthlyLock"])
-    max_trades_per_day = int(risk_state.loc[0, "MaxTradesPerDay"])
-    trades_today = len(journal_today)
-
-    if not trading_enabled:
-        return False, "Trading disabled by risk management"
-    if daily_lock:
-        return False, "Daily lock active"
-    if weekly_lock:
-        return False, "Weekly lock active"
-    if monthly_lock:
-        return False, "Monthly lock active"
-    if trades_today >= max_trades_per_day:
-        return False, f"Max trades per day reached ({max_trades_per_day})"
-    return True, "Risk checks passed"
-
-
-def calculate_position_size(entry_price, stop_loss, paper_balance):
-    risk_state = load_risk_state()
-    risk_pct = float(risk_state.loc[0, "RiskPerTradePct"])
-    if entry_price is None or stop_loss is None:
-        return 1
-    risk_amount = paper_balance * (risk_pct / 100.0)
-    per_unit_risk = abs(float(entry_price) - float(stop_loss))
-    if per_unit_risk <= 0:
-        return 1
-    qty = int(risk_amount // per_unit_risk)
-    return max(1, qty)
-
-
-def paper_trade_entry(price, quantity):
-    state = load_paper_state()
-    bal = float(state.loc[0, "Balance"])
-    used = float(state.loc[0, "UsedMargin"])
-    cost = price * quantity
-    if bal >= cost:
-        state.loc[0, "Balance"] = bal - cost
-        state.loc[0, "UsedMargin"] = used + cost
-        state.loc[0, "OpenPositions"] = int(state.loc[0, "OpenPositions"]) + 1
-        save_paper_state(state)
-        return True
-    return False
-
-
-def paper_trade_exit(entry_price, exit_price, quantity, signal):
-    state = load_paper_state()
-    bal = float(state.loc[0, "Balance"])
-    used = float(state.loc[0, "UsedMargin"])
-    invested = entry_price * quantity
-
-    if "BUY" in signal.upper() or "CALL" in signal.upper():
-        pnl = (exit_price - entry_price) * quantity
-    else:
-        pnl = (entry_price - exit_price) * quantity
-
-    state.loc[0, "Balance"] = bal + invested + pnl
-    state.loc[0, "UsedMargin"] = max(0.0, used - invested)
-    state.loc[0, "OpenPositions"] = max(0, int(state.loc[0, "OpenPositions"]) - 1)
-    save_paper_state(state)
-    return pnl
-
-
-def add_trade_to_journal(symbol, timeframe, signal, entry_price, quantity, stop_loss, target1, target2, target3, trailing_stop, analysis, notes=""):
-    journal = load_journal()
-    new_row = {
-        "DateTime": now_str(),
-        "Symbol": symbol,
-        "Timeframe": timeframe,
-        "Signal": signal,
-        "EntryPrice": entry_price,
-        "ExitPrice": np.nan,
-        "Quantity": quantity,
-        "StopLoss": stop_loss,
-        "Target1": target1,
-        "Target2": target2,
-        "Target3": target3,
-        "TrailingStop": trailing_stop,
-        "Status": "OPEN",
-        "PnL": np.nan,
-        "PnLPercent": np.nan,
-        "Notes": notes,
-        "Result": "",
-        "T1_Hit": False,
-        "T2_Hit": False,
-        "T3_Hit": False,
-        "TradeQualityScore": analysis.get("trade_quality_score", 0),
-        "ValidationScore": analysis.get("validation_score", 0),
-        "StrategyGrade": analysis.get("strategy_grade", "D")
-    }
-    journal = pd.concat([journal, pd.DataFrame([new_row])], ignore_index=True)
-    save_journal(journal)
-
-
-def close_trade_in_journal(index_id, exit_price, result=None, t1_hit=None, t2_hit=None, t3_hit=None):
-    journal = load_journal()
-    if index_id in journal.index:
-        row = journal.loc[index_id]
-        entry = float(row["EntryPrice"])
-        qty = float(row["Quantity"])
-        signal = str(row["Signal"]).upper()
-
-        if "BUY" in signal or "CALL" in signal:
-            pnl = (exit_price - entry) * qty
-            pnl_pct = ((exit_price - entry) / entry) * 100 if entry else 0
-        else:
-            pnl = (entry - exit_price) * qty
-            pnl_pct = ((entry - exit_price) / entry) * 100 if entry else 0
-
-        journal.at[index_id, "ExitPrice"] = exit_price
-        journal.at[index_id, "Status"] = "CLOSED"
-        journal.at[index_id, "PnL"] = round(pnl, 2)
-        journal.at[index_id, "PnLPercent"] = round(pnl_pct, 2)
-        journal.at[index_id, "Result"] = result if result else ("WIN" if pnl > 0 else "LOSS")
-        if t1_hit is not None:
-            journal.at[index_id, "T1_Hit"] = bool(t1_hit)
-        if t2_hit is not None:
-            journal.at[index_id, "T2_Hit"] = bool(t2_hit)
-        if t3_hit is not None:
-            journal.at[index_id, "T3_Hit"] = bool(t3_hit)
-        save_journal(journal)
-
-
-def auto_paper_trade_exit(current_price):
-    try:
-        journal = load_journal()
-        if journal.empty:
-            return 0
-
-        open_trades = journal[journal["Status"] == "OPEN"].copy()
-        if open_trades.empty:
-            return 0
-
-        closed_count = 0
-        for idx, row in open_trades.iterrows():
-            signal = str(row["Signal"]).upper()
-            entry = float(row["EntryPrice"])
-            sl = float(row["StopLoss"]) if pd.notna(row["StopLoss"]) else None
-            t1 = float(row["Target1"]) if pd.notna(row["Target1"]) else None
-            t2 = float(row["Target2"]) if pd.notna(row["Target2"]) else None
-            t3 = float(row["Target3"]) if pd.notna(row["Target3"]) else None
-            qty = float(row["Quantity"])
-
-            t1_hit = False
-            t2_hit = False
-            t3_hit = False
-            exit_price = None
-            result = None
-
-            if "BUY" in signal:
-                if t1 is not None and current_price >= t1:
-                    t1_hit = True
-                if t2 is not None and current_price >= t2:
-                    t2_hit = True
-                if t3 is not None and current_price >= t3:
-                    t3_hit = True
-
-                if sl is not None and current_price <= sl:
-                    exit_price = sl
-                    result = "LOSS"
-                elif t3 is not None and current_price >= t3:
-                    exit_price = t3
-                    result = "WIN"
-                elif t2 is not None and current_price >= t2:
-                    exit_price = t2
-                    result = "WIN"
-                elif t1 is not None and current_price >= t1:
-                    exit_price = t1
-                    result = "WIN"
-
-            else:
-                if t1 is not None and current_price <= t1:
-                    t1_hit = True
-                if t2 is not None and current_price <= t2:
-                    t2_hit = True
-                if t3 is not None and current_price <= t3:
-                    t3_hit = True
-
-                if sl is not None and current_price >= sl:
-                    exit_price = sl
-                    result = "LOSS"
-                elif t3 is not None and current_price <= t3:
-                    exit_price = t3
-                    result = "WIN"
-                elif t2 is not None and current_price <= t2:
-                    exit_price = t2
-                    result = "WIN"
-                elif t1 is not None and current_price <= t1:
-                    exit_price = t1
-                    result = "WIN"
-
-            if exit_price is not None:
-                pnl = paper_trade_exit(entry, exit_price, qty, signal)
-                close_trade_in_journal(idx, exit_price, result=result, t1_hit=t1_hit, t2_hit=t2_hit, t3_hit=t3_hit)
-                closed_count += 1
-
-        return closed_count
-    except Exception as e:
-        log_app_error("auto_paper_trade_exit", e)
-        return 0
-
-
-# =========================================================
-# BACKTEST / WALK FORWARD / SHARPE
-# =========================================================
-def compute_equity_curve_from_trades(trades_df, initial_capital=100000):
-    if trades_df.empty or "PnL" not in trades_df.columns:
-        return pd.DataFrame(columns=["TradeNo", "Equity", "DrawdownPct", "ReturnPct"]), 0.0
-
-    pnl_series = pd.to_numeric(trades_df["PnL"], errors="coerce").fillna(0)
-    equity = initial_capital + pnl_series.cumsum()
-    peak = equity.cummax()
-    drawdown_pct = ((peak - equity) / peak.replace(0, np.nan)) * 100
-
-    prev_equity = equity.shift(1).fillna(initial_capital)
-    return_pct = np.where(prev_equity != 0, ((equity - prev_equity) / prev_equity) * 100, 0)
-
-    curve = pd.DataFrame({
-        "TradeNo": range(1, len(pnl_series) + 1),
-        "Equity": equity.values,
-        "DrawdownPct": pd.Series(drawdown_pct).fillna(0).values,
-        "ReturnPct": pd.Series(return_pct).fillna(0).values
-    })
-    max_dd = float(curve["DrawdownPct"].max()) if not curve.empty else 0.0
-    return curve, round(max_dd, 2)
-
-
-def compute_streaks(results):
-    max_win_streak = 0
-    max_loss_streak = 0
-    current_win = 0
-    current_loss = 0
-
-    for r in results:
-        if r == "WIN":
-            current_win += 1
-            current_loss = 0
-        elif r == "LOSS":
-            current_loss += 1
-            current_win = 0
-        else:
-            current_win = 0
-            current_loss = 0
-        max_win_streak = max(max_win_streak, current_win)
-        max_loss_streak = max(max_loss_streak, current_loss)
-
-    return max_win_streak, max_loss_streak
-
-
-def compute_trade_statistics(trades_df, initial_capital=100000):
-    if trades_df.empty:
-        return {
-            "profit_factor": 0.0,
-            "avg_win": 0.0,
-            "avg_loss": 0.0,
-            "expectancy": 0.0,
-            "winning_streak": 0,
-            "losing_streak": 0,
-            "t1_hit_rate": 0.0,
-            "t2_hit_rate": 0.0,
-            "t3_hit_rate": 0.0,
-            "profitability_score": 0,
-            "sharpe_ratio": 0.0
-        }
-
-    pnl = pd.to_numeric(trades_df["PnL"], errors="coerce").fillna(0)
-    gross_profit = pnl[pnl > 0].sum()
-    gross_loss = abs(pnl[pnl < 0].sum())
-    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (999.0 if gross_profit > 0 else 0.0)
-
-    wins = pnl[pnl > 0]
-    losses = pnl[pnl < 0]
-    avg_win = wins.mean() if not wins.empty else 0.0
-    avg_loss = abs(losses.mean()) if not losses.empty else 0.0
-
-    win_rate = (len(wins) / len(pnl)) * 100 if len(pnl) else 0.0
-    expectancy = ((win_rate / 100) * avg_win) - (((100 - win_rate) / 100) * avg_loss)
-
-    results = trades_df["Result"].astype(str).tolist() if "Result" in trades_df.columns else []
-    winning_streak, losing_streak = compute_streaks(results)
-
-    t1_hit_rate = float((trades_df.get("T1_Hit", pd.Series(dtype=bool)) == True).mean() * 100) if "T1_Hit" in trades_df.columns else 0.0
-    t2_hit_rate = float((trades_df.get("T2_Hit", pd.Series(dtype=bool)) == True).mean() * 100) if "T2_Hit" in trades_df.columns else 0.0
-    t3_hit_rate = float((trades_df.get("T3_Hit", pd.Series(dtype=bool)) == True).mean() * 100) if "T3_Hit" in trades_df.columns else 0.0
-
-    equity_curve_df, _ = compute_equity_curve_from_trades(trades_df, initial_capital=initial_capital)
-    sharpe_ratio = 0.0
-    if not equity_curve_df.empty and "ReturnPct" in equity_curve_df.columns:
-        returns = pd.to_numeric(equity_curve_df["ReturnPct"], errors="coerce").fillna(0)
-        if returns.std() and returns.std() > 0:
-            sharpe_ratio = float((returns.mean() / returns.std()) * np.sqrt(len(returns)))
-
-    profitability_score = 50
-    if profit_factor >= 2:
-        profitability_score += 20
-    elif profit_factor >= 1.5:
-        profitability_score += 10
-    elif profit_factor < 1.2:
-        profitability_score -= 10
-    if expectancy > 0:
-        profitability_score += 15
-    if win_rate >= 55:
-        profitability_score += 10
-    if avg_win > avg_loss:
-        profitability_score += 10
-
-    profitability_score = max(0, min(100, profitability_score))
-
-    return {
-        "profit_factor": round(profit_factor, 2) if profit_factor != 999.0 else 999.0,
-        "avg_win": round(float(avg_win), 2),
-        "avg_loss": round(float(avg_loss), 2),
-        "expectancy": round(float(expectancy), 2),
-        "winning_streak": int(winning_streak),
-        "losing_streak": int(losing_streak),
-        "t1_hit_rate": round(t1_hit_rate, 2),
-        "t2_hit_rate": round(t2_hit_rate, 2),
-        "t3_hit_rate": round(t3_hit_rate, 2),
-        "profitability_score": int(profitability_score),
-        "sharpe_ratio": round(sharpe_ratio, 2)
-    }
-
-
-def simple_backtest(df, symbol="", timeframe_label="", option_metrics=None, news_info=None):
+def simple_backtest(df, symbol=""):
     trades = []
+
     df = df.copy()
     required_cols = [
-        "Open", "High", "Low", "Close", "EMA20", "EMA50", "EMA200", "VWAP", "RSI",
-        "MACD", "SignalLine", "ATR", "ADX", "SuperTrendDirection", "Volume_Spike"
+        "Open", "High", "Low", "Close",
+        "EMA20", "EMA50", "VWAP", "RSI",
+        "MACD", "SignalLine", "ATR"
     ]
+
     for col in required_cols:
         if col not in df.columns:
-            return 0, 0, 0, 0.0, pd.DataFrame()
+            empty_df = pd.DataFrame(columns=[
+                "Date", "Time", "Symbol", "Signal", "Entry",
+                "SL", "Target", "Exit", "Result", "PnL"
+            ])
+            return 0, 0, 0, 0.0, empty_df
 
     df.index = pd.to_datetime(df.index, errors="coerce")
     df = df[~df.index.isna()].copy()
     df = df.replace([np.inf, -np.inf], np.nan)
-    df = df.dropna(subset=["Open", "High", "Low", "Close", "EMA20", "EMA50", "EMA200", "RSI", "MACD", "SignalLine", "ATR", "ADX"]).copy()
+    df = df.dropna(subset=["Open", "High", "Low", "Close", "EMA20", "EMA50", "RSI", "MACD", "SignalLine", "ATR"]).copy()
 
-    if len(df) < 50:
-        return 0, 0, 0, 0.0, pd.DataFrame()
+    if len(df) < 30:
+        empty_df = pd.DataFrame(columns=[
+            "Date", "Time", "Symbol", "Signal", "Entry",
+            "SL", "Target", "Exit", "Result", "PnL"
+        ])
+        return 0, 0, 0, 0.0, empty_df
 
-    for i in range(30, len(df) - 10):
-        mini_df = df.iloc[:i + 1].copy()
-        latest = mini_df.iloc[-1]
-        ts = mini_df.index[-1]
-        htf_bias = "bullish" if latest["EMA20"] > latest["EMA50"] else "bearish"
+    for i in range(20, len(df) - 1):
+        latest = df.iloc[i]
+        ts = df.index[i]
 
-        analysis = analyze_signal(
-            mini_df,
-            htf_bias=htf_bias,
-            timeframe_label=timeframe_label if timeframe_label else "1d",
-            backtest_win_rate=50,
-            mtf_bull_count=4 if htf_bias == "bullish" else 0,
-            mtf_bear_count=4 if htf_bias == "bearish" else 0,
-            option_metrics=option_metrics,
-            news_info=news_info
+        vwap_value = latest["VWAP"] if pd.notna(latest["VWAP"]) else latest["Close"]
+
+        buy_signal = (
+            latest["EMA20"] > latest["EMA50"] and
+            latest["Close"] >= vwap_value and
+            latest["RSI"] > 52 and
+            latest["MACD"] > latest["SignalLine"]
         )
 
-        if analysis["signal_text"] not in ["STRONG BUY", "STRONG SELL"]:
+        sell_signal = (
+            latest["EMA20"] < latest["EMA50"] and
+            latest["Close"] <= vwap_value and
+            latest["RSI"] < 48 and
+            latest["MACD"] < latest["SignalLine"]
+        )
+
+        atr = latest["ATR"]
+        if pd.isna(atr) or atr <= 0:
             continue
 
         entry = float(latest["Close"])
-        sl = analysis["stop_loss"]
-        t1 = analysis["target1"]
-        t2 = analysis["target2"]
-        t3 = analysis["target3"]
-
-        if sl is None or t1 is None:
-            continue
-
         future = df.iloc[i + 1:i + 11]
+
         if future.empty:
             continue
 
-        signal = "BUY" if analysis["signal_type"] == "buy" else "SELL"
-        exit_price = None
-        result = None
-        t1_hit = False
-        t2_hit = False
-        t3_hit = False
+        if buy_signal:
+            signal = "BUY"
+            sl = float(entry - atr)
+            target = float(entry + atr)
+            exit_price = None
+            result = None
 
-        for _, row in future.iterrows():
-            if signal == "BUY":
+            for _, row in future.iterrows():
                 if row["Low"] <= sl:
                     exit_price = sl
                     result = "LOSS"
                     break
-                if row["High"] >= t1:
-                    t1_hit = True
-                if row["High"] >= t2:
-                    t2_hit = True
-                if row["High"] >= t3:
-                    t3_hit = True
-                if row["High"] >= t3:
-                    exit_price = t3
+                if row["High"] >= target:
+                    exit_price = target
                     result = "WIN"
                     break
-                elif row["High"] >= t2:
-                    exit_price = t2
-                    result = "WIN"
-                    break
-                elif row["High"] >= t1:
-                    exit_price = t1
-                    result = "WIN"
-                    break
-            else:
+
+            if exit_price is None:
+                exit_price = float(future.iloc[-1]["Close"])
+                result = "WIN" if exit_price > entry else "LOSS"
+
+            pnl = round(exit_price - entry, 2)
+
+            trades.append({
+                "Date": pd.to_datetime(ts).strftime("%d-%m-%Y"),
+                "Time": pd.to_datetime(ts).strftime("%H:%M:%S"),
+                "Symbol": symbol,
+                "Signal": signal,
+                "Entry": round(entry, 2),
+                "SL": round(sl, 2),
+                "Target": round(target, 2),
+                "Exit": round(exit_price, 2),
+                "Result": result,
+                "PnL": pnl
+            })
+
+        elif sell_signal:
+            signal = "SELL"
+            sl = float(entry + atr)
+            target = float(entry - atr)
+            exit_price = None
+            result = None
+
+            for _, row in future.iterrows():
                 if row["High"] >= sl:
                     exit_price = sl
                     result = "LOSS"
                     break
-                if row["Low"] <= t1:
-                    t1_hit = True
-                if row["Low"] <= t2:
-                    t2_hit = True
-                if row["Low"] <= t3:
-                    t3_hit = True
-                if row["Low"] <= t3:
-                    exit_price = t3
-                    result = "WIN"
-                    break
-                elif row["Low"] <= t2:
-                    exit_price = t2
-                    result = "WIN"
-                    break
-                elif row["Low"] <= t1:
-                    exit_price = t1
+                if row["Low"] <= target:
+                    exit_price = target
                     result = "WIN"
                     break
 
-        if exit_price is None:
-            exit_price = float(future.iloc[-1]["Close"])
-            if signal == "BUY":
-                result = "WIN" if exit_price > entry else "LOSS"
-            else:
+            if exit_price is None:
+                exit_price = float(future.iloc[-1]["Close"])
                 result = "WIN" if exit_price < entry else "LOSS"
 
-        pnl = round((exit_price - entry), 2) if signal == "BUY" else round((entry - exit_price), 2)
+            pnl = round(entry - exit_price, 2)
 
-        trades.append({
-            "Date": pd.to_datetime(ts).strftime("%d-%m-%Y"),
-            "Time": pd.to_datetime(ts).strftime("%H:%M:%S"),
-            "Symbol": symbol,
-            "Timeframe": timeframe_label,
-            "Signal": signal,
-            "Entry": round(entry, 2),
-            "SL": round(sl, 2),
-            "T1": round(t1, 2),
-            "T2": round(t2, 2) if t2 is not None else np.nan,
-            "T3": round(t3, 2) if t3 is not None else np.nan,
-            "Exit": round(exit_price, 2),
-            "Result": result,
-            "PnL": pnl,
-            "T1_Hit": t1_hit,
-            "T2_Hit": t2_hit,
-            "T3_Hit": t3_hit
-        })
+            trades.append({
+                "Date": pd.to_datetime(ts).strftime("%d-%m-%Y"),
+                "Time": pd.to_datetime(ts).strftime("%H:%M:%S"),
+                "Symbol": symbol,
+                "Signal": signal,
+                "Entry": round(entry, 2),
+                "SL": round(sl, 2),
+                "Target": round(target, 2),
+                "Exit": round(exit_price, 2),
+                "Result": result,
+                "PnL": pnl
+            })
 
-    trades_df = pd.DataFrame(trades)
+    trades_df = pd.DataFrame(trades, columns=[
+        "Date", "Time", "Symbol", "Signal", "Entry",
+        "SL", "Target", "Exit", "Result", "PnL"
+    ])
+
     total = len(trades_df)
-    wins = len(trades_df[trades_df["Result"] == "WIN"]) if total else 0
-    losses = len(trades_df[trades_df["Result"] == "LOSS"]) if total else 0
+    wins = len(trades_df[trades_df["Result"] == "WIN"])
+    losses = len(trades_df[trades_df["Result"] == "LOSS"])
     win_rate = (wins / total * 100) if total else 0.0
+
     return wins, losses, total, round(win_rate, 2), trades_df
 
 
-def walk_forward_validation(df, symbol="", timeframe_label="", option_metrics=None, news_info=None):
+# ----------------------------
+# ANGEL ONE
+# ----------------------------
+def map_angel_interval(timeframe):
+    mapping = {
+        "1m": "ONE_MINUTE",
+        "3m": "ONE_MINUTE",
+        "5m": "FIVE_MINUTE",
+        "10m": "FIVE_MINUTE",
+        "15m": "FIFTEEN_MINUTE",
+        "30m": "THIRTY_MINUTE",
+        "1h": "ONE_HOUR",
+        "1d": "ONE_DAY"
+    }
+    return mapping.get(timeframe, "FIVE_MINUTE")
+
+
+def angel_login(api_key, client_code, pin, totp_secret, force_refresh=False):
     try:
-        if df.empty or len(df) < 150:
-            return {"folds": 0, "avg_win_rate": 0.0, "avg_profit_factor": 0.0, "avg_expectancy": 0.0, "table": pd.DataFrame()}
+        cache_key = f"{client_code}_{api_key}"
 
-        fold_results = []
-        total_len = len(df)
-        train_size = int(total_len * 0.6)
-        test_size = int(total_len * 0.2)
+        if (
+            not force_refresh
+            and "angel_api" in st.session_state
+            and "angel_session" in st.session_state
+            and st.session_state.get("angel_cache_key") == cache_key
+        ):
+            return st.session_state["angel_api"], st.session_state["angel_session"]
 
-        start = 0
-        fold_no = 1
-        while (start + train_size + test_size) <= total_len:
-            train_df = df.iloc[start:start + train_size].copy()
-            test_df = df.iloc[start + train_size:start + train_size + test_size].copy()
+        smart_api = SmartConnect(api_key=api_key)
+        totp = pyotp.TOTP(totp_secret).now()
+        session = smart_api.generateSession(client_code, pin, totp)
 
-            _, _, _, _, _ = simple_backtest(
-                train_df,
-                symbol=symbol,
-                timeframe_label=timeframe_label,
-                option_metrics=option_metrics,
-                news_info=news_info
-            )
+        if session and session.get("status"):
+            st.session_state["angel_api"] = smart_api
+            st.session_state["angel_session"] = session
+            st.session_state["angel_cache_key"] = cache_key
+            return smart_api, session
 
-            wins, losses, total, win_rate, trades_df = simple_backtest(
-                test_df,
-                symbol=symbol,
-                timeframe_label=timeframe_label,
-                option_metrics=option_metrics,
-                news_info=news_info
-            )
+        return None, None
 
-            stats = compute_trade_statistics(trades_df)
-            fold_results.append({
-                "Fold": fold_no,
-                "Trades": total,
-                "Wins": wins,
-                "Losses": losses,
-                "WinRate": win_rate,
-                "ProfitFactor": stats["profit_factor"],
-                "Expectancy": stats["expectancy"]
-            })
-
-            fold_no += 1
-            start += test_size
-
-        result_df = pd.DataFrame(fold_results)
-        if result_df.empty:
-            return {"folds": 0, "avg_win_rate": 0.0, "avg_profit_factor": 0.0, "avg_expectancy": 0.0, "table": pd.DataFrame()}
-
-        return {
-            "folds": len(result_df),
-            "avg_win_rate": round(result_df["WinRate"].mean(), 2),
-            "avg_profit_factor": round(result_df["ProfitFactor"].replace(999.0, 5.0).mean(), 2),
-            "avg_expectancy": round(result_df["Expectancy"].mean(), 2),
-            "table": result_df
-        }
     except Exception as e:
-        log_app_error("walk_forward_validation", e)
-        return {"folds": 0, "avg_win_rate": 0.0, "avg_profit_factor": 0.0, "avg_expectancy": 0.0, "table": pd.DataFrame()}
+        st.error(f"Angel Login Failed: {e}")
+        return None, None
 
 
-# =========================================================
-# REPORTS / ANALYTICS
-# =========================================================
-def update_daily_summary():
-    init_daily_summary()
-    journal = load_journal()
-    closed = journal[journal["Status"] == "CLOSED"].copy()
-    if closed.empty:
-        return
+def get_angel_profile(api_key, client_code, pin, totp_secret):
+    try:
+        angel, session = angel_login(api_key, client_code, pin, totp_secret)
+        if angel is None or session is None:
+            return None
 
-    closed["DateOnly"] = pd.to_datetime(closed["DateTime"], format="%d-%m-%Y %H:%M:%S", errors="coerce").dt.date
-    today = datetime.now().date()
-    day_df = closed[closed["DateOnly"] == today]
-    if day_df.empty:
-        return
+        refresh_token = session["data"].get("refreshToken")
+        if not refresh_token:
+            return None
 
-    total = len(day_df)
-    wins = (pd.to_numeric(day_df["PnL"], errors="coerce").fillna(0) > 0).sum()
-    losses = total - wins
-    pnl = pd.to_numeric(day_df["PnL"], errors="coerce").fillna(0).sum()
-    win_rate = (wins / total * 100) if total > 0 else 0
+        return angel.getProfile(refresh_token)
+    except Exception as e:
+        return {"status": False, "message": str(e)}
 
-    summary = safe_read_csv(DAILY_SUMMARY_FILE, pd.DataFrame(columns=["Date", "TotalTrades", "Wins", "Losses", "RealizedPnL", "WinRate"]))
-    summary = summary[summary["Date"] != str(today)]
-    new_row = {
-        "Date": str(today),
-        "TotalTrades": total,
-        "Wins": wins,
-        "Losses": losses,
-        "RealizedPnL": round(pnl, 2),
-        "WinRate": round(win_rate, 2)
+
+def get_angel_candles(api_key, client_code, pin, totp_secret, symbol_name, interval="FIVE_MINUTE"):
+    try:
+        angel, session = angel_login(api_key, client_code, pin, totp_secret)
+        if angel is None or not session or not session.get("data"):
+            return None
+
+        symbol_token = ANGEL_TOKENS.get(symbol_name)
+        if not symbol_token:
+            return {"status": False, "message": f"Missing Angel token for {symbol_name}"}
+
+        ist = timezone(timedelta(hours=5, minutes=30))
+        to_date = datetime.now(ist)
+        from_date = to_date - timedelta(days=7)
+
+        params = {
+            "exchange": "NSE",
+            "symboltoken": symbol_token,
+            "interval": interval,
+            "fromdate": from_date.strftime("%Y-%m-%d %H:%M"),
+            "todate": to_date.strftime("%Y-%m-%d %H:%M")
+        }
+
+        candles = angel.getCandleData(params)
+        return candles
+
+    except Exception as e:
+        return {"status": False, "message": str(e)}
+
+
+def candles_to_df(candles):
+    if not isinstance(candles, dict) or not candles.get("data"):
+        return pd.DataFrame()
+
+    df = pd.DataFrame(
+        candles["data"],
+        columns=["Datetime", "Open", "High", "Low", "Close", "Volume"]
+    )
+
+    df["Datetime"] = pd.to_datetime(df["Datetime"], errors="coerce")
+    df = df.dropna(subset=["Datetime"]).set_index("Datetime")
+
+    for col in ["Open", "High", "Low", "Close", "Volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df = df.dropna(subset=["Open", "High", "Low", "Close"])
+    df["Volume"] = df["Volume"].fillna(0)
+    return df
+
+
+# ----------------------------
+# ANGEL WEBSOCKET
+# ----------------------------
+def init_ws_state():
+    defaults = {
+        "ws_running": False,
+        "ws_connected": False,
+        "ws_error": "",
+        "ws_last_tick": None,
+        "ws_thread_started": False,
+        "live_price": None,
+        "ws_retries": 0,
+        "ws_should_run": False
     }
-    summary = pd.concat([summary, pd.DataFrame([new_row])], ignore_index=True)
-    safe_write_csv(summary, DAILY_SUMMARY_FILE)
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
 
 
-def update_weekly_summary():
-    init_weekly_summary()
-    journal = load_journal()
-    closed = journal[journal["Status"] == "CLOSED"].copy()
-    if closed.empty:
+def start_angel_websocket(api_key, client_code, pin, totp_secret, symbol_name):
+    init_ws_state()
+
+    if not SMART_WS_AVAILABLE:
+        st.session_state["ws_error"] = "SmartWebSocketV2 not available in installed SmartApi package."
         return
 
-    closed["DT"] = pd.to_datetime(closed["DateTime"], format="%d-%m-%Y %H:%M:%S", errors="coerce")
-    current_week = datetime.now().strftime("%Y-W%U")
-    start_week = datetime.now() - timedelta(days=datetime.now().weekday())
-    start_week = datetime(start_week.year, start_week.month, start_week.day)
-    week_df = closed[closed["DT"] >= start_week]
-    if week_df.empty:
+    if st.session_state.get("ws_thread_started"):
         return
 
-    total = len(week_df)
-    wins = (pd.to_numeric(week_df["PnL"], errors="coerce").fillna(0) > 0).sum()
-    losses = total - wins
-    pnl = pd.to_numeric(week_df["PnL"], errors="coerce").fillna(0).sum()
-    win_rate = (wins / total * 100) if total else 0
-
-    summary = safe_read_csv(WEEKLY_SUMMARY_FILE, pd.DataFrame(columns=["WeekKey", "TotalTrades", "Wins", "Losses", "RealizedPnL", "WinRate"]))
-    summary = summary[summary["WeekKey"] != current_week]
-    new_row = {
-        "WeekKey": current_week,
-        "TotalTrades": total,
-        "Wins": wins,
-        "Losses": losses,
-        "RealizedPnL": round(pnl, 2),
-        "WinRate": round(win_rate, 2)
-    }
-    summary = pd.concat([summary, pd.DataFrame([new_row])], ignore_index=True)
-    safe_write_csv(summary, WEEKLY_SUMMARY_FILE)
-
-
-def update_monthly_summary():
-    init_monthly_summary()
-    journal = load_journal()
-    closed = journal[journal["Status"] == "CLOSED"].copy()
-    if closed.empty:
+    symbol_token = ANGEL_TOKENS.get(symbol_name)
+    if not symbol_token:
+        st.session_state["ws_error"] = f"Missing token for {symbol_name}"
         return
 
-    closed["DT"] = pd.to_datetime(closed["DateTime"], format="%d-%m-%Y %H:%M:%S", errors="coerce")
-    current_month = datetime.now().strftime("%Y-%m")
-    start_month = datetime(datetime.now().year, datetime.now().month, 1)
-    month_df = closed[closed["DT"] >= start_month]
-    if month_df.empty:
+    angel, session = angel_login(api_key, client_code, pin, totp_secret)
+    if angel is None or session is None:
+        st.session_state["ws_error"] = "Angel login failed for WebSocket"
         return
 
-    total = len(month_df)
-    wins = (pd.to_numeric(month_df["PnL"], errors="coerce").fillna(0) > 0).sum()
-    losses = total - wins
-    pnl = pd.to_numeric(month_df["PnL"], errors="coerce").fillna(0).sum()
-    win_rate = (wins / total * 100) if total else 0
+    try:
+        auth_token = session["data"]["jwtToken"]
+        feed_token_resp = angel.getfeedToken()
 
-    summary = safe_read_csv(MONTHLY_SUMMARY_FILE, pd.DataFrame(columns=["MonthKey", "TotalTrades", "Wins", "Losses", "RealizedPnL", "WinRate"]))
-    summary = summary[summary["MonthKey"] != current_month]
-    new_row = {
-        "MonthKey": current_month,
-        "TotalTrades": total,
-        "Wins": wins,
-        "Losses": losses,
-        "RealizedPnL": round(pnl, 2),
-        "WinRate": round(win_rate, 2)
-    }
-    summary = pd.concat([summary, pd.DataFrame([new_row])], ignore_index=True)
-    safe_write_csv(summary, MONTHLY_SUMMARY_FILE)
+        if isinstance(feed_token_resp, dict):
+            feed_token = feed_token_resp.get("data", {}).get("feedToken", None)
+            if feed_token is None:
+                feed_token = feed_token_resp.get("feedToken", None)
+        else:
+            feed_token = feed_token_resp
+
+        if not feed_token:
+            st.session_state["ws_error"] = "Feed token not received"
+            return
+
+        st.session_state["ws_should_run"] = True
+
+        def run_socket():
+            retry_count = 0
+
+            while st.session_state.get("ws_should_run", False) and retry_count <= MAX_WS_RETRIES:
+                try:
+                    sws = SmartWebSocketV2(auth_token, api_key, client_code, feed_token)
+                    correlation_id = "elite_dashboard_feed"
+                    mode = 1
+                    token_list = [{"exchangeType": 1, "tokens": [symbol_token]}]
+
+                    def on_data(wsapp, message):
+                        st.session_state["ws_last_tick"] = message
+                        st.session_state["ws_connected"] = True
+                        st.session_state["ws_error"] = ""
+                        st.session_state["ws_retries"] = retry_count
+                        try:
+                            ltp = None
+                            if isinstance(message, dict):
+                                ltp = (
+                                    message.get("last_traded_price")
+                                    or message.get("ltp")
+                                    or message.get("lastTradedPrice")
+                                )
+                                if ltp is not None:
+                                    try:
+                                        ltp_f = float(ltp)
+                                        st.session_state["live_price"] = ltp_f / 100 if ltp_f > 10000 else ltp_f
+                                    except Exception:
+                                        pass
+                        except Exception:
+                            pass
+
+                    def on_open(wsapp):
+                        st.session_state["ws_connected"] = True
+                        st.session_state["ws_error"] = ""
+                        sws.subscribe(correlation_id, mode, token_list)
+
+                    def on_error(wsapp, error):
+                        st.session_state["ws_error"] = f"{error} | retrying..."
+                        st.session_state["ws_connected"] = False
+
+                    def on_close(wsapp):
+                        st.session_state["ws_connected"] = False
+
+                    sws.on_open = on_open
+                    sws.on_data = on_data
+                    sws.on_error = on_error
+                    sws.on_close = on_close
+
+                    st.session_state["ws_running"] = True
+                    sws.connect()
+
+                except Exception as e:
+                    st.session_state["ws_error"] = f"{e} | reconnect attempt {retry_count + 1}/{MAX_WS_RETRIES}"
+                    st.session_state["ws_connected"] = False
+                    st.session_state["ws_running"] = False
+
+                retry_count += 1
+                st.session_state["ws_retries"] = retry_count
+
+                if retry_count <= MAX_WS_RETRIES and st.session_state.get("ws_should_run", False):
+                    pytime.sleep(WS_RETRY_DELAY_SEC)
+
+            if retry_count > MAX_WS_RETRIES:
+                st.session_state["ws_error"] = "Max WebSocket reconnect attempts reached."
+                st.session_state["ws_running"] = False
+                st.session_state["ws_connected"] = False
+
+        thread = threading.Thread(target=run_socket, daemon=True)
+        thread.start()
+        st.session_state["ws_thread_started"] = True
+
+    except Exception as e:
+        st.session_state["ws_error"] = str(e)
 
 
-def symbol_wise_performance(journal_df):
-    if journal_df.empty:
-        return pd.DataFrame()
-    df = journal_df[journal_df["Status"] == "CLOSED"].copy()
-    if df.empty:
-        return pd.DataFrame()
-    df["PnL"] = pd.to_numeric(df["PnL"], errors="coerce").fillna(0)
-    grouped = df.groupby("Symbol").agg(
-        Trades=("Symbol", "count"),
-        TotalPnL=("PnL", "sum"),
-        Wins=("PnL", lambda x: (x > 0).sum()),
-        Losses=("PnL", lambda x: (x <= 0).sum())
-    ).reset_index()
-    grouped["WinRate"] = np.where(grouped["Trades"] > 0, grouped["Wins"] / grouped["Trades"] * 100, 0)
-    return grouped.sort_values("TotalPnL", ascending=False)
-
-
-def timeframe_wise_performance(journal_df):
-    if journal_df.empty:
-        return pd.DataFrame()
-    df = journal_df[journal_df["Status"] == "CLOSED"].copy()
-    if df.empty:
-        return pd.DataFrame()
-    df["PnL"] = pd.to_numeric(df["PnL"], errors="coerce").fillna(0)
-    grouped = df.groupby("Timeframe").agg(
-        Trades=("Timeframe", "count"),
-        TotalPnL=("PnL", "sum"),
-        Wins=("PnL", lambda x: (x > 0).sum()),
-        Losses=("PnL", lambda x: (x <= 0).sum())
-    ).reset_index()
-    grouped["WinRate"] = np.where(grouped["Trades"] > 0, grouped["Wins"] / grouped["Trades"] * 100, 0)
-    return grouped.sort_values("WinRate", ascending=False)
-
-
-def best_worst_time_of_day(backtest_trades_df):
-    if backtest_trades_df.empty or "Time" not in backtest_trades_df.columns:
-        return None, None, pd.DataFrame()
-    df = backtest_trades_df.copy()
-    df["Hour"] = pd.to_datetime(df["Time"], format="%H:%M:%S", errors="coerce").dt.hour
-    df["PnL"] = pd.to_numeric(df["PnL"], errors="coerce").fillna(0)
-    grp = df.groupby("Hour").agg(Trades=("Hour", "count"), AvgPnL=("PnL", "mean"), TotalPnL=("PnL", "sum")).reset_index()
-    if grp.empty:
-        return None, None, grp
-    best = grp.sort_values("AvgPnL", ascending=False).iloc[0]
-    worst = grp.sort_values("AvgPnL", ascending=True).iloc[0]
-    return best, worst, grp
-
-
-# =========================================================
+# ----------------------------
 # TELEGRAM
-# =========================================================
+# ----------------------------
 def send_telegram_alert(token, chat_id, message):
     try:
         url = f"https://api.telegram.org/bot{token}/sendMessage"
         payload = {"chat_id": chat_id, "text": message}
         response = requests.post(url, data=payload, timeout=10)
         return response.status_code == 200
-    except Exception as e:
-        log_app_error("send_telegram_alert", e)
+    except Exception:
         return False
 
 
-# =========================================================
-# MTF HELPERS
-# =========================================================
+# ----------------------------
+# SNAPSHOT TABLES
+# ----------------------------
+@st.cache_data(ttl=300)
+def fetch_market_snapshot(symbol_map):
+    rows = []
+    for name, ticker in symbol_map.items():
+        try:
+            df = yf.download(ticker, period="5d", interval="1d", progress=False, auto_adjust=False)
+            if df.empty or len(df) < 2:
+                continue
+
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+
+            close = float(df["Close"].iloc[-1])
+            prev_close = float(df["Close"].iloc[-2])
+            change_pct = ((close - prev_close) / prev_close) * 100 if prev_close else 0.0
+
+            rows.append({
+                "Name": name,
+                "CMP": round(close, 2),
+                "% Change": round(change_pct, 2)
+            })
+        except Exception:
+            continue
+
+    return pd.DataFrame(rows)
+
+
+def get_intraday_trend_label(df):
+    if df.empty or len(df) < 20:
+        return "----"
+
+    df = add_indicators(df).bfill().ffill()
+    if df.empty:
+        return "----"
+
+    latest = df.iloc[-1]
+
+    if latest["EMA20"] > latest["EMA50"]:
+        return "BULLISH"
+    elif latest["EMA20"] < latest["EMA50"]:
+        return "BEARISH"
+    return "NEUTRAL"
+
+
+def safe_fetch_intraday_trend(ticker, minutes="1m"):
+    try:
+        df = fetch_data(ticker, "1m", "7d")
+        if df.empty:
+            return "----"
+
+        if minutes == "2m":
+            df = resample_ohlcv(df, "2min")
+        elif minutes == "3m":
+            df = resample_ohlcv(df, "3min")
+
+        return get_intraday_trend_label(df)
+    except Exception:
+        return "----"
+
+
+@st.cache_data(ttl=300)
+def fetch_fno_style_scanner(symbol_map):
+    rows = []
+    sno = 1
+
+    for name, ticker in symbol_map.items():
+        try:
+            df = yf.download(
+                ticker,
+                period="5d",
+                interval="1d",
+                progress=False,
+                auto_adjust=False
+            )
+
+            cmp_value = "----"
+            change_str = "----"
+            direction = "----"
+
+            if not df.empty and len(df) >= 2:
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = df.columns.get_level_values(0)
+
+                if "Close" in df.columns:
+                    close = float(df["Close"].iloc[-1])
+                    prev_close = float(df["Close"].iloc[-2])
+
+                    cmp_value = f"{close:.2f}"
+
+                    if prev_close:
+                        change_pct = ((close - prev_close) / prev_close) * 100
+                        change_str = f"{change_pct:+.2f}%"
+                        direction = "BULLISH" if change_pct >= 0 else "BEARISH"
+
+            trend_1m = safe_fetch_intraday_trend(ticker, "1m")
+            trend_2m = safe_fetch_intraday_trend(ticker, "2m")
+            trend_3m = safe_fetch_intraday_trend(ticker, "3m")
+
+            rows.append({
+                "S.NO": sno,
+                "STOCKS": name,
+                "CMP": cmp_value,
+                "% Change": change_str,
+                "1m": trend_1m,
+                "2m": trend_2m,
+                "3m": trend_3m,
+                "Direction": direction
+            })
+            sno += 1
+
+        except Exception:
+            rows.append({
+                "S.NO": sno,
+                "STOCKS": name,
+                "CMP": "----",
+                "% Change": "----",
+                "1m": "----",
+                "2m": "----",
+                "3m": "----",
+                "Direction": "----"
+            })
+            sno += 1
+
+    return pd.DataFrame(rows, columns=[
+        "S.NO", "STOCKS", "CMP", "% Change", "1m", "2m", "3m", "Direction"
+    ])
+
+
+def summarize_fno_bias(fno_df):
+    valid = fno_df[fno_df["Direction"].isin(["BULLISH", "BEARISH"])].copy()
+
+    if valid.empty:
+        return {
+            "overall_bias": "N/A",
+            "bullish_pct": 0,
+            "bearish_pct": 0,
+            "strongest_gainer": "N/A",
+            "strongest_loser": "N/A"
+        }
+
+    bullish_count = (valid["Direction"] == "BULLISH").sum()
+    bearish_count = (valid["Direction"] == "BEARISH").sum()
+    total = len(valid)
+
+    bullish_pct = round((bullish_count / total) * 100)
+    bearish_pct = round((bearish_count / total) * 100)
+
+    overall_bias = "BULLISH" if bullish_count >= bearish_count else "BEARISH"
+
+    valid["ChangeNum"] = valid["% Change"].astype(str).str.replace("%", "", regex=False)
+    valid["ChangeNum"] = pd.to_numeric(valid["ChangeNum"], errors="coerce")
+
+    gainers = valid.dropna(subset=["ChangeNum"]).sort_values("ChangeNum", ascending=False)
+    losers = valid.dropna(subset=["ChangeNum"]).sort_values("ChangeNum", ascending=True)
+
+    strongest_gainer = "N/A"
+    strongest_loser = "N/A"
+
+    if not gainers.empty:
+        strongest_gainer = f"{gainers.iloc[0]['STOCKS']} ({gainers.iloc[0]['% Change']})"
+
+    if not losers.empty:
+        strongest_loser = f"{losers.iloc[0]['STOCKS']} ({losers.iloc[0]['% Change']})"
+
+    return {
+        "overall_bias": overall_bias,
+        "bullish_pct": bullish_pct,
+        "bearish_pct": bearish_pct,
+        "strongest_gainer": strongest_gainer,
+        "strongest_loser": strongest_loser
+    }
+
+
+# ----------------------------
+# MTF SIGNAL
+# ----------------------------
 def get_data_for_timeframe(data_source, selected, ticker, tf, angel_creds):
     if data_source == "Yahoo":
         if tf == "1m":
@@ -2696,12 +1882,15 @@ def get_data_for_timeframe(data_source, selected, ticker, tf, angel_creds):
     interval = map_angel_interval(tf)
     candles = get_angel_candles(api_key, client_code, pin, totp_secret, selected, interval)
     data = candles_to_df(candles)
+
     if data.empty:
         return data
+
     if tf == "3m":
         data = resample_ohlcv(data, "3min")
     elif tf == "10m":
         data = resample_ohlcv(data, "10min")
+
     return data
 
 
@@ -2709,9 +1898,13 @@ def get_mtf_signal(data_source, selected, ticker, tf, angel_creds):
     data = get_data_for_timeframe(data_source, selected, ticker, tf, angel_creds)
     if data.empty:
         return "⚪ N/A"
-    data = add_indicators(data).bfill().ffill()
+
+    data = add_indicators(data)
+    data = data.bfill().ffill()
+
     if len(data) < 5:
         return "⚪ N/A"
+
     latest = data.iloc[-1]
     if latest["EMA20"] > latest["EMA50"]:
         return "🟢 Bullish"
@@ -2720,38 +1913,14 @@ def get_mtf_signal(data_source, selected, ticker, tf, angel_creds):
     return "⚪ Neutral"
 
 
-# =========================================================
-# OPTION STRIKE
-# =========================================================
-def suggest_option_strike(symbol, spot_price, signal_type):
-    if symbol == "NIFTY":
-        step = 50
-    elif symbol == "BANKNIFTY":
-        step = 100
-    else:
-        step = 10
-
-    atm = round(spot_price / step) * step
-    if signal_type == "buy":
-        return {"type": "CALL", "atm": atm, "otm": atm + step, "text": f"Suggested CALL strikes: ATM {atm} CE, OTM {atm + step} CE"}
-    elif signal_type == "sell":
-        return {"type": "PUT", "atm": atm, "otm": atm - step, "text": f"Suggested PUT strikes: ATM {atm} PE, OTM {atm - step} PE"}
-    return {"type": "NONE", "atm": None, "otm": None, "text": "No option strike suggestion"}
-
-
-# =========================================================
-# APP INIT
-# =========================================================
+# ----------------------------
+# APP START
+# ----------------------------
 login_panel()
 init_journal()
 init_paper_state()
 init_daily_summary()
-init_weekly_summary()
-init_monthly_summary()
 init_risk_state()
-init_weekly_risk()
-init_monthly_risk()
-init_signal_audit()
 init_ws_state()
 
 stocks = {
@@ -2778,10 +1947,56 @@ ANGEL_TOKENS = {
     "ITC": "1660"
 }
 
-st.title("Elite Trading Dashboard Final Ultimate")
-st.caption("Polling First | Walk Forward | Auto Exit | News Filter | Dynamic Option Chain")
+global_indices = {
+    "S&P 500": "^GSPC",
+    "Dow Jones": "^DJI",
+    "Nasdaq": "^IXIC",
+    "FTSE 100": "^FTSE",
+    "DAX": "^GDAXI",
+    "Nikkei 225": "^N225",
+    "Hang Seng": "^HSI",
+    "Crude Oil": "CL=F",
+    "Gold": "GC=F",
+    "USD/INR": "INR=X"
+}
+
+indian_indices = {
+    "NIFTY 50": "^NSEI",
+    "BANKNIFTY": "^NSEBANK",
+    "SENSEX": "^BSESN",
+    "NIFTY IT": "^CNXIT",
+    "NIFTY AUTO": "^CNXAUTO",
+    "NIFTY PHARMA": "^CNXPHARMA"
+}
+
+major_stocks = {
+    "RELIANCE": "RELIANCE.NS",
+    "HDFC BANK": "HDFCBANK.NS",
+    "ICICI BANK": "ICICIBANK.NS",
+    "INFY": "INFY.NS",
+    "TCS": "TCS.NS",
+    "ITC": "ITC.NS",
+    "LT": "LT.NS",
+    "SBI": "SBIN.NS",
+    "AXIS BANK": "AXISBANK.NS",
+    "BHARTI AIRTEL": "BHARTIARTL.NS",
+    "KOTAK BANK": "KOTAKBANK.NS",
+    "HCLTECH": "HCLTECH.NS",
+    "ASIAN PAINTS": "ASIANPAINT.NS",
+    "MARUTI": "MARUTI.NS",
+    "SUN PHARMA": "SUNPHARMA.NS",
+    "TITAN": "TITAN.NS",
+    "ULTRATECH CEMENT": "ULTRACEMCO.NS",
+    "NESTLE INDIA": "NESTLEIND.NS",
+    "BAJAJ FINANCE": "BAJFINANCE.NS",
+    "POWER GRID": "POWERGRID.NS"
+}
+
+st.title("📈 Elite Trading Dashboard Ultimate V6")
+st.caption("Journal + Paper Trading + Alerts + MTF + Backtest + Global/India Market Snapshot + Angel Ready")
 
 debug_mode = st.sidebar.checkbox("Debug Mode", value=False)
+
 selected = st.selectbox("Select Stock / Index", list(stocks.keys()))
 data_source = st.radio("Data Source", ["Yahoo", "Angel"], horizontal=True)
 timeframe = st.selectbox("Select Time Frame", ["1m", "3m", "5m", "10m", "15m", "30m", "1h", "1d"])
@@ -2792,36 +2007,36 @@ with st.expander("Telegram Alert Settings"):
     telegram_enabled = st.checkbox("Enable Telegram Alerts", value=False)
     telegram_bot_token = st.text_input("Telegram Bot Token", type="password")
     telegram_chat_id = st.text_input("Telegram Chat ID")
-    auto_send_telegram = st.checkbox("Auto-send only High Quality New Signals", value=False)
-
-with st.expander("News Filter API"):
-    news_api_key = st.text_input("NewsAPI Key", type="password")
-    news_filter_enabled = st.checkbox("Enable News Filter", value=False)
+    auto_send_telegram = st.checkbox("Auto-send on New Signal", value=False)
 
 with st.expander("Angel One API Settings"):
+    angel_enabled = st.checkbox("Enable Angel One API", value=(data_source == "Angel"))
     angel_api_key = st.text_input("Angel API Key", type="password")
     angel_client_code = st.text_input("Angel Client Code")
     angel_pin = st.text_input("Angel PIN", type="password")
     angel_totp_secret = st.text_input("Angel TOTP Secret", type="password")
-    polling_mode = st.checkbox("Use Angel LTP Polling Mode", value=True)
-    ws_enable = st.checkbox("Enable Angel WebSocket (Optional)", value=False)
+    ws_enable = st.checkbox("Enable Angel WebSocket", value=False)
 
     if st.button("Test Angel Login"):
-        angel, session = angel_login(angel_api_key, angel_client_code, angel_pin, angel_totp_secret, force_refresh=True)
+        angel, session = angel_login(
+            angel_api_key, angel_client_code, angel_pin, angel_totp_secret, force_refresh=True
+        )
         if angel and session:
-            st.success("Angel One Login Successful")
+            st.success("✅ Angel One Login Successful")
         else:
-            st.error("Angel login failed")
+            st.error("❌ Angel login failed")
 
     if st.button("Stop WebSocket"):
-        stop_angel_websocket()
-        sync_ws_state_to_session()
+        st.session_state["ws_should_run"] = False
+        st.session_state["ws_connected"] = False
+        st.session_state["ws_running"] = False
+        st.session_state["ws_thread_started"] = False
         st.warning("WebSocket stop requested.")
 
-ticker = stocks[selected]
-
 if auto_refresh:
-    st_autorefresh(interval=refresh_seconds * 1000, key="elite_ultimate_refresh")
+    st_autorefresh(interval=refresh_seconds * 1000, key="ultimate_refresh")
+
+ticker = stocks[selected]
 
 if timeframe == "1m":
     yf_interval, yf_period = "1m", "7d"
@@ -2851,7 +2066,15 @@ if data_source == "Angel":
         st.stop()
 
     angel_interval = map_angel_interval(timeframe)
-    candles = get_angel_candles(angel_api_key, angel_client_code, angel_pin, angel_totp_secret, selected, angel_interval)
+    candles = get_angel_candles(
+        angel_api_key,
+        angel_client_code,
+        angel_pin,
+        angel_totp_secret,
+        selected,
+        angel_interval
+    )
+
     data = candles_to_df(candles)
 
     if data.empty:
@@ -2862,9 +2085,14 @@ if data_source == "Angel":
     else:
         st.session_state["last_good_candles"] = candles
 
-    if ws_enable and not USE_POLLING_AS_PRIMARY:
-        start_angel_websocket(angel_api_key, angel_client_code, angel_pin, angel_totp_secret, selected)
-        sync_ws_state_to_session()
+    if ws_enable:
+        start_angel_websocket(
+            angel_api_key,
+            angel_client_code,
+            angel_pin,
+            angel_totp_secret,
+            selected
+        )
 else:
     data = fetch_data(ticker, yf_interval, yf_period)
 
@@ -2877,20 +2105,17 @@ if timeframe == "3m":
 elif timeframe == "10m":
     data = resample_ohlcv(data, "10min")
 
-ok, msg = data_integrity_check(data, ["Open", "High", "Low", "Close", "Volume"], min_rows=DATA_INTEGRITY_MIN_ROWS)
-if not ok:
-    st.error(f"Data integrity failed: {msg}")
-    st.stop()
-
-data = add_indicators(data).bfill().ffill()
+data = add_indicators(data)
 backtest_data = data.copy()
+data = data.bfill().ffill()
 
 if len(data) < 30:
     st.warning(f"Only {len(data)} rows available after indicator calculation.")
     st.stop()
 
-htf_interval, _ = get_higher_timeframe(timeframe)
+htf_interval, htf_period = get_higher_timeframe(timeframe)
 angel_creds = (angel_api_key, angel_client_code, angel_pin, angel_totp_secret)
+
 htf_data = get_data_for_timeframe(data_source, selected, ticker, htf_interval, angel_creds)
 
 if not htf_data.empty:
@@ -2902,6 +2127,18 @@ if not htf_data.empty:
         htf_bias = None
 else:
     htf_bias = None
+
+wins, losses, total_trades, backtest_win_rate, backtest_trades_df = simple_backtest(backtest_data, symbol=selected)
+
+analysis = analyze_signal(
+    data,
+    htf_bias=htf_bias,
+    timeframe_label=timeframe,
+    backtest_win_rate=backtest_win_rate
+)
+
+pcr = get_pcr()
+latest = data.iloc[-1]
 
 mtf_table = pd.DataFrame({
     "Timeframe": ["1m", "3m", "5m", "15m"],
@@ -2916,97 +2153,72 @@ mtf_table = pd.DataFrame({
 bull_count = sum("Bullish" in sig for sig in mtf_table["Trend"])
 bear_count = sum("Bearish" in sig for sig in mtf_table["Trend"])
 
-dynamic_oc_symbol = get_dynamic_option_chain_symbol(selected)
-option_metrics = parse_option_chain_metrics(dynamic_oc_symbol)
-
-news_info = {"allow_trade": True, "message": "News filter disabled", "events": []}
-if news_filter_enabled:
-    news_info = get_news_events(news_api_key, selected)
-
-wins, losses, total_trades, backtest_win_rate, backtest_trades_df = simple_backtest(
-    backtest_data,
-    symbol=selected,
-    timeframe_label=timeframe,
-    option_metrics=option_metrics,
-    news_info=news_info
-)
-
-analysis = analyze_signal(
-    data,
-    htf_bias=htf_bias,
-    timeframe_label=timeframe,
-    backtest_win_rate=backtest_win_rate,
-    mtf_bull_count=bull_count,
-    mtf_bear_count=bear_count,
-    option_metrics=option_metrics,
-    news_info=news_info
-)
-
-walk_forward_result = walk_forward_validation(
-    backtest_data,
-    symbol=selected,
-    timeframe_label=timeframe,
-    option_metrics=option_metrics,
-    news_info=news_info
-)
-
-stats = compute_trade_statistics(backtest_trades_df, initial_capital=DEFAULT_INITIAL_BALANCE)
-equity_curve_df, max_drawdown = compute_equity_curve_from_trades(backtest_trades_df, initial_capital=DEFAULT_INITIAL_BALANCE)
-
-health_score, health_label = strategy_health_monitor(
-    analysis["validation_score"],
-    backtest_win_rate,
-    stats["profit_factor"] if stats["profit_factor"] != 999.0 else 5.0,
-    max_drawdown
-)
-
-best_hour, worst_hour, hour_perf_df = best_worst_time_of_day(backtest_trades_df)
-
 if bull_count >= 3:
-    mtf_grade = "Strong Bullish Alignment"
+    mtf_grade = "🔥 Strong Bullish Alignment"
 elif bear_count >= 3:
-    mtf_grade = "Strong Bearish Alignment"
+    mtf_grade = "🔥 Strong Bearish Alignment"
 else:
-    mtf_grade = "Mixed Timeframes"
+    mtf_grade = "⚠️ Mixed Timeframes"
 
-mtf_confirmation = "Neutral"
+mtf_confirmation = "➖ Neutral"
 if analysis["signal_type"] == "buy" and htf_bias == "bullish":
-    mtf_confirmation = "Bullish Alignment"
+    mtf_confirmation = "✅ Bullish Alignment"
 elif analysis["signal_type"] == "sell" and htf_bias == "bearish":
-    mtf_confirmation = "Bearish Alignment"
+    mtf_confirmation = "✅ Bearish Alignment"
 elif analysis["signal_type"] in ["buy", "sell"]:
-    mtf_confirmation = "Timeframe Conflict"
+    mtf_confirmation = "⚠️ Timeframe Conflict"
 
-quality_score = (analysis["win_chance"] + analysis["confidence"] + analysis["validation_score"]) / 3
+quality_score = (analysis["win_chance"] + analysis["confidence"]) / 2
 if quality_score >= 85:
-    signal_quality = "Excellent"
+    signal_quality = "🔥 Excellent"
 elif quality_score >= 70:
-    signal_quality = "Strong"
+    signal_quality = "✅ Strong"
 elif quality_score >= 55:
-    signal_quality = "Moderate"
+    signal_quality = "⚠️ Moderate"
 else:
-    signal_quality = "Weak"
+    signal_quality = "❌ Weak"
 
-live_price = None
-if data_source == "Angel" and polling_mode:
-    live_price = get_angel_ltp_polling(angel_api_key, angel_client_code, angel_pin, angel_totp_secret, selected)
-elif data_source == "Angel" and ws_enable:
-    sync_ws_state_to_session()
-    live_price = st.session_state.get("live_price")
+patterns = []
+pattern_map = {
+    "InvertedHammer": "🟢 Inverted Hammer",
+    "HangingMan": "🔴 Hanging Man",
+    "DragonflyDoji": "🟢 Dragonfly Doji",
+    "GravestoneDoji": "🔴 Gravestone Doji",
+    "ThreeWhiteSoldiers": "🟢 Three White Soldiers",
+    "ThreeBlackCrows": "🔴 Three Black Crows",
+    "Hammer": "🟢 Hammer",
+    "ShootingStar": "🔴 Shooting Star",
+    "BullishMarubozu": "🟢 Bullish Marubozu",
+    "BearishMarubozu": "🔴 Bearish Marubozu",
+    "Doji": "🟡 Doji",
+    "BullishEngulfing": "🟢 Bullish Engulfing",
+    "BearishEngulfing": "🔴 Bearish Engulfing",
+    "PiercingPattern": "🟢 Piercing Pattern",
+    "DarkCloudCover": "🔴 Dark Cloud Cover",
+    "TweezerBottom": "🟢 Tweezer Bottom",
+    "TweezerTop": "🔴 Tweezer Top",
+    "MorningStar": "🟢 Morning Star",
+    "EveningStar": "🔴 Evening Star",
+    "BullishHarami": "🟢 Bullish Harami",
+    "BearishHarami": "🔴 Bearish Harami"
+}
 
-current_display_price = live_price if live_price else analysis["close_price"]
+for key, label in pattern_map.items():
+    if bool(latest.get(key, False)):
+        patterns.append(label)
 
-closed_auto = auto_paper_trade_exit(current_display_price)
+if bool(latest.get("RetestBull", False)):
+    patterns.append("🚀 Bullish Retest")
+if bool(latest.get("RetestBear", False)):
+    patterns.append("🔻 Bearish Retest")
 
 option_suggestion = suggest_option_strike(selected, analysis["close_price"], analysis["signal_type"])
-expiry_seconds = get_signal_expiry_remaining(selected, timeframe, analysis["signal_text"])
 
 alert_text = (
     f"{selected} | {timeframe} | {analysis['signal_text']} | "
-    f"Grade: {analysis['strategy_grade']} | Validation: {analysis['validation_score']} | "
-    f"Quality: {analysis['trade_quality_score']} | Confidence: {analysis['confidence']}% | "
-    f"Win Chance: {analysis['win_chance']}% | Price: {round(current_display_price, 2)} | "
-    f"RR: {analysis['rr_ratio']} | OC: {dynamic_oc_symbol} | {option_suggestion['text']}"
+    f"Strength: {analysis['strength']} | Confidence: {analysis['confidence']}% | "
+    f"Win Chance: {analysis['win_chance']}% | Price: {round(analysis['close_price'], 2)} | "
+    f"{option_suggestion['text']}"
 )
 
 current_signal_key = f"{selected}|{timeframe}|{analysis['signal_text']}|{round(analysis['close_price'], 2)}"
@@ -3014,9 +2226,6 @@ last_signal_key = ""
 if os.path.exists(SIGNAL_STATE_FILE):
     with open(SIGNAL_STATE_FILE, "r") as f:
         last_signal_key = f.read().strip()
-
-if analysis["signal_type"] in ["buy", "sell"] and not is_duplicate_signal(selected, timeframe, analysis):
-    add_signal_audit(selected, timeframe, analysis)
 
 if telegram_enabled and telegram_bot_token and telegram_chat_id:
     if st.button("Send Telegram Alert Now"):
@@ -3026,35 +2235,53 @@ if telegram_enabled and telegram_bot_token and telegram_chat_id:
         else:
             st.error("Failed to send Telegram alert.")
 
-    if (
-        auto_send_telegram and
-        current_signal_key != last_signal_key and
-        analysis["signal_type"] != "neutral" and
-        analysis["trade_quality_score"] >= HIGH_QUALITY_SIGNAL_MIN_SCORE and
-        analysis["validation_score"] >= MIN_VALIDATION_SCORE_FOR_ALERT and
-        not is_duplicate_signal(selected, timeframe, analysis)
-    ):
+    if auto_send_telegram and current_signal_key != last_signal_key and analysis["signal_type"] != "neutral":
         sent = send_telegram_alert(telegram_bot_token, telegram_chat_id, alert_text)
         if sent:
             with open(SIGNAL_STATE_FILE, "w") as f:
                 f.write(current_signal_key)
 
-paper_state = load_paper_state()
-paper_balance = float(paper_state.loc[0, "Balance"])
-risk_ok, risk_msg = risk_check_before_trade()
+# ----------------------------
+# DASHBOARD
+# ----------------------------
+st.subheader("🚨 Live Signal Analytics")
 
-st.subheader("Live Signal Analytics")
-
-if data_source == "Angel":
-    p1, p2, p3, p4 = st.columns(4)
-    with p1:
-        st.metric("Polling Mode", "Primary" if polling_mode else "Off")
-    with p2:
-        st.metric("WebSocket Mode", "Optional" if ws_enable else "Off")
-    with p3:
+if data_source == "Angel" and ws_enable:
+    ws_col1, ws_col2, ws_col3, ws_col4 = st.columns(4)
+    with ws_col1:
+        st.metric("WebSocket Status", "Connected" if st.session_state.get("ws_connected") else "Disconnected")
+    with ws_col2:
+        live_price = st.session_state.get("live_price")
         st.metric("Live Price", round(live_price, 2) if live_price else "-")
-    with p4:
-        st.metric("Auto Closed Trades", closed_auto)
+    with ws_col3:
+        st.metric("WS Available", "Yes" if SMART_WS_AVAILABLE else "No")
+    with ws_col4:
+        st.metric("WS Retries", st.session_state.get("ws_retries", 0))
+
+    if st.session_state.get("ws_error"):
+        st.warning(f"WebSocket: {st.session_state['ws_error']}")
+
+st.subheader("📊 Multi Timeframe Alignment")
+st.dataframe(mtf_table, use_container_width=True)
+
+col1, col2 = st.columns(2)
+with col1:
+    st.metric("Bullish TF", bull_count)
+with col2:
+    st.metric("Bearish TF", bear_count)
+
+if "Strong Bullish" in mtf_grade:
+    st.success(mtf_grade)
+elif "Strong Bearish" in mtf_grade:
+    st.error(mtf_grade)
+else:
+    st.warning(mtf_grade)
+
+st.subheader("🕯 Candlestick Patterns")
+if patterns:
+    st.success(" | ".join(patterns))
+else:
+    st.info("No major candlestick pattern detected")
 
 if analysis["signal_type"] == "buy":
     st.success(alert_text)
@@ -3063,279 +2290,94 @@ elif analysis["signal_type"] == "sell":
 else:
     st.warning(alert_text)
 
-if expiry_seconds is not None:
-    st.info(f"Signal Expiry Remaining: {expiry_seconds} sec")
+if analysis["signal_type"] == "buy" and bear_count >= 3:
+    st.error("⚠️ BUY signal hai lekin MTF Alignment Bearish hai")
+if analysis["signal_type"] == "sell" and bull_count >= 3:
+    st.error("⚠️ SELL signal hai lekin MTF Alignment Bullish hai")
 
-st.subheader("Strategy Validation Dashboard")
-sv1, sv2, sv3, sv4, sv5, sv6 = st.columns(6)
-with sv1:
-    st.metric("Validation Score", analysis["validation_score"])
-with sv2:
-    st.metric("Strategy Grade", analysis["strategy_grade"])
-with sv3:
-    st.metric("Trade Quality", analysis["trade_quality_score"])
-with sv4:
-    st.metric("Health Score", health_score)
-with sv5:
-    st.metric("Health Label", health_label)
-with sv6:
-    st.metric("Market Regime", analysis["market_regime"])
-
-st.subheader("Multi Timeframe Alignment")
-st.dataframe(mtf_table, use_container_width=True)
-m1, m2, m3 = st.columns(3)
+m1, m2, m3, m4, m5, m6, m7, m8 = st.columns(8)
 with m1:
-    st.metric("Bullish TF", bull_count)
+    st.metric("Current Price", round(analysis["close_price"], 2))
+    st.metric("VWAP", round(float(analysis["vwap"]), 2) if analysis["vwap"] is not None else "N/A")
 with m2:
-    st.metric("Bearish TF", bear_count)
+    st.metric("EMA20", round(analysis["ema20"], 2))
+    st.metric("EMA50", round(analysis["ema50"], 2))
 with m3:
-    st.metric("MTF Status", mtf_confirmation)
-
-if "Bullish" in mtf_grade:
-    st.success(mtf_grade)
-elif "Bearish" in mtf_grade:
-    st.error(mtf_grade)
-else:
-    st.warning(mtf_grade)
-
-top1, top2, top3, top4 = st.columns(4)
-with top1:
-    st.metric("Current Price", round(current_display_price, 2))
-with top2:
-    st.metric("Signal", analysis["signal_text"])
-with top3:
+    st.metric("RSI", round(analysis["rsi"], 2))
+    st.metric("ATR", round(analysis["atr"], 2))
+with m4:
+    st.metric("MACD", round(analysis["macd"], 2))
+    st.metric("ADX", round(analysis["adx"], 2))
+with m5:
     st.metric("Win Chance %", analysis["win_chance"])
-with top4:
     st.metric("Confidence %", analysis["confidence"])
+with m6:
+    st.metric("Bullish Score", analysis["bullish_score"])
+    st.metric("Bearish Score", analysis["bearish_score"])
+with m7:
+    st.metric("Signal Quality", signal_quality)
+with m8:
+    st.metric("PCR", pcr if pcr is not None else "Unavailable")
 
 a1, a2, a3, a4, a5, a6 = st.columns(6)
 with a1:
-    st.metric("ADX", round(analysis["adx"], 2))
-with a2:
-    st.metric("EMA200 Confirm", "Yes" if ((analysis["signal_type"] == "buy" and analysis["close_price"] > analysis["ema200"]) or (analysis["signal_type"] == "sell" and analysis["close_price"] < analysis["ema200"])) else "No")
-with a3:
-    st.metric("SuperTrend", "Bullish" if analysis["supertrend_direction"] == 1 else "Bearish" if analysis["supertrend_direction"] == -1 else "Neutral")
-with a4:
-    st.metric("RR Ratio", analysis["rr_ratio"] if analysis["rr_ratio"] else "-")
-with a5:
-    st.metric("Dynamic OC", dynamic_oc_symbol)
-with a6:
-    st.metric("News Filter", "Blocked" if not news_info["allow_trade"] else "Clear")
-
-b1, b2, b3, b4, b5, b6 = st.columns(6)
-with b1:
-    st.metric("VWAP", round(float(analysis["vwap"]), 2) if analysis["vwap"] is not None else "N/A")
-with b2:
-    st.metric("EMA20", round(analysis["ema20"], 2))
-with b3:
-    st.metric("EMA50", round(analysis["ema50"], 2))
-with b4:
-    st.metric("EMA200", round(analysis["ema200"], 2))
-with b5:
-    st.metric("RSI", round(analysis["rsi"], 2))
-with b6:
-    st.metric("ATR", round(analysis["atr"], 2))
-
-c1, c2, c3, c4, c5, c6 = st.columns(6)
-with c1:
     st.metric("Support", round(analysis["support"], 2))
-with c2:
+with a2:
     st.metric("Resistance", round(analysis["resistance"], 2))
-with c3:
-    st.metric("Gap %", analysis["gap_pct"])
-with c4:
-    st.metric("OI Bias", analysis["oi_bias"])
-with c5:
-    st.metric("PCR", analysis["pcr"] if analysis["pcr"] is not None else "N/A")
-with c6:
-    st.metric("No Trade Zone", "Yes" if analysis["no_trade_zone"] else "No")
-
-r1, r2, r3, r4 = st.columns(4)
-with r1:
-    st.metric("Trending Market", "Yes" if analysis["trending_market"] else "No")
-with r2:
-    st.metric("Sideways Market", "Yes" if analysis["sideways_market"] else "No")
-with r3:
-    st.metric("High Volatility", "Yes" if analysis["high_volatility_market"] else "No")
-with r4:
-    st.metric("Signal Quality", signal_quality)
-
-st.subheader("Risk Management")
-rk1, rk2, rk3, rk4, rk5 = st.columns(5)
-risk_state = load_risk_state()
-weekly_risk = load_weekly_risk()
-monthly_risk = load_monthly_risk()
-with rk1:
-    st.metric("Paper Balance", round(paper_balance, 2))
-with rk2:
-    st.metric("Daily Lock", "Yes" if bool(risk_state.loc[0, "DailyLock"]) else "No")
-with rk3:
-    st.metric("Weekly Lock", "Yes" if bool(weekly_risk.loc[0, "WeeklyLock"]) else "No")
-with rk4:
-    st.metric("Monthly Lock", "Yes" if bool(monthly_risk.loc[0, "MonthlyLock"]) else "No")
-with rk5:
-    st.metric("Risk Status", risk_msg)
-
-if analysis["signal_type"] in ["buy", "sell"] and analysis["stop_loss"] is not None:
-    qty = calculate_position_size(analysis["close_price"], analysis["stop_loss"], paper_balance)
-    t1c, t2c, t3c, t4c, t5c, t6c = st.columns(6)
-    with t1c:
-        st.metric("Stop Loss", round(analysis["stop_loss"], 2))
-    with t2c:
-        st.metric("Partial Exit", round(analysis["partial_exit"], 2) if analysis["partial_exit"] else "-")
-    with t3c:
-        st.metric("Target 1", round(analysis["target1"], 2) if analysis["target1"] else "-")
-    with t4c:
-        st.metric("Target 2", round(analysis["target2"], 2) if analysis["target2"] else "-")
-    with t5c:
-        st.metric("Target 3", round(analysis["target3"], 2) if analysis["target3"] else "-")
-    with t6c:
-        st.metric("Auto Position Size", qty)
-
-    if st.button("Paper Trade Entry"):
-        if not risk_ok:
-            st.error(risk_msg)
-        else:
-            ok_entry = paper_trade_entry(analysis["close_price"], qty)
-            if ok_entry:
-                add_trade_to_journal(
-                    selected, timeframe, analysis["signal_text"], analysis["close_price"], qty,
-                    analysis["stop_loss"], analysis["target1"], analysis["target2"], analysis["target3"],
-                    analysis["trailing_stop"], analysis, notes="Paper trade entry from dashboard"
-                )
-                st.success("Paper trade entered")
-            else:
-                st.error("Insufficient paper balance")
-
-with st.expander("Why this signal?"):
-    for reason in analysis["reasons"]:
-        st.write("-", reason)
-
-if news_filter_enabled:
-    st.subheader("News Filter Events")
-    if news_info["events"]:
-        st.dataframe(pd.DataFrame(news_info["events"]), use_container_width=True)
-    else:
-        st.info(news_info["message"])
-
-st.subheader("Backtest Analytics")
-ba1, ba2, ba3, ba4, ba5, ba6 = st.columns(6)
-with ba1:
+with a3:
     st.metric("Backtest Wins", wins)
-with ba2:
+with a4:
     st.metric("Backtest Losses", losses)
-with ba3:
-    st.metric("Total Trades", total_trades)
-with ba4:
+with a5:
     st.metric("Backtest Win Rate", f"{backtest_win_rate:.1f}%")
-with ba5:
-    st.metric("Profit Factor", stats["profit_factor"])
-with ba6:
-    st.metric("Max Drawdown %", max_drawdown)
+with a6:
+    st.metric("MTF Status", mtf_confirmation)
 
-bb1, bb2, bb3, bb4, bb5, bb6 = st.columns(6)
-with bb1:
-    st.metric("Winning Streak", stats["winning_streak"])
-with bb2:
-    st.metric("Losing Streak", stats["losing_streak"])
-with bb3:
-    st.metric("Average Win", stats["avg_win"])
-with bb4:
-    st.metric("Average Loss", stats["avg_loss"])
-with bb5:
-    st.metric("Expectancy", stats["expectancy"])
-with bb6:
-    st.metric("Sharpe Ratio", stats["sharpe_ratio"])
+with st.expander("📘 Backtest Trade Log", expanded=False):
+    if not backtest_trades_df.empty:
+        st.dataframe(backtest_trades_df, use_container_width=True)
+    else:
+        st.info("No backtest trades found for current symbol/timeframe.")
 
-bc1, bc2, bc3, bc4 = st.columns(4)
-with bc1:
-    st.metric("T1 Hit Rate %", stats["t1_hit_rate"])
-with bc2:
-    st.metric("T2 Hit Rate %", stats["t2_hit_rate"])
-with bc3:
-    st.metric("T3 Hit Rate %", stats["t3_hit_rate"])
-with bc4:
-    st.metric("Profitability Score", stats["profitability_score"])
+st.subheader("📋 F&O Style Stocks Table")
+st.caption("Yahoo Mode shows underlying spot % change, not futures % change. For genuine futures % change, a valid Angel One futures contract/quote is required.")
 
-st.subheader("Walk Forward Validation")
-wf1, wf2, wf3, wf4 = st.columns(4)
-with wf1:
-    st.metric("Folds", walk_forward_result["folds"])
-with wf2:
-    st.metric("Avg Win Rate", walk_forward_result["avg_win_rate"])
-with wf3:
-    st.metric("Avg Profit Factor", walk_forward_result["avg_profit_factor"])
-with wf4:
-    st.metric("Avg Expectancy", walk_forward_result["avg_expectancy"])
+fno_scanner_df = fetch_fno_style_scanner(major_stocks)
 
-if not walk_forward_result["table"].empty:
-    st.dataframe(walk_forward_result["table"], use_container_width=True)
+if not fno_scanner_df.empty:
+    def highlight_trend(val):
+        if val == "BULLISH":
+            return "background-color: #163d1a; color: #7CFC00; font-weight: bold;"
+        elif val == "BEARISH":
+            return "background-color: #4a1515; color: #ff6b6b; font-weight: bold;"
+        elif val == "NEUTRAL":
+            return "background-color: #3a3a3a; color: #f2c94c; font-weight: bold;"
+        return ""
+
+    styled_fno_df = (
+        fno_scanner_df.style
+        .map(highlight_trend, subset=["1m", "2m", "3m", "Direction"])
+    )
+
+    st.dataframe(styled_fno_df, use_container_width=True, hide_index=True)
+
+    fno_summary = summarize_fno_bias(fno_scanner_df)
+
+    st.markdown(
+        f"""
+**Overall Bias:** {fno_summary['overall_bias']}
+
+**Bullish = {fno_summary['bullish_pct']}%**  
+**Bearish = {fno_summary['bearish_pct']}%**
+
+**Strongest Gainer :** {fno_summary['strongest_gainer']}  
+**Strongest Loser  :** {fno_summary['strongest_loser']}
+"""
+    )
 else:
-    st.info("Walk forward validation data unavailable.")
+    st.info("F&O style scanner data unavailable.")
 
-st.subheader("Equity Curve")
-if not equity_curve_df.empty:
-    eq_fig = go.Figure()
-    eq_fig.add_trace(go.Scatter(x=equity_curve_df["TradeNo"], y=equity_curve_df["Equity"], mode="lines", name="Equity"))
-    eq_fig.update_layout(height=320, template="plotly_dark", title="Equity Curve")
-    st.plotly_chart(eq_fig, use_container_width=True)
-else:
-    st.info("No equity curve data available.")
-
-st.subheader("Best / Worst Time of Day")
-if best_hour is not None and worst_hour is not None:
-    bt1, bt2 = st.columns(2)
-    with bt1:
-        st.success(f"Best Hour: {int(best_hour['Hour'])}:00 | AvgPnL: {round(best_hour['AvgPnL'], 2)}")
-    with bt2:
-        st.error(f"Worst Hour: {int(worst_hour['Hour'])}:00 | AvgPnL: {round(worst_hour['AvgPnL'], 2)}")
-    st.dataframe(hour_perf_df, use_container_width=True)
-else:
-    st.info("Time of day analysis unavailable.")
-
-st.subheader("Backtest Trade Log")
-if not backtest_trades_df.empty:
-    st.dataframe(backtest_trades_df, use_container_width=True)
-else:
-    st.info("No backtest trades found.")
-
-journal = load_journal()
-update_daily_summary()
-update_weekly_summary()
-update_monthly_summary()
-
-st.subheader("Journal Analytics Dashboard")
-closed_journal = journal[journal["Status"] == "CLOSED"].copy() if not journal.empty else pd.DataFrame()
-if not closed_journal.empty:
-    sym_perf = symbol_wise_performance(journal)
-    tf_perf = timeframe_wise_performance(journal)
-
-    j1, j2 = st.columns(2)
-    with j1:
-        st.markdown("**Symbol-wise Performance**")
-        st.dataframe(sym_perf, use_container_width=True)
-    with j2:
-        st.markdown("**Timeframe-wise Performance**")
-        st.dataframe(tf_perf, use_container_width=True)
-
-    st.markdown("**Closed Trade Journal**")
-    st.dataframe(closed_journal, use_container_width=True)
-else:
-    st.info("No closed trades in journal yet.")
-
-st.subheader("Daily / Weekly / Monthly Reports")
-rep1, rep2, rep3 = st.columns(3)
-with rep1:
-    st.markdown("**Daily Summary**")
-    st.dataframe(safe_read_csv(DAILY_SUMMARY_FILE), use_container_width=True)
-with rep2:
-    st.markdown("**Weekly Summary**")
-    st.dataframe(safe_read_csv(WEEKLY_SUMMARY_FILE), use_container_width=True)
-with rep3:
-    st.markdown("**Monthly Summary**")
-    st.dataframe(safe_read_csv(MONTHLY_SUMMARY_FILE), use_container_width=True)
-
-st.subheader("Option Suggestion")
+st.subheader("🎯 Option CALL/PUT Suggestion")
 if option_suggestion["type"] == "CALL":
     st.success(option_suggestion["text"])
 elif option_suggestion["type"] == "PUT":
@@ -3343,6 +2385,361 @@ elif option_suggestion["type"] == "PUT":
 else:
     st.warning(option_suggestion["text"])
 
+if analysis["stop_loss"] is not None:
+    t1, t2, t3, t4, t5 = st.columns(5)
+    with t1:
+        st.metric("Stop Loss", round(analysis["stop_loss"], 2))
+    with t2:
+        st.metric("Partial Exit", round(analysis["partial_exit"], 2) if analysis["partial_exit"] else "-")
+    with t3:
+        st.metric("Target 1", round(analysis["target1"], 2) if analysis["target1"] else "-")
+    with t4:
+        st.metric("Target 2", round(analysis["target2"], 2) if analysis["target2"] else "-")
+    with t5:
+        st.metric("Trailing Stop", round(analysis["trailing_stop"], 2) if analysis["trailing_stop"] else "-")
+
+with st.expander("Why this signal?"):
+    for reason in analysis["reasons"]:
+        st.write("-", reason)
+
+st.subheader("🌍 Global / Macro Performance (Latest Daily Close)")
+global_df = fetch_market_snapshot(global_indices)
+if not global_df.empty:
+    st.dataframe(global_df, use_container_width=True)
+else:
+    st.info("Global / macro data unavailable.")
+
+st.subheader("🇮🇳 Indian Market Performance (Latest Daily Close)")
+india_df = fetch_market_snapshot(indian_indices)
+if not india_df.empty:
+    st.dataframe(india_df, use_container_width=True)
+else:
+    st.info("Indian market data unavailable.")
+
+st.subheader("🛡 Risk Management Module")
+
+risk_state = load_risk_state()
+today_closed = get_today_closed_trades()
+today_realized_pnl = pd.to_numeric(today_closed.get("PnL", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()
+today_trade_count = len(today_closed)
+
+r1, r2, r3 = st.columns(3)
+with r1:
+    daily_loss_limit = st.number_input(
+        "Daily Loss Limit",
+        min_value=100.0,
+        value=float(risk_state.loc[0, "DailyLossLimit"]),
+        step=100.0
+    )
+with r2:
+    max_trades_per_day = st.number_input(
+        "Max Trades Per Day",
+        min_value=1,
+        value=int(risk_state.loc[0, "MaxTradesPerDay"]),
+        step=1
+    )
+with r3:
+    risk_per_trade_pct = st.number_input(
+        "Risk Per Trade (%)",
+        min_value=0.1,
+        value=float(risk_state.loc[0, "RiskPerTradePct"]),
+        step=0.1
+    )
+
+trading_enabled = st.checkbox(
+    "Enable Trading",
+    value=bool(risk_state.loc[0, "TradingEnabled"])
+)
+
+if st.button("Save Risk Settings"):
+    risk_state.loc[0, "DailyLossLimit"] = daily_loss_limit
+    risk_state.loc[0, "MaxTradesPerDay"] = int(max_trades_per_day)
+    risk_state.loc[0, "RiskPerTradePct"] = float(risk_per_trade_pct)
+    risk_state.loc[0, "TradingEnabled"] = bool(trading_enabled)
+    save_risk_state(risk_state)
+    st.success("Risk settings saved.")
+    st.rerun()
+
+rr1, rr2, rr3 = st.columns(3)
+with rr1:
+    st.metric("Today Closed Trades", today_trade_count)
+with rr2:
+    st.metric("Today Realized PnL", round(today_realized_pnl, 2))
+with rr3:
+    paper_state_for_risk = load_paper_state()
+    suggested_qty = calculate_position_size(
+        analysis["close_price"],
+        analysis["stop_loss"],
+        float(paper_state_for_risk.loc[0, "Balance"])
+    ) if analysis["stop_loss"] is not None else 1
+    st.metric("Suggested Qty", suggested_qty)
+
+risk_ok, risk_msg = risk_check_before_trade()
+if risk_ok:
+    st.success(risk_msg)
+else:
+    st.error(risk_msg)
+
+st.subheader("💼 Paper Trading")
+paper_state = load_paper_state()
+
+p1, p2, p3 = st.columns(3)
+with p1:
+    st.metric("Paper Balance", round(float(paper_state.loc[0, "Balance"]), 2))
+with p2:
+    st.metric("Used Margin", round(float(paper_state.loc[0, "UsedMargin"]), 2))
+with p3:
+    st.metric("Open Positions", int(paper_state.loc[0, "OpenPositions"]))
+
+paper_qty = st.number_input("Paper Trade Quantity (Manual Override)", min_value=1, value=1, step=1)
+
+if st.button("Take Paper Trade"):
+    risk_ok, risk_msg = risk_check_before_trade()
+
+    if not risk_ok:
+        st.error(risk_msg)
+
+    elif analysis["signal_type"] in ["buy", "sell"]:
+        final_qty = paper_qty
+        if analysis["stop_loss"] is not None:
+            final_qty = calculate_position_size(
+                analysis["close_price"],
+                analysis["stop_loss"],
+                float(paper_state.loc[0, "Balance"])
+            )
+
+        success = paper_trade_entry(analysis["close_price"], final_qty)
+        if success:
+            add_trade_to_journal(
+                symbol=selected,
+                timeframe=timeframe,
+                signal=analysis["signal_text"],
+                entry_price=analysis["close_price"],
+                quantity=final_qty,
+                stop_loss=analysis["stop_loss"],
+                target1=analysis["target1"],
+                target2=analysis["target2"],
+                trailing_stop=analysis["trailing_stop"],
+                notes="Paper Trade"
+            )
+            st.success(f"Paper trade entered and journal updated. Qty used: {final_qty}")
+            st.rerun()
+        else:
+            st.error("Insufficient paper balance.")
+    else:
+        st.warning("No valid signal for paper trade.")
+
+st.subheader("Candlestick Chart")
+fig = go.Figure()
+
+fig.add_trace(go.Candlestick(
+    x=data.index,
+    open=data["Open"],
+    high=data["High"],
+    low=data["Low"],
+    close=data["Close"],
+    name="Candles"
+))
+fig.add_trace(go.Scatter(x=data.index, y=data["EMA20"], mode="lines", name="EMA20", line=dict(color="orange", width=1.5)))
+fig.add_trace(go.Scatter(x=data.index, y=data["EMA50"], mode="lines", name="EMA50", line=dict(color="blue", width=1.5)))
+fig.add_trace(go.Scatter(x=data.index, y=data["VWAP"], mode="lines", name="VWAP", line=dict(color="purple", width=1.3, dash="dot")))
+fig.add_trace(go.Scatter(x=data.index, y=data["BB_Upper"], mode="lines", name="BB Upper", line=dict(color="gray", width=1, dash="dash")))
+fig.add_trace(go.Scatter(x=data.index, y=data["BB_Lower"], mode="lines", name="BB Lower", line=dict(color="gray", width=1, dash="dash")))
+
+fig.add_trace(go.Scatter(
+    x=data.index,
+    y=data["BuyMarker"],
+    mode="markers",
+    name="Buy Signal",
+    marker=dict(symbol="triangle-up", color="green", size=12)
+))
+fig.add_trace(go.Scatter(
+    x=data.index,
+    y=data["SellMarker"],
+    mode="markers",
+    name="Sell Signal",
+    marker=dict(symbol="triangle-down", color="red", size=12)
+))
+
+fig.add_hline(y=analysis["support"], line_dash="dot", line_color="green", annotation_text="Support")
+fig.add_hline(y=analysis["resistance"], line_dash="dot", line_color="red", annotation_text="Resistance")
+
+fig.update_layout(
+    height=700,
+    xaxis_rangeslider_visible=False,
+    template="plotly_dark",
+    title=f"{selected} Candlestick Chart ({timeframe})"
+)
+st.plotly_chart(fig, use_container_width=True)
+
+st.subheader("MACD Chart")
+macd_fig = go.Figure()
+macd_fig.add_trace(go.Scatter(x=data.index, y=data["MACD"], mode="lines", name="MACD", line=dict(color="cyan")))
+macd_fig.add_trace(go.Scatter(x=data.index, y=data["SignalLine"], mode="lines", name="Signal", line=dict(color="orange")))
+macd_fig.add_trace(go.Bar(x=data.index, y=data["MACD_Hist"], name="Histogram"))
+macd_fig.update_layout(height=300, template="plotly_dark", title="MACD")
+st.plotly_chart(macd_fig, use_container_width=True)
+
+st.subheader("RSI / Stochastic / ADX Chart")
+multi_fig = go.Figure()
+multi_fig.add_trace(go.Scatter(x=data.index, y=data["RSI"], mode="lines", name="RSI", line=dict(color="yellow")))
+multi_fig.add_trace(go.Scatter(x=data.index, y=data["StochK"], mode="lines", name="Stoch K", line=dict(color="lime")))
+multi_fig.add_trace(go.Scatter(x=data.index, y=data["StochD"], mode="lines", name="Stoch D", line=dict(color="red")))
+multi_fig.add_trace(go.Scatter(x=data.index, y=data["ADX"], mode="lines", name="ADX", line=dict(color="white")))
+multi_fig.update_layout(height=350, template="plotly_dark", title="Momentum + Trend Strength")
+st.plotly_chart(multi_fig, use_container_width=True)
+
+st.subheader("📝 Trade Journal")
+
+col_j1, col_j2 = st.columns(2)
+with col_j1:
+    qty = st.number_input("Manual Journal Quantity", min_value=1, value=1, step=1, key="journal_qty")
+    note_text = st.text_input("Trade Notes", value="", key="journal_note")
+    if st.button("Add Current Signal to Journal"):
+        if analysis["signal_type"] in ["buy", "sell"]:
+            add_trade_to_journal(
+                symbol=selected,
+                timeframe=timeframe,
+                signal=analysis["signal_text"],
+                entry_price=analysis["close_price"],
+                quantity=qty,
+                stop_loss=analysis["stop_loss"],
+                target1=analysis["target1"],
+                target2=analysis["target2"],
+                trailing_stop=analysis["trailing_stop"],
+                notes=note_text
+            )
+            st.success("Trade added to journal.")
+            st.rerun()
+        else:
+            st.warning("No valid trade signal to add.")
+
+journal_df = load_journal()
+st.dataframe(journal_df, use_container_width=True)
+
+st.subheader("📌 Entry / Exit History")
+
+open_trades = journal_df[journal_df["Status"] == "OPEN"]
+if not open_trades.empty:
+    st.write("Open Trades")
+    st.dataframe(open_trades, use_container_width=True)
+
+    open_indices = open_trades.index.tolist()
+    selected_trade_index = st.selectbox("Select Open Trade Row to Exit", open_indices)
+    exit_price_input = st.number_input("Exit Price", min_value=0.0, value=float(analysis["close_price"]), step=0.1)
+
+    if st.button("Close Selected Trade"):
+        row = journal_df.loc[selected_trade_index]
+        pnl = paper_trade_exit(
+            entry_price=float(row["EntryPrice"]),
+            exit_price=exit_price_input,
+            quantity=float(row["Quantity"]),
+            signal=str(row["Signal"])
+        )
+        close_trade_in_journal(selected_trade_index, exit_price_input)
+        update_daily_summary()
+        st.success(f"Trade closed. Paper PnL: {round(pnl, 2)}")
+        st.rerun()
+else:
+    st.info("No open trades available.")
+
+closed_trades = journal_df[journal_df["Status"] == "CLOSED"]
+if not closed_trades.empty:
+    st.write("Closed Trades")
+    st.dataframe(closed_trades, use_container_width=True)
+
+    total_pnl = pd.to_numeric(closed_trades["PnL"], errors="coerce").fillna(0).sum()
+    avg_pnl_pct = pd.to_numeric(closed_trades["PnLPercent"], errors="coerce").fillna(0).mean()
+
+    rp1, rp2 = st.columns(2)
+    with rp1:
+        st.metric("Total Realized PnL", round(total_pnl, 2))
+    with rp2:
+        st.metric("Average PnL %", round(avg_pnl_pct, 2))
+
+st.subheader("📊 Daily Summary Report")
+summary_df = pd.read_csv(SESSION_SUMMARY_FILE)
+st.dataframe(summary_df, use_container_width=True)
+
+st.subheader("Downloads")
+market_csv = data.to_csv().encode("utf-8")
+st.download_button(
+    label="📥 Download Market Data CSV",
+    data=market_csv,
+    file_name=f"{selected}_{timeframe}_market_data.csv",
+    mime="text/csv"
+)
+
+journal_csv = journal_df.to_csv(index=False).encode("utf-8")
+st.download_button(
+    label="📥 Download Trade Journal CSV",
+    data=journal_csv,
+    file_name="trade_journal.csv",
+    mime="text/csv"
+)
+
+summary_csv = summary_df.to_csv(index=False).encode("utf-8")
+st.download_button(
+    label="📥 Download Daily Summary CSV",
+    data=summary_csv,
+    file_name="daily_summary.csv",
+    mime="text/csv"
+)
+
+backtest_csv = backtest_trades_df.to_csv(index=False).encode("utf-8")
+st.download_button(
+    label="📥 Download Backtest CSV",
+    data=backtest_csv,
+    file_name=f"{selected}_{timeframe}_backtest_trades.csv",
+    mime="text/csv"
+)
+
+fno_csv = fno_scanner_df.to_csv(index=False).encode("utf-8")
+st.download_button(
+    label="📥 Download F&O Style Stocks CSV",
+    data=fno_csv,
+    file_name="fno_style_stocks.csv",
+    mime="text/csv"
+)
+
 if debug_mode:
-    st.subheader("Debug Panel")
-   
+    st.subheader("🐞 Debug")
+    st.write("Data Source:", data_source)
+    st.write("Selected:", selected)
+    st.write("Timeframe:", timeframe)
+    st.write("Rows Loaded:", len(data))
+    st.write("Columns:", list(data.columns))
+    st.write("Latest Row:")
+    st.dataframe(data.tail(5), use_container_width=True)
+    st.write("PCR Debug:", pcr)
+    st.write("Angel Token:", ANGEL_TOKENS.get(selected))
+    st.write("Backtest Rows:", len(backtest_data))
+    st.write("Backtest Trades:", len(backtest_trades_df))
+    if "VWAP" in data.columns:
+        st.write("VWAP Null Count:", int(data["VWAP"].isna().sum()))
+        st.dataframe(data[["Close", "Volume", "VWAP"]].tail(10), use_container_width=True)
+    if "Volume" in data.columns:
+        st.write("Volume Sum:", float(data["Volume"].fillna(0).sum()))
+    if all(col in backtest_data.columns for col in ["EMA20", "EMA50", "VWAP", "RSI", "MACD", "SignalLine", "ATR"]):
+        st.write("Backtest Required Nulls:")
+        st.write(backtest_data[["EMA20", "EMA50", "VWAP", "RSI", "MACD", "SignalLine", "ATR"]].isna().sum())
+
+        buy_debug = (
+            (backtest_data["EMA20"] > backtest_data["EMA50"]) &
+            (backtest_data["RSI"] > 52) &
+            (backtest_data["MACD"] > backtest_data["SignalLine"])
+        )
+        sell_debug = (
+            (backtest_data["EMA20"] < backtest_data["EMA50"]) &
+            (backtest_data["RSI"] < 48) &
+            (backtest_data["MACD"] < backtest_data["SignalLine"])
+        )
+        st.write("Possible Buy Signals:", int(buy_debug.sum()))
+        st.write("Possible Sell Signals:", int(sell_debug.sum()))
+
+    if data_source == "Angel":
+        st.write("WebSocket Available:", SMART_WS_AVAILABLE)
+        st.write("WS Connected:", st.session_state.get("ws_connected"))
+        st.write("WS Error:", st.session_state.get("ws_error"))
+        st.write("WS Retries:", st.session_state.get("ws_retries"))
+        st.write("Last Tick:", st.session_state.get("ws_last_tick"))
