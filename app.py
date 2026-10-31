@@ -433,25 +433,58 @@ def login_panel():
 # =========================================================
 # DATA FETCH
 # =========================================================
-@st.cache_data(ttl=10)
+@st.cache_data(ttl=10, show_spinner=False)
 def fetch_data(ticker, interval, period):
+    """Yahoo OHLCV loader tolerant of yfinance MultiIndex layout changes."""
+    needed = ["Open", "High", "Low", "Close", "Volume"]
+    errors = []
+    df = pd.DataFrame()
     try:
-        df = yf.download(ticker, interval=interval, period=period, progress=False, auto_adjust=False)
-        if df.empty:
-            return pd.DataFrame()
+        try:
+            df = yf.download(ticker, interval=interval, period=period,
+                             progress=False, auto_adjust=False, threads=False,
+                             multi_level_index=False)
+        except TypeError:
+            df = yf.download(ticker, interval=interval, period=period,
+                             progress=False, auto_adjust=False, threads=False)
+        except Exception as exc:
+            errors.append(f"download: {exc}")
 
+        # yfinance versions differ: columns may be (Price, Ticker) or (Ticker, Price).
         if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
+            best_level = None
+            best_count = -1
+            for level in range(df.columns.nlevels):
+                vals = [str(v) for v in df.columns.get_level_values(level)]
+                count = sum(col in vals for col in needed)
+                if count > best_count:
+                    best_count, best_level = count, level
+            if best_level is not None:
+                df.columns = df.columns.get_level_values(best_level)
+        if not df.empty and all(c in df.columns for c in needed):
+            df = df.loc[:, ~pd.Index(df.columns).duplicated()].copy()
+            df = df[needed].copy()
+        else:
+            # Ticker.history is a useful fallback when download returns a changed schema.
+            try:
+                hist = yf.Ticker(ticker).history(period=period, interval=interval,
+                                                 auto_adjust=False, prepost=False)
+                if not hist.empty and all(c in hist.columns for c in needed):
+                    df = hist[needed].copy()
+            except Exception as exc:
+                errors.append(f"history: {exc}")
 
-        needed = ["Open", "High", "Low", "Close", "Volume"]
-        if any(c not in df.columns for c in needed):
+        if df.empty or not all(c in df.columns for c in needed):
+            if errors:
+                log_app_error("fetch_data", " | ".join(errors))
             return pd.DataFrame()
-
-        df = df[needed].copy()
         df.index = pd.to_datetime(df.index, errors="coerce")
         df = df[~df.index.isna()].copy()
+        for col in needed:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
         df = df.dropna(subset=["Open", "High", "Low", "Close"])
-        df["Volume"] = pd.to_numeric(df["Volume"], errors="coerce").fillna(0)
+        df["Volume"] = df["Volume"].fillna(0)
+        df = df[~df.index.duplicated(keep="last")].sort_index()
         return df
     except Exception as e:
         log_app_error("fetch_data", e)
@@ -548,17 +581,47 @@ def get_angel_candles(api_key, client_code, pin, totp_secret, symbol_name, inter
 
 
 def candles_to_df(candles):
+    """Normalize SmartAPI candle responses without hiding broker error messages."""
     try:
-        if not isinstance(candles, dict) or not candles.get("data"):
+        if isinstance(candles, pd.DataFrame):
+            raw = candles.copy()
+            if "Datetime" in raw.columns:
+                raw = raw.set_index("Datetime")
+            elif "timestamp" in raw.columns:
+                raw = raw.set_index("timestamp")
+            df = raw
+        else:
+            payload = candles.get("data") if isinstance(candles, dict) else candles
+            if not isinstance(payload, (list, tuple)) or len(payload) == 0:
+                return pd.DataFrame()
+            if isinstance(payload[0], dict):
+                df = pd.DataFrame(payload).rename(columns={
+                    "timestamp": "Datetime", "time": "Datetime",
+                    "open": "Open", "high": "High", "low": "Low",
+                    "close": "Close", "volume": "Volume"
+                })
+                if "Datetime" in df.columns:
+                    df = df.set_index("Datetime")
+            else:
+                df = pd.DataFrame(payload)
+                if df.shape[1] < 5:
+                    return pd.DataFrame()
+                cols = ["Datetime", "Open", "High", "Low", "Close", "Volume"][:df.shape[1]]
+                df.columns = cols
+                df = df.set_index("Datetime")
+        df.index = pd.to_datetime(df.index, errors="coerce")
+        df = df[~df.index.isna()].copy()
+        df.columns = [str(c).strip().title() for c in df.columns]
+        required = ["Open", "High", "Low", "Close"]
+        if not all(c in df.columns for c in required):
             return pd.DataFrame()
-        df = pd.DataFrame(candles["data"], columns=["Datetime", "Open", "High", "Low", "Close", "Volume"])
-        df["Datetime"] = pd.to_datetime(df["Datetime"], errors="coerce")
-        df = df.dropna(subset=["Datetime"]).set_index("Datetime")
-        for col in ["Open", "High", "Low", "Close", "Volume"]:
+        if "Volume" not in df.columns:
+            df["Volume"] = 0
+        for col in required + ["Volume"]:
             df[col] = pd.to_numeric(df[col], errors="coerce")
-        df = df.dropna(subset=["Open", "High", "Low", "Close"])
+        df = df.dropna(subset=required)
         df["Volume"] = df["Volume"].fillna(0)
-        return df
+        return df[required + ["Volume"]].sort_index()
     except Exception as e:
         log_app_error("candles_to_df", e)
         return pd.DataFrame()
@@ -3159,29 +3222,56 @@ if "last_good_candles" not in st.session_state:
 
 if data_source == "Angel":
     if not (angel_api_key and angel_client_code and angel_pin and angel_totp_secret):
-        st.warning("Please fill Angel credentials to use Angel data source.")
-        st.stop()
-
-    angel_interval = map_angel_interval(timeframe)
-    candles = get_angel_candles(angel_api_key, angel_client_code, angel_pin, angel_totp_secret, selected, angel_interval)
-    data = candles_to_df(candles)
-
-    if data.empty:
-        last_good = st.session_state.get("last_good_candles")
-        data = candles_to_df(last_good)
-        if not data.empty:
-            st.warning("Using last successful Angel candle data.")
+        st.warning("Angel One selected, but API Key / Client Code / PIN / TOTP are incomplete. Enter credentials in Angel One API Settings, or switch to Yahoo Finance.")
+        data = pd.DataFrame()
     else:
-        st.session_state["last_good_candles"] = candles
-
-    if ws_enable:
-        start_angel_websocket(angel_api_key, angel_client_code, angel_pin, angel_totp_secret, selected)
-        sync_ws_state_to_session()
+        angel_interval = map_angel_interval(timeframe)
+        candles = get_angel_candles(angel_api_key, angel_client_code, angel_pin, angel_totp_secret, selected, angel_interval)
+        data = candles_to_df(candles)
+        if data.empty:
+            last_good = st.session_state.get("last_good_candles")
+            data = candles_to_df(last_good)
+            if isinstance(candles, dict):
+                st.error(f"Angel One candle response: {candles.get('message', 'No candle data returned')}")
+            if not data.empty:
+                st.warning("Using last successful Angel candle data.")
+        else:
+            st.session_state["last_good_candles"] = candles
+        if ws_enable:
+            start_angel_websocket(angel_api_key, angel_client_code, angel_pin, angel_totp_secret, selected)
+            sync_ws_state_to_session()
 else:
     data = fetch_data(ticker, yf_interval, yf_period)
+    if data.empty:
+        st.error(f"Yahoo Finance returned no OHLCV rows for {ticker} ({yf_interval}, {yf_period}). Check internet access, Yahoo availability, symbol and market session. See Debug Mode / app_error_log.csv for details.")
 
 if data.empty:
-    st.error("No data found")
+    st.warning("Live price charts and signal calculations need valid OHLC candles. The independent scanner and saved journal are still shown below.")
+    st.subheader("Major Stocks Scanner — NIFTY Top 30")
+    st.caption("Scanner uses Yahoo Finance independently of the selected primary data source.")
+    if st.button("Retry NIFTY Top 30 Scanner", key="retry_scanner_no_main_data"):
+        build_nifty_top30_scanner.clear()
+        st.rerun()
+    try:
+        empty_feed_scanner = build_nifty_top30_scanner()
+        if empty_feed_scanner.empty:
+            st.info("Scanner feed is also unavailable right now. No prices or trends will be fabricated.")
+        else:
+            st.dataframe(empty_feed_scanner, use_container_width=True, hide_index=True)
+            st.dataframe(scanner_breadth_summary(empty_feed_scanner), use_container_width=True, hide_index=True)
+    except Exception as scanner_error:
+        st.error(f"Scanner error: {scanner_error}")
+    st.subheader("Saved Trade Journal")
+    try:
+        saved_journal = load_journal()
+        st.dataframe(saved_journal.tail(100), use_container_width=True, hide_index=True)
+    except Exception as journal_error:
+        st.error(f"Journal error: {journal_error}")
+    st.subheader("Data Diagnostics")
+    st.write({"Selected source": data_source, "Selected symbol": selected, "Ticker": ticker,
+              "Timeframe": timeframe, "Yahoo interval": yf_interval, "Yahoo period": yf_period,
+              "Angel SDK available": SMART_API_AVAILABLE, "Last successful Angel candles": bool(st.session_state.get("last_good_candles"))})
+    st.info("For Angel One, verify all four credentials in the Angel One API Settings expander. For Yahoo, retry after a short interval; intraday feeds can be rate-limited or unavailable.")
     st.stop()
 
 if timeframe == "3m":
@@ -3189,17 +3279,16 @@ if timeframe == "3m":
 elif timeframe == "10m":
     data = resample_ohlcv(data, "10min")
 
-ok, msg = data_integrity_check(data, ["Open", "High", "Low", "Close", "Volume"], min_rows=DATA_INTEGRITY_MIN_ROWS)
+ok, msg = data_integrity_check(data, ["Open", "High", "Low", "Close", "Volume"], min_rows=2)
 if not ok:
     st.error(f"Data integrity failed: {msg}")
     st.stop()
 
-data = add_indicators(data).bfill().ffill()
+data = add_indicators(data).replace([np.inf, -np.inf], np.nan).bfill().ffill()
 backtest_data = data.copy()
 
-if len(data) < 30:
-    st.warning(f"Only {len(data)} rows available after indicator calculation.")
-    st.stop()
+if len(data) < 35:
+    st.warning(f"Only {len(data)} candles available. Live price / chart can display, but backtest and some long-period indicators need more history.")
 
 htf_interval, _ = get_higher_timeframe(timeframe)
 angel_creds = (angel_api_key, angel_client_code, angel_pin, angel_totp_secret)
