@@ -15,7 +15,7 @@ import streamlit as st
 import yfinance as yf
 
 # Visible deployment marker: confirms which source file Streamlit Cloud is running.
-APP_BUILD_ID = "2026-11-01-ONECLICK-RELEASE-09"
+APP_BUILD_ID = "2026-11-01-LIVE-GLOBAL-INDIA-BOARD-10"
 # Optional integrations: Yahoo mode must still start if Angel SDK/TOTP or
 # the auto-refresh helper is not installed.
 try:
@@ -1475,6 +1475,44 @@ NIFTY_TOP30 = {
 }
 
 
+# Global/macro and major Indian share-board. Yahoo Finance is intentionally an
+# independent feed so this information remains visible even when the selected
+# primary Angel/Yahoo OHLC chart feed is unavailable.
+GLOBAL_MACRO_ASSETS = [
+    {"name": "S&P 500", "tickers": ("^GSPC",)},
+    {"name": "Hang Seng", "tickers": ("^HSI",)},
+    {"name": "GIFT Nifty", "tickers": ("^NSEI",), "fallback_name": "NIFTY spot proxy (not GIFT futures)", "always_fallback_label": True},
+    {"name": "India VIX", "tickers": ("^INDIAVIX",)},
+    {"name": "NASDAQ", "tickers": ("^IXIC",)},
+    {"name": "Shanghai Composite", "tickers": ("000001.SS", "^SSEC")},
+    {"name": "USD/INR", "tickers": ("INR=X",)},
+    {"name": "Dow Jones", "tickers": ("^DJI",)},
+    {"name": "FTSE 100", "tickers": ("^FTSE",)},
+    {"name": "Brent Crude", "tickers": ("BZ=F",)},
+    {"name": "Nikkei 225", "tickers": ("^N225",)},
+    {"name": "DAX", "tickers": ("^GDAXI",)},
+    {"name": "Gold", "tickers": ("GC=F",)},
+]
+
+MAJOR_INDIAN_MARKET_STOCKS = [
+    {"name": "Reliance", "tickers": ("RELIANCE.NS",)},
+    {"name": "Axis Bank", "tickers": ("AXISBANK.NS",)},
+    {"name": "HCL Tech", "tickers": ("HCLTECH.NS",)},
+    {"name": "Maruti", "tickers": ("MARUTI.NS",)},
+    {"name": "ITC", "tickers": ("ITC.NS",)},
+    {"name": "HDFC Bank", "tickers": ("HDFCBANK.NS",)},
+    {"name": "Kotak Bank", "tickers": ("KOTAKBANK.NS",)},
+    {"name": "Wipro", "tickers": ("WIPRO.NS",)},
+    {"name": "Mahindra & Mahindra", "tickers": ("M&M.NS",)},
+    {"name": "Larsen & Toubro", "tickers": ("LT.NS",)},
+    {"name": "ICICI Bank", "tickers": ("ICICIBANK.NS",)},
+    {"name": "TCS", "tickers": ("TCS.NS",)},
+    {"name": "Tech Mahindra", "tickers": ("TECHM.NS",)},
+    {"name": "Bajaj Auto", "tickers": ("BAJAJ-AUTO.NS",)},
+    {"name": "Bharti Airtel", "tickers": ("BHARTIARTL.NS",)},
+]
+
+
 def classify_stock_timeframe(frame):
     """Return a transparent trend classification using EMA, MACD, RSI and HA direction."""
     if frame is None or frame.empty or len(frame) < 25:
@@ -1539,7 +1577,7 @@ def _normalize_yahoo_frame(frame):
     return df[needed + ["Volume"]].loc[~df.index.duplicated(keep="last")].sort_index()
 
 
-@st.cache_data(ttl=45, show_spinner=False)
+@st.cache_data(ttl=30, show_spinner=False)
 def fetch_yahoo_batch(tickers, interval, period):
     """Fetch many Yahoo tickers in one HTTP batch and return {ticker: OHLCV}.
 
@@ -1593,6 +1631,169 @@ def fetch_yahoo_batch(tickers, interval, period):
     except Exception as exc:
         log_app_error("fetch_yahoo_batch", exc)
         return empty_result
+
+
+def _market_quote_from_frames(name, ticker_used, intraday_frame, daily_frame, fallback_label=None):
+    """Build one market quote using the newest 5-minute bar, else latest daily close.
+
+    Daily % change is calculated against the last completed daily bar before the
+    current quote date. Missing quotes remain NaN; values are never copied from
+    other indices or companies.
+    """
+    empty = {
+        "Name": name, "Ticker": ticker_used, "Price": np.nan,
+        "ChangePct": np.nan, "Status": "No data returned", "AsOf": "N/A",
+        "DisplayName": fallback_label or name,
+    }
+    try:
+        intraday = _normalize_yahoo_frame(intraday_frame)
+        daily = _normalize_yahoo_frame(daily_frame)
+        intraday = intraday.dropna(subset=["Close"]) if not intraday.empty else intraday
+        daily = daily.dropna(subset=["Close"]) if not daily.empty else daily
+
+        use_intraday = not intraday.empty
+        if use_intraday and not daily.empty:
+            try:
+                intraday_date = pd.Timestamp(intraday.index[-1]).date()
+                daily_latest_date = pd.Timestamp(daily.index[-1]).date()
+                # If the latest intraday bar is older than a newer EOD bar,
+                # show the newer EOD value instead of a stale intraday quote.
+                if daily_latest_date > intraday_date:
+                    use_intraday = False
+            except Exception:
+                pass
+
+        if use_intraday:
+            price = float(intraday["Close"].iloc[-1])
+            quote_timestamp = pd.Timestamp(intraday.index[-1])
+            quote_date = quote_timestamp.date()
+            previous_close = np.nan
+            if not daily.empty:
+                older_daily = daily[[pd.Timestamp(x).date() < quote_date for x in daily.index]]
+                if not older_daily.empty:
+                    previous_close = float(older_daily["Close"].iloc[-1])
+                elif len(daily) >= 2:
+                    previous_close = float(daily["Close"].iloc[-2])
+            status = "Latest 5m bar"
+        elif not daily.empty:
+            price = float(daily["Close"].iloc[-1])
+            quote_timestamp = pd.Timestamp(daily.index[-1])
+            previous_close = float(daily["Close"].iloc[-2]) if len(daily) >= 2 else np.nan
+            status = "Latest daily close"
+        else:
+            return empty
+
+        change_pct = np.nan
+        if pd.notna(previous_close) and previous_close != 0:
+            change_pct = ((price - previous_close) / previous_close) * 100.0
+
+        try:
+            as_of = quote_timestamp.strftime("%Y-%m-%d %H:%M %Z").strip()
+        except Exception:
+            as_of = str(quote_timestamp)
+        return {
+            "Name": name,
+            "Ticker": ticker_used,
+            "Price": round(price, 4),
+            "ChangePct": round(float(change_pct), 2) if pd.notna(change_pct) else np.nan,
+            "Status": status,
+            "AsOf": as_of,
+            "DisplayName": fallback_label or name,
+        }
+    except Exception as exc:
+        log_app_error("market_board_quote", f"{name} ({ticker_used}): {exc}")
+        return empty
+
+
+def build_live_market_board_rows():
+    """Fetch global/macro + major Indian quotes in two batched Yahoo requests.
+
+    5-minute bars provide the newest available quote when the market/provider
+    supplies them. Latest daily close is a clearly marked fallback outside
+    market hours or where an intraday instrument is unsupported.
+    """
+    instruments = GLOBAL_MACRO_ASSETS + MAJOR_INDIAN_MARKET_STOCKS
+    tickers = tuple(dict.fromkeys(
+        ticker for item in instruments for ticker in item.get("tickers", ())
+    ))
+    intraday_data = fetch_yahoo_batch(tickers, "5m", "5d")
+    daily_data = fetch_yahoo_batch(tickers, "1d", "5d")
+
+    global_rows = []
+    indian_rows = []
+    for item in instruments:
+        chosen_ticker = None
+        chosen_row = None
+        candidates = item.get("tickers", ())
+        for candidate_index, candidate in enumerate(candidates):
+            intraday = intraday_data.get(candidate, pd.DataFrame())
+            daily = daily_data.get(candidate, pd.DataFrame())
+            if (isinstance(intraday, pd.DataFrame) and not intraday.empty) or (isinstance(daily, pd.DataFrame) and not daily.empty):
+                chosen_ticker = candidate
+                label_override = None
+                if item.get("fallback_name") and (candidate_index > 0 or item.get("always_fallback_label")):
+                    label_override = item["fallback_name"]
+                chosen_row = _market_quote_from_frames(
+                    item["name"], candidate, intraday, daily, fallback_label=label_override
+                )
+                break
+        if chosen_row is None:
+            chosen_row = _market_quote_from_frames(
+                item["name"], candidates[0] if candidates else "N/A",
+                pd.DataFrame(), pd.DataFrame()
+            )
+        (global_rows if item in GLOBAL_MACRO_ASSETS else indian_rows).append(chosen_row)
+    return global_rows, indian_rows
+
+
+def _render_market_quote_grid(rows, columns_per_row=5):
+    """Render compact market metric cards with per-instrument freshness labels."""
+    if not rows:
+        st.info("No instruments are configured for this market board.")
+        return
+    for start in range(0, len(rows), columns_per_row):
+        chunk = rows[start:start + columns_per_row]
+        cols = st.columns(columns_per_row)
+        for col, item in zip(cols, chunk):
+            with col:
+                price = item.get("Price", np.nan)
+                pct = item.get("ChangePct", np.nan)
+                price_text = f"{float(price):,.2f}" if pd.notna(price) else "N/A"
+                delta_text = f"{float(pct):+.2f}%" if pd.notna(pct) else None
+                st.metric(str(item.get("DisplayName") or item.get("Name")), price_text, delta=delta_text)
+                st.caption(
+                    f"{item.get('Ticker', 'N/A')} · {item.get('Status', 'N/A')}\n"
+                    f"As of: {item.get('AsOf', 'N/A')}"
+                )
+
+
+def render_live_global_india_market_board():
+    """Top-level global and Indian market performance panel."""
+    st.divider()
+    st.header("Global / Macro Performance")
+    st.caption(
+        "Latest available market quote: 5-minute Yahoo bars where available; otherwise latest daily close. "
+        "The market board is independent of the selected primary Angel/Yahoo candle source."
+    )
+    if st.button("Refresh Global + Indian Market Data", key="refresh_global_india_market_board"):
+        fetch_yahoo_batch.clear()
+    with st.spinner("Refreshing global indices, macro instruments and major Indian stocks…"):
+        global_rows, indian_rows = build_live_market_board_rows()
+    st.caption(f"Board checked: {datetime.now().strftime('%d-%b-%Y %H:%M:%S')} | Yahoo batch cache: 30 seconds")
+    _render_market_quote_grid(global_rows, columns_per_row=5)
+    unavailable_global = sum(pd.isna(row.get("Price", np.nan)) for row in global_rows)
+    if unavailable_global:
+        st.warning(f"{unavailable_global} global/macro instruments returned no quote. They remain N/A rather than showing stale values from another symbol.")
+
+    st.subheader("🇮🇳 Major Indian Stocks — Banks, IT, Auto and Index Leaders")
+    _render_market_quote_grid(indian_rows, columns_per_row=5)
+    unavailable_indian = sum(pd.isna(row.get("Price", np.nan)) for row in indian_rows)
+    if unavailable_indian:
+        st.warning(f"{unavailable_indian} Indian stocks returned no quote in this Yahoo batch. Check the symbol and provider availability.")
+    st.caption(
+        "Source: Yahoo Finance. Yahoo data latency differs by exchange and instrument. "
+        "GIFT Nifty is shown only when its Yahoo futures symbol resolves; otherwise the card is explicitly labelled as a NIFTY spot proxy."
+    )
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -3698,6 +3899,11 @@ if refresh_market_now:
     build_nifty_top30_scanner.clear()
     st.session_state["angel_history_cache"] = {}
 
+# Keep this above the OHLC no-data guard: the global/macro and Indian share
+# boards must continue to refresh even if the selected primary chart feed fails.
+if auto_refresh and AUTO_REFRESH_AVAILABLE:
+    st_autorefresh(interval=refresh_seconds * 1000, key="elite_live_market_board_refresh")
+
 with st.expander("Telegram Alert Settings"):
     telegram_enabled = st.checkbox("Enable Telegram Alerts", value=False)
     telegram_bot_token = st.text_input("Telegram Bot Token", type="password")
@@ -3834,6 +4040,11 @@ if debug_mode:
         "Authenticated Angel session present": bool(_debug_cached_session_data),
         "Session matches API Key + Client Code": _debug_cache_match,
     })
+
+# This board intentionally renders before the selected OHLC pipeline. It remains
+# visible if Angel/Yahoo chart candles are unavailable later in the script.
+render_live_global_india_market_board()
+
 
 ticker = stocks[selected]
 
@@ -4076,8 +4287,10 @@ if data.empty:
         except Exception as error_read_exc:
             st.caption(f"Could not read local error log: {error_read_exc}")
     st.info("On Sundays/market holidays, live ticks are not expected. Historical candles from prior sessions should still be available; use the Angel candle response above to identify broker/API errors.")
-    if auto_refresh:
-        st.caption("Auto-refresh is paused while the selected source has no valid OHLC data. Use the Refresh market data and scanner button above.")
+    if auto_refresh and AUTO_REFRESH_AVAILABLE:
+        st.caption("Auto-refresh remains active for the Global/Macro and Major Indian Stocks market board. The chart waits for valid OHLC candles.")
+    elif auto_refresh and not AUTO_REFRESH_AVAILABLE:
+        st.warning("Auto-refresh is enabled but streamlit-autorefresh is not installed. Install requirements.txt and redeploy.")
     st.stop()
 
 if active_data_source != data_source:
@@ -4642,9 +4855,5 @@ if debug_mode:
     st.write("Angel LTP diagnostics:", st.session_state.get("angel_last_ltp_diagnostic", {"status": "not_requested"}))
 
 
-# Auto-refresh is deliberately rendered after dashboard output so it cannot
-# interrupt the first market-data request during initial page load.
-if auto_refresh and AUTO_REFRESH_AVAILABLE:
-    st_autorefresh(interval=refresh_seconds * 1000, key="elite_ultimate_refresh_after_dashboard")
-elif auto_refresh and not AUTO_REFRESH_AVAILABLE:
+if auto_refresh and not AUTO_REFRESH_AVAILABLE:
     st.caption("Auto-refresh helper is not installed; use the manual browser refresh or install streamlit-autorefresh.")
