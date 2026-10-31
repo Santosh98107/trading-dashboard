@@ -16,7 +16,7 @@ import streamlit as st
 import yfinance as yf
 
 # Visible deployment marker: confirms which source file Streamlit Cloud is running.
-APP_BUILD_ID = "2026-11-01-MANUAL-AUTO-PASSWORD-11"
+APP_BUILD_ID = "2026-11-01-PAPER-EXIT-MODE-CLEAN-13"
 # Optional integrations: Yahoo mode must still start if Angel SDK/TOTP or
 # the auto-refresh helper is not installed.
 try:
@@ -225,14 +225,17 @@ def init_users():
 
 
 def init_journal():
+    """Create the paper journal with backward-compatible partial-exit fields."""
     if not os.path.exists(JOURNAL_FILE):
         cols = [
-            "DateTime", "Symbol", "Timeframe", "Signal", "EntryPrice", "ExitPrice",
-            "Quantity", "StopLoss", "Target1", "Target2", "Target3", "TrailingStop",
-            "Status", "PnL", "PnLPercent", "Notes", "Result", "T1_Hit", "T2_Hit", "T3_Hit",
+            "DateTime", "Symbol", "Timeframe", "Signal", "Side", "EntryPrice", "ExitPrice",
+            "Quantity", "RemainingQty", "StopLoss", "Target1", "Target2", "Target3", "TrailingStop",
+            "ATR", "AutoExitEnabled", "Status", "PnL", "RealizedPnL", "PnLPercent", "Notes",
+            "Result", "T1_Hit", "T2_Hit", "T3_Hit", "LastPrice", "LastUpdateTime",
             "TradeQualityScore", "ValidationScore", "StrategyGrade"
         ]
         safe_write_csv(pd.DataFrame(columns=cols), JOURNAL_FILE)
+
 
 
 def init_paper_state():
@@ -316,8 +319,46 @@ def init_signal_audit():
 # LOAD / SAVE
 # =========================================================
 def load_journal():
+    """Load the journal and migrate older CSVs in memory without losing trades."""
     init_journal()
-    return safe_read_csv(JOURNAL_FILE, pd.DataFrame())
+    journal = safe_read_csv(JOURNAL_FILE, pd.DataFrame())
+    if journal.empty:
+        for text_col in ["Symbol", "Timeframe", "Signal", "Side", "Status", "Notes", "Result", "StrategyGrade", "LastUpdateTime"]:
+            if text_col in journal.columns:
+                journal[text_col] = journal[text_col].astype(object)
+        return journal
+    changed = False
+    defaults = {
+        "Side": "", "RemainingQty": np.nan, "RealizedPnL": 0.0, "ATR": np.nan,
+        "AutoExitEnabled": False, "LastPrice": np.nan, "LastUpdateTime": ""
+    }
+    for col, default in defaults.items():
+        if col not in journal.columns:
+            journal[col] = default
+            changed = True
+    # Keep text/status fields object-typed so older CSVs with blank cells can accept later updates.
+    for text_col in ["Symbol", "Timeframe", "Signal", "Side", "Status", "Notes", "Result", "StrategyGrade", "LastUpdateTime"]:
+        if text_col in journal.columns:
+            journal[text_col] = journal[text_col].fillna("").astype(object)
+    if "Quantity" in journal.columns:
+        qty = pd.to_numeric(journal["Quantity"], errors="coerce").fillna(0.0)
+        rem = pd.to_numeric(journal["RemainingQty"], errors="coerce")
+        missing_rem = rem.isna()
+        if missing_rem.any():
+            status = journal.get("Status", pd.Series("OPEN", index=journal.index)).astype(str).str.upper()
+            rem.loc[missing_rem] = np.where(status.loc[missing_rem].eq("OPEN"), qty.loc[missing_rem], 0.0)
+            journal["RemainingQty"] = rem
+            changed = True
+        if "Side" in journal.columns:
+            sig = journal.get("Signal", pd.Series("", index=journal.index)).astype(str).str.upper()
+            side_blank = journal["Side"].astype(str).str.strip().eq("")
+            journal.loc[side_blank, "Side"] = np.where(sig.loc[side_blank].str.contains("SELL|PUT", regex=True), "SELL", "BUY")
+            if side_blank.any():
+                changed = True
+    if changed:
+        safe_write_csv(journal, JOURNAL_FILE)
+    return journal
+
 
 
 def save_journal(df):
@@ -335,7 +376,7 @@ def load_paper_state():
 
 
 def save_paper_state(df):
-    safe_write_csv(df, PAPER_STATE_FILE)
+    return safe_write_csv(df, PAPER_STATE_FILE)
 
 
 def load_risk_state():
@@ -1955,7 +1996,7 @@ def blank_nifty_scanner_frame():
 def render_nifty_scanner_result(scanner_df):
     """Render a scanner table only from real provider values; missing values stay N/A."""
     if scanner_df is None or scanner_df.empty:
-        st.warning("Yahoo Finance did not return scanner rows. Check outbound network access and Recent App Errors.")
+        st.warning("Yahoo Finance did not return scanner rows. Check network access, provider availability and instrument symbols.")
         return
     breadth = scanner_breadth_summary(scanner_df)
     st.markdown("**NIFTY market breadth by timeframe**")
@@ -3026,180 +3067,481 @@ def calculate_position_size(entry_price, stop_loss, paper_balance):
     return max(1, qty)
 
 
-def paper_trade_entry(price, quantity):
-    state = load_paper_state()
-    bal = float(state.loc[0, "Balance"])
-    used = float(state.loc[0, "UsedMargin"])
-    cost = price * quantity
-    if bal >= cost:
-        state.loc[0, "Balance"] = bal - cost
-        state.loc[0, "UsedMargin"] = used + cost
+def paper_trade_entry(price, quantity, side="BUY"):
+    """Reserve virtual cash/margin for either a paper long or paper short."""
+    try:
+        price = float(price)
+        quantity = int(quantity)
+        side = str(side).upper()
+        if not np.isfinite(price) or price <= 0 or quantity <= 0 or side not in ("BUY", "SELL"):
+            return False
+        state = load_paper_state()
+        bal = float(state.loc[0, "Balance"])
+        used = float(state.loc[0, "UsedMargin"])
+        reserved = price * quantity
+        # This simulator reserves full notional for both long and short positions.
+        if bal + 1e-9 < reserved:
+            return False
+        state.loc[0, "Balance"] = bal - reserved
+        state.loc[0, "UsedMargin"] = used + reserved
         state.loc[0, "OpenPositions"] = int(state.loc[0, "OpenPositions"]) + 1
-        save_paper_state(state)
-        return True
-    return False
+        return save_paper_state(state)
+    except Exception as exc:
+        log_app_error("paper_trade_entry", exc)
+        return False
 
 
-def paper_trade_exit(entry_price, exit_price, quantity, signal):
+
+def paper_trade_exit(entry_price, exit_price, quantity, signal, final_close=True):
+    """Release reserved notional and credit/debit simulated P&L."""
     state = load_paper_state()
     bal = float(state.loc[0, "Balance"])
     used = float(state.loc[0, "UsedMargin"])
-    invested = entry_price * quantity
-
-    if "BUY" in signal.upper() or "CALL" in signal.upper():
-        pnl = (exit_price - entry_price) * quantity
-    else:
-        pnl = (entry_price - exit_price) * quantity
-
-    state.loc[0, "Balance"] = bal + invested + pnl
-    state.loc[0, "UsedMargin"] = max(0.0, used - invested)
-    state.loc[0, "OpenPositions"] = max(0, int(state.loc[0, "OpenPositions"]) - 1)
+    entry_price = float(entry_price)
+    exit_price = float(exit_price)
+    quantity = float(quantity)
+    reserved = entry_price * quantity
+    is_long = "BUY" in str(signal).upper() or "CALL" in str(signal).upper()
+    pnl = (exit_price - entry_price) * quantity if is_long else (entry_price - exit_price) * quantity
+    state.loc[0, "Balance"] = bal + reserved + pnl
+    state.loc[0, "UsedMargin"] = max(0.0, used - reserved)
+    state.loc[0, "OpenPositions"] = max(0, int(state.loc[0, "OpenPositions"]) - (1 if final_close and quantity > 0 else 0))
     save_paper_state(state)
-    return pnl
+    return float(pnl)
 
 
-def add_trade_to_journal(symbol, timeframe, signal, entry_price, quantity, stop_loss, target1, target2, target3, trailing_stop, analysis, notes=""):
+
+def get_suggested_paper_levels(analysis, side, entry_price):
+    """Return side-correct suggested levels; ATR fallback is explicitly a simulation plan."""
+    side = str(side).upper()
+    entry = float(entry_price)
+    atr = float(analysis.get("atr") or 0.0)
+    risk = min(max(atr if np.isfinite(atr) else 0.0, entry * 0.003, 0.01), entry * 0.20)
+    same_signal = (side == "BUY" and analysis.get("signal_type") == "buy") or (side == "SELL" and analysis.get("signal_type") == "sell")
+    if same_signal:
+        sl = analysis.get("stop_loss")
+        t1, t2, t3 = analysis.get("target1"), analysis.get("target2"), analysis.get("target3")
+        try:
+            sl, t1, t2, t3 = float(sl), float(t1), float(t2), float(t3)
+            valid = (sl < entry < t1 < t2 < t3) if side == "BUY" else (t3 < t2 < t1 < entry < sl)
+            if not valid:
+                raise ValueError("Signal levels are not on the correct side")
+        except Exception:
+            sl = t1 = t2 = t3 = None
+    else:
+        sl = t1 = t2 = t3 = None
+    if sl is None:
+        if side == "BUY":
+            sl, t1, t2, t3 = entry - risk, entry + 2 * risk, entry + 3 * risk, entry + 4 * risk
+        else:
+            sl, t1, t2, t3 = entry + risk, entry - 2 * risk, entry - 3 * risk, entry - 4 * risk
+    trailing = sl
+    return {
+        "side": side, "entry": entry, "stop_loss": float(sl),
+        "target1": float(t1), "target2": float(t2), "target3": float(t3),
+        "trailing_stop": float(trailing), "atr": float(atr if atr > 0 else risk)
+    }
+
+
+def add_trade_to_journal(symbol, timeframe, signal, entry_price, quantity, stop_loss, target1, target2, target3,
+                         trailing_stop, analysis, notes="", auto_exit=True, atr=None):
     journal = load_journal()
+    side = "SELL" if "SELL" in str(signal).upper() else "BUY"
     new_row = {
-        "DateTime": now_str(),
-        "Symbol": symbol,
-        "Timeframe": timeframe,
-        "Signal": signal,
-        "EntryPrice": entry_price,
-        "ExitPrice": np.nan,
-        "Quantity": quantity,
-        "StopLoss": stop_loss,
-        "Target1": target1,
-        "Target2": target2,
-        "Target3": target3,
-        "TrailingStop": trailing_stop,
-        "Status": "OPEN",
-        "PnL": np.nan,
-        "PnLPercent": np.nan,
-        "Notes": notes,
-        "Result": "",
-        "T1_Hit": False,
-        "T2_Hit": False,
-        "T3_Hit": False,
+        "DateTime": now_str(), "Symbol": symbol, "Timeframe": timeframe,
+        "Signal": side, "Side": side, "EntryPrice": float(entry_price), "ExitPrice": np.nan,
+        "Quantity": int(quantity), "RemainingQty": int(quantity), "StopLoss": float(stop_loss),
+        "Target1": float(target1), "Target2": float(target2), "Target3": float(target3),
+        "TrailingStop": float(trailing_stop), "ATR": float(atr if atr is not None else analysis.get("atr", 0.0)),
+        "AutoExitEnabled": bool(auto_exit), "Status": "OPEN", "PnL": 0.0, "RealizedPnL": 0.0,
+        "PnLPercent": 0.0, "Notes": notes, "Result": "", "T1_Hit": False, "T2_Hit": False,
+        "T3_Hit": False, "LastPrice": float(entry_price), "LastUpdateTime": now_str(),
         "TradeQualityScore": analysis.get("trade_quality_score", 0),
         "ValidationScore": analysis.get("validation_score", 0),
         "StrategyGrade": analysis.get("strategy_grade", "D")
     }
     journal = pd.concat([journal, pd.DataFrame([new_row])], ignore_index=True)
     save_journal(journal)
+    return True
+
 
 
 def close_trade_in_journal(index_id, exit_price, result=None, t1_hit=None, t2_hit=None, t3_hit=None):
+    """Legacy compatibility closer; closes the position's currently remaining quantity."""
     journal = load_journal()
-    if index_id in journal.index:
-        row = journal.loc[index_id]
-        entry = float(row["EntryPrice"])
-        qty = float(row["Quantity"])
-        signal = str(row["Signal"]).upper()
+    if index_id not in journal.index:
+        return False
+    row = journal.loc[index_id]
+    entry = float(row["EntryPrice"])
+    qty = float(row.get("RemainingQty", row["Quantity"]))
+    side = str(row.get("Side", row["Signal"])).upper()
+    if qty <= 0:
+        return False
+    pnl = paper_trade_exit(entry, float(exit_price), qty, side)
+    prior = float(row.get("RealizedPnL", 0.0) or 0.0)
+    total = prior + pnl
+    journal.at[index_id, "RemainingQty"] = 0
+    journal.at[index_id, "RealizedPnL"] = total
+    journal.at[index_id, "ExitPrice"] = float(exit_price)
+    journal.at[index_id, "Status"] = "CLOSED"
+    journal.at[index_id, "PnL"] = round(total, 2)
+    journal.at[index_id, "PnLPercent"] = round((total / (entry * float(row["Quantity"])) * 100) if entry else 0, 2)
+    journal.at[index_id, "Result"] = result or ("WIN" if total > 0 else "LOSS" if total < 0 else "BREAKEVEN")
+    journal.at[index_id, "LastPrice"] = float(exit_price)
+    journal.at[index_id, "LastUpdateTime"] = now_str()
+    for col, value in (("T1_Hit", t1_hit), ("T2_Hit", t2_hit), ("T3_Hit", t3_hit)):
+        if value is not None:
+            journal.at[index_id, col] = bool(value)
+    save_journal(journal)
+    return True
 
-        if "BUY" in signal or "CALL" in signal:
-            pnl = (exit_price - entry) * qty
-            pnl_pct = ((exit_price - entry) / entry) * 100 if entry else 0
-        else:
-            pnl = (entry - exit_price) * qty
-            pnl_pct = ((entry - exit_price) / entry) * 100 if entry else 0
-
-        journal.at[index_id, "ExitPrice"] = exit_price
-        journal.at[index_id, "Status"] = "CLOSED"
-        journal.at[index_id, "PnL"] = round(pnl, 2)
-        journal.at[index_id, "PnLPercent"] = round(pnl_pct, 2)
-        journal.at[index_id, "Result"] = result if result else ("WIN" if pnl > 0 else "LOSS")
-        if t1_hit is not None:
-            journal.at[index_id, "T1_Hit"] = bool(t1_hit)
-        if t2_hit is not None:
-            journal.at[index_id, "T2_Hit"] = bool(t2_hit)
-        if t3_hit is not None:
-            journal.at[index_id, "T3_Hit"] = bool(t3_hit)
-        save_journal(journal)
 
 
-def auto_paper_trade_exit(current_price):
+def _paper_bool(value, default=False):
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on", "enabled"}
     try:
+        return bool(value)
+    except Exception:
+        return default
+
+
+
+def render_paper_exit_mode_selector():
+    """Offer an explicit Manual or Auto Exit mode; Manual is the safe default."""
+    valid_modes = {"Manual Exit", "Auto Exit (Enabled)"}
+    if st.session_state.get("paper_exit_mode") not in valid_modes:
+        st.session_state["paper_exit_mode"] = "Manual Exit"
+    mode = st.radio(
+        "Exit Management Mode",
+        options=["Manual Exit", "Auto Exit (Enabled)"],
+        horizontal=True,
+        key="paper_exit_mode",
+        help=(
+            "Manual Exit: positions remain open until you press CLOSE. "
+            "Auto Exit: the selected symbol is monitored on Streamlit reruns/auto-refresh "
+            "and may scale out at targets or close at stop/trailing stop."
+        ),
+    )
+    enabled = mode == "Auto Exit (Enabled)"
+    if enabled:
+        st.success("AUTO EXIT ENABLED — keep Auto Refresh ON and keep the position's symbol selected.")
+    else:
+        st.info("MANUAL EXIT MODE — positions close only when you press CLOSE.")
+    return enabled
+
+
+def sync_open_position_auto_exit(enabled, journal=None):
+    """Apply the selected Manual/Auto mode to every currently open paper journal row."""
+    if journal is None:
+        journal = load_journal()
+    if journal.empty:
+        return journal
+    if "AutoExitEnabled" not in journal.columns:
+        journal["AutoExitEnabled"] = False
+    status = journal.get("Status", pd.Series("", index=journal.index)).astype(str).str.upper()
+    open_mask = status.eq("OPEN")
+    if not open_mask.any():
+        return journal
+    current_flags = journal.loc[open_mask, "AutoExitEnabled"].map(lambda value: _paper_bool(value, False))
+    if not current_flags.eq(bool(enabled)).all():
+        journal.loc[open_mask, "AutoExitEnabled"] = bool(enabled)
+        save_journal(journal)
+    return journal
+
+
+def _paper_side_pnl(entry, exit_price, quantity, side):
+    return (exit_price - entry) * quantity if str(side).upper() == "BUY" else (entry - exit_price) * quantity
+
+
+def close_paper_position(index_id, exit_price, reason="Manual Close"):
+    """Close all remaining units of one paper position at the supplied simulated price."""
+    journal = load_journal()
+    if journal.empty or index_id not in journal.index:
+        return False, "Paper position was not found."
+    row = journal.loc[index_id]
+    if str(row.get("Status", "")).upper() != "OPEN":
+        return False, "This paper position is already closed."
+    try:
+        entry = float(row["EntryPrice"])
+        qty = int(float(row.get("RemainingQty", row["Quantity"])))
+        exit_price = float(exit_price)
+        side = str(row.get("Side", row["Signal"])).upper()
+        if qty <= 0 or exit_price <= 0 or not np.isfinite(exit_price):
+            return False, "Invalid quantity or exit price."
+        pnl = paper_trade_exit(entry, exit_price, qty, side)
+        prior = float(row.get("RealizedPnL", 0.0) or 0.0)
+        total = prior + pnl
+        journal.at[index_id, "RemainingQty"] = 0
+        journal.at[index_id, "RealizedPnL"] = total
+        journal.at[index_id, "ExitPrice"] = exit_price
+        journal.at[index_id, "LastPrice"] = exit_price
+        journal.at[index_id, "LastUpdateTime"] = now_str()
+        journal.at[index_id, "Status"] = "CLOSED"
+        journal.at[index_id, "PnL"] = round(total, 2)
+        initial_notional = entry * float(row.get("Quantity", qty))
+        journal.at[index_id, "PnLPercent"] = round((total / initial_notional * 100) if initial_notional else 0.0, 2)
+        journal.at[index_id, "Result"] = "WIN" if total > 0 else "LOSS" if total < 0 else "BREAKEVEN"
+        journal.at[index_id, "Notes"] = (str(row.get("Notes", "")) + f" | {reason}").strip(" |")
+        save_journal(journal)
+        return True, f"Paper position closed. Total realized P&L: ₹{total:,.2f}"
+    except Exception as exc:
+        log_app_error("close_paper_position", exc)
+        return False, f"Could not close paper position: {exc}"
+
+
+def _paper_partial_exit(index_id, exit_price, quantity, target_flag=None):
+    """Execute a virtual partial exit and update remaining quantity/realized P&L."""
+    journal = load_journal()
+    if journal.empty or index_id not in journal.index:
+        return False
+    row = journal.loc[index_id]
+    if str(row.get("Status", "")).upper() != "OPEN":
+        return False
+    entry = float(row["EntryPrice"])
+    side = str(row.get("Side", row["Signal"])).upper()
+    remaining = int(float(row.get("RemainingQty", row["Quantity"])))
+    q = min(remaining, max(0, int(quantity)))
+    if q <= 0:
+        return False
+    pnl = paper_trade_exit(entry, float(exit_price), q, side, final_close=(q >= remaining))
+    total_realized = float(row.get("RealizedPnL", 0.0) or 0.0) + pnl
+    new_remaining = remaining - q
+    journal.at[index_id, "RemainingQty"] = new_remaining
+    journal.at[index_id, "RealizedPnL"] = total_realized
+    journal.at[index_id, "PnL"] = round(total_realized, 2)
+    journal.at[index_id, "LastPrice"] = float(exit_price)
+    journal.at[index_id, "LastUpdateTime"] = now_str()
+    if target_flag:
+        journal.at[index_id, target_flag] = True
+    if new_remaining <= 0:
+        journal.at[index_id, "RemainingQty"] = 0
+        journal.at[index_id, "ExitPrice"] = float(exit_price)
+        journal.at[index_id, "Status"] = "CLOSED"
+        journal.at[index_id, "Result"] = "WIN" if total_realized > 0 else "LOSS" if total_realized < 0 else "BREAKEVEN"
+        initial_notional = entry * float(row.get("Quantity", q))
+        journal.at[index_id, "PnLPercent"] = round((total_realized / initial_notional * 100) if initial_notional else 0.0, 2)
+    save_journal(journal)
+    return True
+
+
+def auto_paper_trade_exit(current_price, symbol=None, atr=None):
+    """Auto-manage only the currently selected symbol; scale out at T1/T2 and close at T3/SL."""
+    try:
+        price = float(current_price)
+        if not np.isfinite(price) or price <= 0:
+            return {"closed": 0, "partial": 0, "updated": 0}
         journal = load_journal()
         if journal.empty:
-            return 0
-
-        open_trades = journal[journal["Status"] == "OPEN"].copy()
-        if open_trades.empty:
-            return 0
-
-        closed_count = 0
-        for idx, row in open_trades.iterrows():
-            signal = str(row["Signal"]).upper()
+            return {"closed": 0, "partial": 0, "updated": 0}
+        open_rows = journal[journal["Status"].astype(str).str.upper().eq("OPEN")].copy()
+        closed_count = partial_count = updated_count = 0
+        for idx, original in open_rows.iterrows():
+            if symbol and str(original.get("Symbol", "")) != str(symbol):
+                continue
+            if not _paper_bool(original.get("AutoExitEnabled", False), False):
+                continue
+            # Refresh the row after any partial operation.
+            journal = load_journal()
+            if idx not in journal.index or str(journal.at[idx, "Status"]).upper() != "OPEN":
+                continue
+            row = journal.loc[idx]
+            side = str(row.get("Side", row.get("Signal", "BUY"))).upper()
+            is_long = side == "BUY"
             entry = float(row["EntryPrice"])
-            sl = float(row["StopLoss"]) if pd.notna(row["StopLoss"]) else None
-            t1 = float(row["Target1"]) if pd.notna(row["Target1"]) else None
-            t2 = float(row["Target2"]) if pd.notna(row["Target2"]) else None
-            t3 = float(row["Target3"]) if pd.notna(row["Target3"]) else None
-            qty = float(row["Quantity"])
+            initial_qty = int(float(row.get("Quantity", 1)))
+            rem_qty = int(float(row.get("RemainingQty", initial_qty)))
+            if rem_qty <= 0:
+                continue
+            row_atr = row.get("ATR", np.nan)
+            try:
+                atr_value = float(row_atr) if pd.notna(row_atr) and float(row_atr) > 0 else float(atr or 0.0)
+            except Exception:
+                atr_value = float(atr or 0.0)
+            trail_gap = max(0.5 * atr_value, entry * 0.0005, 0.01)
+            old_trail = row.get("TrailingStop", row.get("StopLoss", np.nan))
+            try:
+                old_trail = float(old_trail) if pd.notna(old_trail) else float(row["StopLoss"])
+            except Exception:
+                old_trail = float(row["StopLoss"])
+            new_trail = max(old_trail, price - trail_gap) if is_long else min(old_trail, price + trail_gap)
+            journal.at[idx, "TrailingStop"] = new_trail
+            journal.at[idx, "LastPrice"] = price
+            journal.at[idx, "LastUpdateTime"] = now_str()
+            save_journal(journal)
 
-            t1_hit = False
-            t2_hit = False
-            t3_hit = False
-            exit_price = None
-            result = None
+            stop_loss = float(row["StopLoss"])
+            effective_stop = max(stop_loss, new_trail) if is_long else min(stop_loss, new_trail)
+            stop_hit = price <= effective_stop if is_long else price >= effective_stop
+            if stop_hit:
+                ok, _ = close_paper_position(idx, price, "Auto Exit — Stop Loss / Trailing Stop")
+                if ok:
+                    closed_count += 1
+                continue
 
-            if "BUY" in signal:
-                if t1 is not None and current_price >= t1:
-                    t1_hit = True
-                if t2 is not None and current_price >= t2:
-                    t2_hit = True
-                if t3 is not None and current_price >= t3:
-                    t3_hit = True
-
-                if sl is not None and current_price <= sl:
-                    exit_price = sl
-                    result = "LOSS"
-                elif t3 is not None and current_price >= t3:
-                    exit_price = t3
-                    result = "WIN"
-                elif t2 is not None and current_price >= t2:
-                    exit_price = t2
-                    result = "WIN"
-                elif t1 is not None and current_price >= t1:
-                    exit_price = t1
-                    result = "WIN"
-
-            else:
-                if t1 is not None and current_price <= t1:
-                    t1_hit = True
-                if t2 is not None and current_price <= t2:
-                    t2_hit = True
-                if t3 is not None and current_price <= t3:
-                    t3_hit = True
-
-                if sl is not None and current_price >= sl:
-                    exit_price = sl
-                    result = "LOSS"
-                elif t3 is not None and current_price <= t3:
-                    exit_price = t3
-                    result = "WIN"
-                elif t2 is not None and current_price <= t2:
-                    exit_price = t2
-                    result = "WIN"
-                elif t1 is not None and current_price <= t1:
-                    exit_price = t1
-                    result = "WIN"
-
-            if exit_price is not None:
-                pnl = paper_trade_exit(entry, exit_price, qty, signal)
-                close_trade_in_journal(idx, exit_price, result=result, t1_hit=t1_hit, t2_hit=t2_hit, t3_hit=t3_hit)
+            target_specs = [
+                ("T1_Hit", "Target1", 0.34),
+                ("T2_Hit", "Target2", 0.33),
+                ("T3_Hit", "Target3", 1.00),
+            ]
+            for flag, target_col, fraction in target_specs:
+                journal = load_journal()
+                if idx not in journal.index or str(journal.at[idx, "Status"]).upper() != "OPEN":
+                    break
+                row_now = journal.loc[idx]
+                if _paper_bool(row_now.get(flag, False), False):
+                    continue
+                target = row_now.get(target_col, np.nan)
+                if pd.isna(target):
+                    continue
+                target = float(target)
+                target_hit = price >= target if is_long else price <= target
+                if not target_hit:
+                    continue
+                current_remaining = int(float(row_now.get("RemainingQty", row_now["Quantity"])))
+                if fraction >= 1.0:
+                    q_exit = current_remaining
+                else:
+                    q_exit = min(current_remaining, max(1, int(round(initial_qty * fraction))))
+                if _paper_partial_exit(idx, target, q_exit, target_flag=flag):
+                    partial_count += 1
+                    # After T1 protect the remainder around breakeven; after T2 protect T1.
+                    journal = load_journal()
+                    if idx in journal.index and str(journal.at[idx, "Status"]).upper() == "OPEN":
+                        protect_level = entry if flag == "T1_Hit" else float(row_now.get("Target1", entry))
+                        existing = float(journal.at[idx, "TrailingStop"])
+                        tightened = max(existing, protect_level) if is_long else min(existing, protect_level)
+                        journal.at[idx, "TrailingStop"] = tightened
+                        save_journal(journal)
+            # Count a fully closed position once; partial_count tracks scale-outs.
+            final_journal = load_journal()
+            if idx in final_journal.index and str(final_journal.at[idx, "Status"]).upper() == "CLOSED":
                 closed_count += 1
+            updated_count += 1
+        return {"closed": closed_count, "partial": partial_count, "updated": updated_count}
+    except Exception as exc:
+        log_app_error("auto_paper_trade_exit", exc)
+        return {"closed": 0, "partial": 0, "updated": 0}
 
-        return closed_count
-    except Exception as e:
-        log_app_error("auto_paper_trade_exit", e)
-        return 0
 
 
 # =========================================================
 # BACKTEST / WALK FORWARD / SHARPE
 # =========================================================
+
+def render_paper_trading_no_data_controls(selected, timeframe, current_price=None):
+    """Keep virtual paper controls usable when the provider has no valid OHLC quote."""
+    st.subheader("Paper Trading — Manual / Auto Exit | Market Feed Unavailable")
+    st.caption("Virtual orders only; no broker orders are sent. Signal scores/PCR need provider data. Auto Exit can use a valid Angel LTP when available; otherwise it waits for the market feed. Enter a manual price only when you know the current traded price.")
+    state = load_paper_state()
+    journal = load_journal()
+    auto_enabled = render_paper_exit_mode_selector()
+    journal = sync_open_position_auto_exit(auto_enabled, journal)
+
+    # In the no-OHLC branch, a valid Angel LTP can still manage the selected
+    # symbol. If no live quote exists, Auto Exit stays armed and waits safely.
+    if auto_enabled:
+        try:
+            valid_price = float(current_price) if current_price is not None else 0.0
+        except Exception:
+            valid_price = 0.0
+        if np.isfinite(valid_price) and valid_price > 0:
+            auto_result = auto_paper_trade_exit(valid_price, symbol=selected, atr=None)
+            if auto_result.get("closed", 0) or auto_result.get("partial", 0):
+                st.success(
+                    f"Auto Exit: {auto_result.get('closed', 0)} position(s) closed; "
+                    f"{auto_result.get('partial', 0)} target scale-out(s) completed."
+                )
+        else:
+            st.warning("Auto Exit is ENABLED but waiting for a valid selected-symbol market price. It will manage this symbol on the next refresh after a price is available.")
+
+    # Re-read the account after any automatic partial/full exit before showing balances.
+    state = load_paper_state()
+    journal = load_journal()
+    balance = float(state.loc[0, "Balance"])
+    used = float(state.loc[0, "UsedMargin"])
+    open_rows = journal[journal.get("Status", pd.Series(dtype=str)).astype(str).str.upper().eq("OPEN")].copy() if not journal.empty else pd.DataFrame()
+    realized = 0.0
+    if not journal.empty:
+        if "RealizedPnL" in journal.columns:
+            realized += pd.to_numeric(journal["RealizedPnL"], errors="coerce").fillna(0).sum()
+        if "PnL" in journal.columns:
+            closed_mask = journal.get("Status", pd.Series("", index=journal.index)).astype(str).str.upper().eq("CLOSED")
+            zero_realized = pd.to_numeric(journal.get("RealizedPnL", pd.Series(0, index=journal.index)), errors="coerce").fillna(0).eq(0)
+            realized += pd.to_numeric(journal.loc[closed_mask & zero_realized, "PnL"], errors="coerce").fillna(0).sum()
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.metric("Paper Cash", f"₹{balance:,.2f}")
+    with c2:
+        st.metric("Used Virtual Margin", f"₹{used:,.2f}")
+    with c3:
+        st.metric("Realized Paper P&L", f"₹{realized:,.2f}")
+    with c4:
+        st.metric("Open Positions", int(len(open_rows)))
+    st.write("Bullish Score: N/A  |  Bearish Score: N/A  |  PCR: N/A — valid candles/option-chain data are unavailable.")
+    with st.expander("Open a manual paper position", expanded=True):
+        entry_price = st.number_input("Manual paper entry price (₹)", min_value=0.0, value=0.0, step=0.05, key="paper_no_data_entry_price")
+        atr_value = st.number_input("ATR estimate (optional; zero uses a small percentage fallback)", min_value=0.0, value=0.0, step=0.05, key="paper_no_data_atr")
+        qty = st.number_input("Quantity", min_value=1, max_value=1000000, value=1, step=1, key="paper_no_data_qty")
+        if entry_price > 0:
+            buy_plan = get_suggested_paper_levels({"atr": atr_value, "signal_type": "neutral"}, "BUY", entry_price)
+            sell_plan = get_suggested_paper_levels({"atr": atr_value, "signal_type": "neutral"}, "SELL", entry_price)
+            st.write({"BUY": {"Entry": round(buy_plan["entry"], 2), "SL": round(buy_plan["stop_loss"], 2), "T1": round(buy_plan["target1"], 2), "T2": round(buy_plan["target2"], 2), "T3": round(buy_plan["target3"], 2), "Trailing SL": round(buy_plan["trailing_stop"], 2)}, "SELL": {"Entry": round(sell_plan["entry"], 2), "SL": round(sell_plan["stop_loss"], 2), "T1": round(sell_plan["target1"], 2), "T2": round(sell_plan["target2"], 2), "T3": round(sell_plan["target3"], 2), "Trailing SL": round(sell_plan["trailing_stop"], 2)}})
+        b1, b2 = st.columns(2)
+        with b1:
+            buy_manual = st.button("BUY / LONG", key="paper_no_data_buy", use_container_width=True)
+        with b2:
+            sell_manual = st.button("SELL / SHORT", key="paper_no_data_sell", use_container_width=True)
+        if buy_manual or sell_manual:
+            side = "BUY" if buy_manual else "SELL"
+            no_data_risk_ok, no_data_risk_message = risk_check_before_trade()
+            if entry_price <= 0:
+                st.error("Enter a valid manual entry price first.")
+            elif not no_data_risk_ok:
+                st.error(f"Paper order blocked by risk controls: {no_data_risk_message}")
+            elif entry_price * int(qty) > balance:
+                st.error("Insufficient virtual cash for the requested quantity.")
+            else:
+                analysis_stub = {"atr": atr_value, "signal_type": "neutral", "trade_quality_score": 0, "validation_score": 0, "strategy_grade": "N/A"}
+                plan = get_suggested_paper_levels(analysis_stub, side, entry_price)
+                if paper_trade_entry(entry_price, int(qty), side=side):
+                    add_trade_to_journal(selected, timeframe, side, entry_price, int(qty), plan["stop_loss"], plan["target1"], plan["target2"], plan["target3"], plan["trailing_stop"], analysis_stub, notes="Manual price paper entry while market feed unavailable", auto_exit=auto_enabled, atr=plan["atr"])
+                    st.success(f"Manual paper {side} position opened. No real order was sent.")
+                    st.rerun()
+                else:
+                    st.error("Paper account could not reserve the required virtual cash.")
+    st.markdown("**Open paper positions — manual close**")
+    if open_rows.empty:
+        st.info("No open paper positions.")
+    else:
+        for idx, pos in open_rows.iterrows():
+            entry = float(pos["EntryPrice"])
+            try:
+                last = float(pos.get("LastPrice", entry))
+                if not np.isfinite(last) or last <= 0:
+                    last = entry
+            except Exception:
+                last = entry
+            with st.container(border=True):
+                st.write(f"**{pos.get('Symbol', 'N/A')} — {pos.get('Side', pos.get('Signal', 'N/A'))}** · Remaining {int(float(pos.get('RemainingQty', pos.get('Quantity', 0))))} · Entry ₹{entry:,.2f}")
+                exit_price = st.number_input("Manual exit price (₹)", min_value=0.01, value=float(last), step=0.05, key=f"paper_no_data_close_price_{idx}")
+                if st.button("CLOSE PAPER POSITION", key=f"paper_no_data_close_{idx}"):
+                    closed, message = close_paper_position(idx, exit_price, "Manual close without feed")
+                    if closed:
+                        st.success(message)
+                        st.rerun()
+                    else:
+                        st.error(message)
+    st.markdown("**Paper journal**")
+    if journal.empty:
+        st.caption("No paper trades recorded.")
+    else:
+        cols = [c for c in ["DateTime", "Symbol", "Side", "EntryPrice", "Quantity", "RemainingQty", "ExitPrice", "Status", "RealizedPnL", "PnL", "Result"] if c in journal.columns]
+        st.dataframe(journal[cols].tail(100), use_container_width=True, hide_index=True)
+
+
 def compute_equity_curve_from_trades(trades_df, initial_capital=100000):
     if trades_df.empty or "PnL" not in trades_df.columns:
         return pd.DataFrame(columns=["TradeNo", "Equity", "DrawdownPct", "ReturnPct"]), 0.0
@@ -3943,7 +4285,6 @@ st.title("Elite Trading Dashboard Final Ultimate")
 st.caption("Polling First | Walk Forward | Auto Exit | News Filter | Dynamic Option Chain")
 st.sidebar.caption(f"App build: {APP_BUILD_ID}")
 
-debug_mode = st.sidebar.checkbox("Debug Mode", value=False)
 selected = st.selectbox("Select Stock / Index", list(stocks.keys()))
 data_source = st.radio("Data Source", ["Yahoo", "Angel"], horizontal=True)
 timeframe = st.selectbox("Select Time Frame", ["1m", "3m", "5m", "10m", "15m", "30m", "1h", "1d"])
@@ -4103,37 +4444,6 @@ if all((angel_api_key, angel_client_code, angel_pin, angel_totp_secret)):
     st.session_state["angel_saved_pin"] = angel_pin
     st.session_state["angel_saved_totp_secret"] = angel_totp_secret
 
-# Debug only: expose presence flags, never credential contents. This helps distinguish
-# a stale Cloud deployment from Streamlit session-state loss after a successful login.
-if debug_mode:
-    _debug_api = str(angel_api_key or "").strip()
-    _debug_client = str(angel_client_code or "").strip()
-    _debug_pin = str(angel_pin or "").strip()
-    _debug_totp = str(angel_totp_secret or "").strip()
-    _debug_expected_cache_key = f"{_debug_client}_{_debug_api}"
-    _debug_cached_session = st.session_state.get("angel_session")
-    _debug_cached_session_data = (
-        _debug_cached_session.get("data")
-        if isinstance(_debug_cached_session, dict) else None
-    )
-    _debug_cache_match = bool(
-        st.session_state.get("angel_api") is not None
-        and _debug_cached_session_data
-        and st.session_state.get("angel_cache_key") == _debug_expected_cache_key
-    )
-    st.sidebar.markdown("**Angel credential diagnostics (presence only)**")
-    st.sidebar.write({
-        "API Key present": bool(_debug_api),
-        "Client Code present": bool(_debug_client),
-        "PIN present in current/session values": bool(_debug_pin),
-        "PIN saved in app session": bool(st.session_state.get("angel_saved_pin")),
-        "TOTP Secret present": bool(_debug_totp),
-        "TOTP widget state present": bool(str(st.session_state.get("angel_totp_secret_input", "") or "").strip()),
-        "TOTP saved session present": bool(str(st.session_state.get("angel_saved_totp_secret", "") or "").strip()),
-        "Authenticated Angel session present": bool(_debug_cached_session_data),
-        "Session matches API Key + Client Code": _debug_cache_match,
-    })
-
 # This board intentionally renders before the selected OHLC pipeline. It remains
 # visible if Angel/Yahoo chart candles are unavailable later in the script.
 render_live_global_india_market_board()
@@ -4203,7 +4513,7 @@ _angel_credentials_ready = bool(
 
 st.info(
     f"Market data request: {data_source} | {selected} | {timeframe}. "
-    "The app will show broker diagnostics if the feed returns an error or no candles."
+    "Live market data depends on provider availability, authenticated access and instrument support."
 )
 
 if data_source == "Angel":
@@ -4299,46 +4609,12 @@ if data.empty:
         else:
             st.caption(f"Angel LTP polling status: {angel_ltp_status}")
     st.warning("No usable OHLC candles were returned by the selected source or its available fallback. The chart and indicator calculations are paused rather than displaying invented candles.")
-    st.subheader("Data Diagnostics")
-    # Re-read the cache after the request attempt: a fresh login may have been
-    # created by angel_login() during this same rerun.
-    _diag_session_obj = st.session_state.get("angel_session")
-    _diag_session_data = _diag_session_obj.get("data") if isinstance(_diag_session_obj, dict) else None
-    _diag_session_ready = bool(
-        st.session_state.get("angel_api") is not None
-        and _diag_session_data
-        and st.session_state.get("angel_cache_key") == f"{angel_client_code}_{angel_api_key}"
+    st.subheader("Market Data Status")
+    st.info(
+        f"{data_source} did not return usable historical candles for {selected} ({timeframe}). "
+        "Charts and indicator calculations are paused until a valid provider response is available. "
+        "The market overview, paper journal and manual paper controls remain available."
     )
-    st.write({
-        "Selected source": data_source,
-        "OHLC source attempted": active_data_source,
-        "Selected symbol": selected,
-        "Yahoo ticker": ticker,
-        "Timeframe": timeframe,
-        "Yahoo interval": yf_interval,
-        "Yahoo period": yf_period,
-        "Angel SDK available": SMART_API_AVAILABLE,
-        "Angel authenticated session ready": _diag_session_ready,
-        "Angel missing inputs (names only)": _angel_missing_fields,
-        "Angel instrument mapping": st.session_state.get("angel_last_instrument") or {
-            "token": ANGEL_TOKENS.get(selected),
-            "trading_symbol": ANGEL_TRADING_SYMBOLS.get(selected),
-            "exchange": ANGEL_EXCHANGES.get(selected, "NSE"),
-            "source": "Built-in fallback mapping" if ANGEL_TOKENS.get(selected) else "Not resolved yet",
-        },
-        "Angel interval": map_angel_interval(timeframe),
-        "Angel candle response": angel_candle_diagnostics,
-        "Angel LTP status": angel_ltp_status,
-        "Angel LTP response diagnostics": st.session_state.get("angel_last_ltp_diagnostic", {"status": "not_requested"}),
-        "Angel candle rows parsed": int(len(candles_to_df(angel_candles_response))),
-        "Angel client method available": bool(callable(getattr(st.session_state.get("angel_api"), "getCandleData", None))),
-        "Angel LTP method available": bool(callable(getattr(st.session_state.get("angel_api"), "ltpData", None))),
-        "Yahoo primary rows": yahoo_primary_rows,
-        "Yahoo fallback rows": yahoo_fallback_rows,
-        "Angel last successful candles cached for this symbol/timeframe": bool(
-            st.session_state.get("last_good_candles_by_key", {}).get(f"{selected}|{map_angel_interval(timeframe)}")
-        ),
-    })
     st.subheader("Market Dashboard — awaiting valid OHLC candles")
     st.info("Angel login and quote polling are separate from historical candles. The dashboard will not invent OHLC bars or indicator values when both sources return no usable history.")
     st.subheader("Major Stocks Scanner — NIFTY Top 30")
@@ -4369,17 +4645,11 @@ if data.empty:
         st.dataframe(saved_journal.tail(100), use_container_width=True, hide_index=True)
     except Exception as journal_error:
         st.error(f"Journal error: {journal_error}")
-    if debug_mode:
-        st.subheader("Recent App Errors")
-        try:
-            recent_errors = safe_read_csv(ERROR_LOG_FILE, pd.DataFrame())
-            if not recent_errors.empty:
-                st.dataframe(recent_errors.tail(30), use_container_width=True, hide_index=True)
-            else:
-                st.caption("No application errors have been logged in this session's local data directory.")
-        except Exception as error_read_exc:
-            st.caption(f"Could not read local error log: {error_read_exc}")
-    st.info("On Sundays/market holidays, live ticks are not expected. Historical candles from prior sessions should still be available; use the Angel candle response above to identify broker/API errors.")
+    st.info("Live ticks may be unavailable outside market hours. Historical candles and live quotes depend on the selected provider and instrument permissions.")
+    render_paper_trading_no_data_controls(
+        selected, timeframe,
+        current_price=(angel_ltp_value if data_source == "Angel" else None)
+    )
     if auto_refresh and AUTO_REFRESH_AVAILABLE:
         st.caption("Auto-refresh remains active for the Global/Macro and Major Indian Stocks market board. The chart waits for valid OHLC candles.")
     elif auto_refresh and not AUTO_REFRESH_AVAILABLE:
@@ -4516,7 +4786,7 @@ elif data_source == "Angel" and ws_enable and not polling_mode:
 
 current_display_price = live_price if live_price else analysis["close_price"]
 
-closed_auto = auto_paper_trade_exit(current_display_price)
+closed_auto = 0
 
 option_suggestion = suggest_option_strike(selected, analysis["close_price"], analysis["signal_type"])
 expiry_seconds = get_signal_expiry_remaining(selected, timeframe, analysis["signal_text"])
@@ -4607,7 +4877,7 @@ if data_source == "Angel":
     with p3:
         st.metric("Live Price", round(live_price, 2) if live_price else "-")
     with p4:
-        st.metric("Auto Closed Trades", closed_auto)
+        st.metric("Exit Mode", "AUTO ENABLED" if st.session_state.get("paper_exit_mode") == "Auto Exit (Enabled)" else "MANUAL")
 
 if analysis["signal_type"] == "buy":
     st.success(alert_text)
@@ -4699,6 +4969,16 @@ with mac3:
 with mac4:
     st.metric("Candle Pattern Score", analysis["candle_pattern_score"])
 
+score1, score2, score3, score4 = st.columns(4)
+with score1:
+    st.metric("Bullish Score", analysis["bullish_score"])
+with score2:
+    st.metric("Bearish Score", analysis["bearish_score"])
+with score3:
+    st.metric("PCR", analysis["pcr"] if analysis["pcr"] is not None else "N/A")
+with score4:
+    st.metric("OI Bias", analysis["oi_bias"])
+
 c1, c2, c3, c4, c5, c6 = st.columns(6)
 with c1:
     st.metric("Support", round(analysis["support"], 2))
@@ -4739,36 +5019,195 @@ with rk4:
 with rk5:
     st.metric("Risk Status", risk_msg)
 
-if analysis["signal_type"] in ["buy", "sell"] and analysis["stop_loss"] is not None:
-    qty = calculate_position_size(analysis["close_price"], analysis["stop_loss"], paper_balance)
-    t1c, t2c, t3c, t4c, t5c, t6c = st.columns(6)
-    with t1c:
-        st.metric("Stop Loss", round(analysis["stop_loss"], 2))
-    with t2c:
-        st.metric("Partial Exit", round(analysis["partial_exit"], 2) if analysis["partial_exit"] else "-")
-    with t3c:
-        st.metric("Target 1", round(analysis["target1"], 2) if analysis["target1"] else "-")
-    with t4c:
-        st.metric("Target 2", round(analysis["target2"], 2) if analysis["target2"] else "-")
-    with t5c:
-        st.metric("Target 3", round(analysis["target3"], 2) if analysis["target3"] else "-")
-    with t6c:
-        st.metric("Auto Position Size", qty)
+st.subheader("Paper Trading — BUY / SELL / CLOSE | Virtual Orders Only")
+st.caption("No broker orders are sent. Suggested levels are analytical estimates, not guaranteed outcomes. Short positions reserve full notional as virtual margin.")
 
-    if st.button("Paper Trade Entry"):
-        if not risk_ok:
-            st.error(risk_msg)
+paper_state = load_paper_state()
+paper_balance = float(paper_state.loc[0, "Balance"])
+used_margin = float(paper_state.loc[0, "UsedMargin"])
+paper_journal = load_journal()
+open_paper = paper_journal[paper_journal.get("Status", pd.Series(dtype=str)).astype(str).str.upper().eq("OPEN")].copy() if not paper_journal.empty else pd.DataFrame()
+realized_pnl = 0.0
+if not paper_journal.empty:
+    if "RealizedPnL" in paper_journal.columns:
+        realized_pnl += pd.to_numeric(paper_journal["RealizedPnL"], errors="coerce").fillna(0).sum()
+    if "PnL" in paper_journal.columns:
+        legacy_closed = paper_journal.get("Status", pd.Series("", index=paper_journal.index)).astype(str).str.upper().eq("CLOSED")
+        legacy_zero_realized = pd.to_numeric(paper_journal.get("RealizedPnL", 0), errors="coerce").fillna(0).eq(0)
+        realized_pnl += pd.to_numeric(paper_journal.loc[legacy_closed & legacy_zero_realized, "PnL"], errors="coerce").fillna(0).sum()
+
+unrealized_selected = 0.0
+if not open_paper.empty:
+    for _, pos in open_paper.iterrows():
+        if str(pos.get("Symbol", "")) != str(selected):
+            continue
+        qty_now = float(pos.get("RemainingQty", pos.get("Quantity", 0)) or 0)
+        side_now = str(pos.get("Side", pos.get("Signal", "BUY"))).upper()
+        unrealized_selected += _paper_side_pnl(float(pos["EntryPrice"]), float(current_display_price), qty_now, side_now)
+
+paper_auto_exit_enabled = render_paper_exit_mode_selector()
+
+# The selected mode immediately arms or disarms every open virtual position.
+paper_journal = sync_open_position_auto_exit(paper_auto_exit_enabled, paper_journal)
+
+if paper_auto_exit_enabled:
+    auto_result = auto_paper_trade_exit(current_display_price, symbol=selected, atr=analysis.get("atr"))
+    if auto_result.get("closed", 0) or auto_result.get("partial", 0):
+        st.success(
+            f"Auto-exit manager: {auto_result.get('closed', 0)} position(s) fully closed; "
+            f"{auto_result.get('partial', 0)} target scale-out(s) executed."
+        )
+    # Refresh balances and open-position rows after any automatic partial/full exit.
+    paper_state = load_paper_state()
+    paper_balance = float(paper_state.loc[0, "Balance"])
+    used_margin = float(paper_state.loc[0, "UsedMargin"])
+    paper_journal = load_journal()
+    open_paper = paper_journal[paper_journal.get("Status", pd.Series(dtype=str)).astype(str).str.upper().eq("OPEN")].copy() if not paper_journal.empty else pd.DataFrame()
+    realized_pnl = 0.0
+    if not paper_journal.empty:
+        realized_pnl += pd.to_numeric(paper_journal.get("RealizedPnL", 0), errors="coerce").fillna(0).sum()
+        legacy_closed = paper_journal.get("Status", pd.Series("", index=paper_journal.index)).astype(str).str.upper().eq("CLOSED")
+        legacy_zero_realized = pd.to_numeric(paper_journal.get("RealizedPnL", 0), errors="coerce").fillna(0).eq(0)
+        if "PnL" in paper_journal.columns:
+            realized_pnl += pd.to_numeric(paper_journal.loc[legacy_closed & legacy_zero_realized, "PnL"], errors="coerce").fillna(0).sum()
+    unrealized_selected = 0.0
+    if not open_paper.empty:
+        for _, pos in open_paper.iterrows():
+            if str(pos.get("Symbol", "")) == str(selected):
+                qty_now = float(pos.get("RemainingQty", pos.get("Quantity", 0)) or 0)
+                side_now = str(pos.get("Side", pos.get("Signal", "BUY"))).upper()
+                unrealized_selected += _paper_side_pnl(float(pos["EntryPrice"]), float(current_display_price), qty_now, side_now)
+
+# Dashboard's suggested directional plan is selected from the stronger score. Both BUY and SELL can be placed manually.
+plan_side = "BUY" if int(analysis.get("bullish_score", 0)) >= int(analysis.get("bearish_score", 0)) else "SELL"
+paper_plan = get_suggested_paper_levels(analysis, plan_side, current_display_price)
+recommended_qty_risk = calculate_position_size(current_display_price, paper_plan["stop_loss"], paper_balance)
+max_affordable_qty = int(max(0.0, paper_balance) // max(float(current_display_price), 0.01))
+recommended_qty = max(1, min(int(recommended_qty_risk), max(1, max_affordable_qty)))
+
+pm1, pm2, pm3, pm4 = st.columns(4)
+with pm1:
+    st.metric("Paper Cash", f"₹{paper_balance:,.2f}")
+with pm2:
+    st.metric("Used Virtual Margin", f"₹{used_margin:,.2f}")
+with pm3:
+    st.metric("Realized Paper P&L", f"₹{realized_pnl:,.2f}")
+with pm4:
+    st.metric("Open Paper Positions", int(len(open_paper)))
+pm5, pm6, pm7 = st.columns(3)
+with pm5:
+    st.metric("Selected Symbol Unrealized P&L", f"₹{unrealized_selected:,.2f}")
+with pm6:
+    st.metric("Bullish / Bearish Score", f"{analysis['bullish_score']} / {analysis['bearish_score']}")
+with pm7:
+    st.metric("PCR", analysis["pcr"] if analysis["pcr"] is not None else "N/A")
+
+st.markdown(f"**Suggested plan direction:** {plan_side} / {'LONG' if plan_side == 'BUY' else 'SHORT'}  ·  **Current signal:** {analysis['signal_text']}")
+st.caption("When the signal is NO TRADE, the levels below are an ATR-based paper-planning reference only; they do not convert the signal into a live recommendation.")
+pl1, pl2, pl3, pl4, pl5, pl6 = st.columns(6)
+with pl1:
+    st.metric("Suggested Entry", round(paper_plan["entry"], 2))
+with pl2:
+    st.metric("Suggested Stop Loss", round(paper_plan["stop_loss"], 2))
+with pl3:
+    st.metric("Target 1", round(paper_plan["target1"], 2))
+with pl4:
+    st.metric("Target 2", round(paper_plan["target2"], 2))
+with pl5:
+    st.metric("Target 3", round(paper_plan["target3"], 2))
+with pl6:
+    st.metric("Initial Trailing Stop", round(paper_plan["trailing_stop"], 2))
+
+st.markdown("**Place a virtual paper order**")
+order_qty = st.number_input(
+    "Quantity", min_value=1, max_value=1000000, value=int(recommended_qty), step=1,
+    key=f"paper_order_qty_{selected}_{timeframe}"
+)
+order_cols = st.columns(2)
+with order_cols[0]:
+    buy_clicked = st.button("BUY / LONG", type="primary", use_container_width=True, key="paper_buy_order")
+with order_cols[1]:
+    sell_clicked = st.button("SELL / SHORT", type="secondary", use_container_width=True, key="paper_sell_order")
+
+if buy_clicked or sell_clicked:
+    order_side = "BUY" if buy_clicked else "SELL"
+    order_plan = get_suggested_paper_levels(analysis, order_side, current_display_price)
+    order_qty_int = int(order_qty)
+    required_margin = float(current_display_price) * order_qty_int
+    if not risk_ok:
+        st.error(f"Paper order blocked by risk controls: {risk_msg}")
+    elif required_margin > paper_balance:
+        st.error(f"Insufficient virtual cash. Required margin ₹{required_margin:,.2f}; available ₹{paper_balance:,.2f}.")
+    elif not (order_plan["stop_loss"] > 0 and order_plan["target1"] > 0 and order_plan["target2"] > 0 and order_plan["target3"] > 0):
+        st.error("The suggested price levels are invalid. Check the current market price and ATR data.")
+    else:
+        entered = paper_trade_entry(current_display_price, order_qty_int, side=order_side)
+        if entered:
+            add_trade_to_journal(
+                selected, timeframe, order_side, current_display_price, order_qty_int,
+                order_plan["stop_loss"], order_plan["target1"], order_plan["target2"],
+                order_plan["target3"], order_plan["trailing_stop"], analysis,
+                notes=f"Manual paper {order_side} entry; virtual only",
+                auto_exit=paper_auto_exit_enabled, atr=order_plan["atr"]
+            )
+            st.success(f"Paper {order_side} order opened: {selected} × {order_qty_int} at ₹{current_display_price:,.2f}. No real order was sent.")
+            st.rerun()
         else:
-            ok_entry = paper_trade_entry(analysis["close_price"], qty)
-            if ok_entry:
-                add_trade_to_journal(
-                    selected, timeframe, analysis["signal_text"], analysis["close_price"], qty,
-                    analysis["stop_loss"], analysis["target1"], analysis["target2"], analysis["target3"],
-                    analysis["trailing_stop"], analysis, notes="Paper trade entry from dashboard"
+            st.error("Insufficient virtual cash or paper-state write failed.")
+
+st.markdown("**Open paper positions**")
+st.caption("Auto Exit mode: the currently selected symbol is checked on each Streamlit rerun/auto-refresh for stop loss, trailing stop and T1/T2/T3. Keep Auto Refresh ON and keep that symbol selected. Manual Exit mode disables automatic exits; the CLOSE control remains available for every open position. This is a paper simulator, not a background execution service.")
+if open_paper.empty:
+    st.info("No open paper positions. Use BUY / LONG or SELL / SHORT to open a virtual position.")
+else:
+    display_cols = [c for c in ["Symbol", "Side", "Timeframe", "EntryPrice", "RemainingQty", "StopLoss", "TrailingStop", "Target1", "Target2", "Target3", "T1_Hit", "T2_Hit", "T3_Hit", "LastPrice", "AutoExitEnabled"] if c in open_paper.columns]
+    st.dataframe(open_paper[display_cols], use_container_width=True, hide_index=True)
+    for pos_idx, pos in open_paper.iterrows():
+        pos_symbol = str(pos.get("Symbol", ""))
+        pos_side = str(pos.get("Side", pos.get("Signal", "BUY"))).upper()
+        pos_entry = float(pos.get("EntryPrice", 0.0))
+        pos_remaining = int(float(pos.get("RemainingQty", pos.get("Quantity", 0)) or 0))
+        if pos_symbol == str(selected):
+            default_exit_price = float(current_display_price)
+            close_help = "Current selected-symbol market price will be used."
+        else:
+            try:
+                default_exit_price = float(pos.get("LastPrice", pos_entry))
+                if not np.isfinite(default_exit_price) or default_exit_price <= 0:
+                    default_exit_price = pos_entry
+            except Exception:
+                default_exit_price = pos_entry
+            close_help = "This symbol is not selected. Verify or edit the last exit price before closing."
+        with st.container(border=True):
+            close_cols = st.columns([2, 1, 1, 1, 1])
+            with close_cols[0]:
+                st.markdown(f"**{pos_symbol} — {pos_side}**")
+                st.caption(f"Remaining: {pos_remaining} · Entry: ₹{pos_entry:,.2f}")
+            with close_cols[1]:
+                st.metric("Last Price", round(default_exit_price, 2))
+            with close_cols[2]:
+                st.metric("Trailing SL", round(float(pos.get("TrailingStop", pos.get("StopLoss", 0)) or 0), 2))
+            with close_cols[3]:
+                st.metric("Unrealized P&L", f"₹{_paper_side_pnl(pos_entry, default_exit_price, pos_remaining, pos_side):,.2f}")
+            with close_cols[4]:
+                exit_price_input = st.number_input(
+                    "Exit Price", min_value=0.01, value=float(default_exit_price), step=0.05,
+                    key=f"paper_manual_exit_price_{pos_idx}", help=close_help
                 )
-                st.success("Paper trade entered")
-            else:
-                st.error("Insufficient paper balance")
+                if st.button("CLOSE", key=f"paper_close_position_{pos_idx}", use_container_width=True):
+                    closed, close_message = close_paper_position(pos_idx, exit_price_input, "Manual Close")
+                    if closed:
+                        st.success(close_message)
+                        st.rerun()
+                    else:
+                        st.error(close_message)
+
+st.markdown("**Paper trade history**")
+if paper_journal.empty:
+    st.caption("No paper trades have been recorded yet.")
+else:
+    history_cols = [c for c in ["DateTime", "Symbol", "Side", "EntryPrice", "Quantity", "RemainingQty", "ExitPrice", "Status", "RealizedPnL", "PnL", "Result", "Notes"] if c in paper_journal.columns]
+    st.dataframe(paper_journal[history_cols].tail(100), use_container_width=True, hide_index=True)
 
 with st.expander("Why this signal?"):
     for reason in analysis["reasons"]:
@@ -4931,22 +5370,6 @@ elif option_suggestion["type"] == "PUT":
     st.error(option_suggestion["text"])
 else:
     st.warning(option_suggestion["text"])
-
-if debug_mode:
-    st.subheader("Debug Panel")
-    st.write("Angel SDK available:", SMART_API_AVAILABLE)
-    st.write("Auto-refresh helper available:", AUTO_REFRESH_AVAILABLE)
-    st.write("Data source:", data_source)
-    st.write("Selected instrument:", selected)
-    st.write("Selected timeframe:", timeframe)
-    st.write("Candle rows:", len(data))
-    st.write("Last candle timestamp:", str(data.index[-1]) if not data.empty else "N/A")
-    st.write("Live price:", current_display_price)
-    st.write("WebSocket state:", st.session_state.get("ws_connected", False))
-    st.write("Last WebSocket tick:", st.session_state.get("ws_last_tick"))
-    st.write("Angel instrument mapping:", st.session_state.get("angel_last_instrument", "Not requested in this session"))
-    st.write("Angel LTP diagnostics:", st.session_state.get("angel_last_ltp_diagnostic", {"status": "not_requested"}))
-
 
 if auto_refresh and not AUTO_REFRESH_AVAILABLE:
     st.caption("Auto-refresh helper is not installed; use the manual browser refresh or install streamlit-autorefresh.")
