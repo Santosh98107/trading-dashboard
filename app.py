@@ -15,7 +15,7 @@ import streamlit as st
 import yfinance as yf
 
 # Visible deployment marker: confirms which source file Streamlit Cloud is running.
-APP_BUILD_ID = "2026-11-01-ANGEL-TOTP-FORM-FIX-04"
+APP_BUILD_ID = "2026-11-01-ONECLICK-RELEASE-09"
 # Optional integrations: Yahoo mode must still start if Angel SDK/TOTP or
 # the auto-refresh helper is not installed.
 try:
@@ -445,11 +445,11 @@ def fetch_data(ticker, interval, period):
     try:
         try:
             df = yf.download(ticker, interval=interval, period=period,
-                             progress=False, auto_adjust=False, threads=False,
+                             progress=False, auto_adjust=False, threads=False, timeout=15,
                              multi_level_index=False)
         except TypeError:
             df = yf.download(ticker, interval=interval, period=period,
-                             progress=False, auto_adjust=False, threads=False)
+                             progress=False, auto_adjust=False, threads=False, timeout=15)
         except Exception as exc:
             errors.append(f"download: {exc}")
 
@@ -471,7 +471,7 @@ def fetch_data(ticker, interval, period):
             # Ticker.history is a useful fallback when download returns a changed schema.
             try:
                 hist = yf.Ticker(ticker).history(period=period, interval=interval,
-                                                 auto_adjust=False, prepost=False)
+                                                 auto_adjust=False, prepost=False, timeout=15)
                 if not hist.empty and all(c in hist.columns for c in needed):
                     df = hist[needed].copy()
             except Exception as exc:
@@ -527,6 +527,18 @@ def map_angel_interval(timeframe):
     return mapping.get(timeframe, "FIVE_MINUTE")
 
 
+def install_smartapi_http_timeout(api):
+    """Set the timeout used by SmartAPI's own requests.request call."""
+    try:
+        # Current smartapi-python uses self.timeout in SmartConnect._request.
+        # Patching reqsession.request does not affect that code path.
+        api.timeout = 10
+        return True
+    except Exception as exc:
+        log_app_error("install_smartapi_http_timeout", exc)
+        return False
+
+
 def angel_login(api_key, client_code, pin, totp_secret, force_refresh=False):
     """Return a matching authenticated session; only request PIN/TOTP for fresh login."""
     try:
@@ -556,7 +568,11 @@ def angel_login(api_key, client_code, pin, totp_secret, force_refresh=False):
         if not all((api_key, client_code, pin, totp_secret)):
             return None, None
 
-        smart_api = SmartConnect(api_key=api_key)
+        try:
+            smart_api = SmartConnect(api_key=api_key, timeout=10)
+        except TypeError:
+            smart_api = SmartConnect(api_key=api_key)
+        install_smartapi_http_timeout(smart_api)
         totp = pyotp.TOTP(totp_secret).now()
         session = smart_api.generateSession(client_code, pin, totp)
 
@@ -572,23 +588,156 @@ def angel_login(api_key, client_code, pin, totp_secret, force_refresh=False):
         return None, None
 
 
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_angel_instrument_master():
+    """Download and normalize Angel One's public instrument master once per day."""
+    url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
+    try:
+        response = requests.get(url, timeout=20)
+        response.raise_for_status()
+        payload = response.json()
+        frame = pd.DataFrame(payload)
+        if frame.empty:
+            return pd.DataFrame()
+        lower = {str(col).strip().lower(): col for col in frame.columns}
+        def pick(*names):
+            for name in names:
+                if name in lower:
+                    return lower[name]
+            return None
+        col_map = {
+            "Token": pick("token", "symboltoken"),
+            "TradingSymbol": pick("symbol", "tradingsymbol", "trading_symbol"),
+            "Name": pick("name", "underlying"),
+            "Exchange": pick("exch_seg", "exchange"),
+            "InstrumentType": pick("instrumenttype", "instrument_type"),
+            "Expiry": pick("expiry"),
+        }
+        if not all(col_map[k] for k in ("Token", "TradingSymbol", "Exchange")):
+            log_app_error("get_angel_instrument_master", f"Unexpected master columns: {list(frame.columns)[:30]}")
+            return pd.DataFrame()
+        out = pd.DataFrame({
+            key: frame[src] for key, src in col_map.items() if src is not None
+        })
+        for key in ("Name", "Expiry", "InstrumentType"):
+            if key not in out:
+                out[key] = ""
+        out["Token"] = out["Token"].astype(str).str.strip()
+        out["TradingSymbol"] = out["TradingSymbol"].astype(str).str.strip()
+        out["Name"] = out["Name"].astype(str).str.strip().str.upper()
+        out["Exchange"] = out["Exchange"].astype(str).str.strip().str.upper()
+        out["Exchange"] = out["Exchange"].replace({
+            "NSE_CM": "NSE", "BSE_CM": "BSE", "NSECM": "NSE", "BSECM": "BSE"
+        })
+        out["InstrumentType"] = out["InstrumentType"].astype(str).str.strip().str.upper()
+        out["Expiry"] = out["Expiry"].astype(str).str.strip()
+        out = out[(out["Token"] != "") & (out["TradingSymbol"] != "")]
+        return out.reset_index(drop=True)
+    except Exception as exc:
+        log_app_error("get_angel_instrument_master", exc)
+        return pd.DataFrame()
+
+
+def resolve_angel_instrument(symbol_name):
+    """Resolve exchange, trading symbol and token from master; use known safe fallbacks."""
+    symbol_name = str(symbol_name or "").strip().upper()
+    fallback_token = ANGEL_TOKENS.get(symbol_name)
+    fallback_symbol = ANGEL_TRADING_SYMBOLS.get(symbol_name)
+    fallback_exchange = ANGEL_EXCHANGES.get(symbol_name, "NSE")
+
+    # Avoid an unnecessary public-master download for the verified built-in
+    # NIFTY/BankNIFTY and core-stock mappings. Less-common instruments (including
+    # SENSEX and the wider watchlist) are resolved from the live public master.
+    if fallback_token and fallback_symbol:
+        resolved = {
+            "exchange": fallback_exchange,
+            "trading_symbol": fallback_symbol,
+            "token": str(fallback_token),
+            "source": "Built-in verified fallback mapping",
+        }
+        st.session_state["angel_last_instrument"] = resolved
+        return resolved
+
+    master = get_angel_instrument_master()
+    if master is not None and not master.empty:
+        aliases = ANGEL_NAME_ALIASES.get(symbol_name, [symbol_name])
+        aliases = [str(x).strip().upper() for x in aliases]
+        exchange_preference = "BSE" if symbol_name == "SENSEX" else "NSE"
+        candidates = master[master["Exchange"].isin([exchange_preference])].copy()
+        if symbol_name in {"NIFTY", "BANKNIFTY", "SENSEX"}:
+            candidates = candidates[
+                candidates["Name"].isin(aliases)
+                | candidates["TradingSymbol"].str.upper().isin(aliases)
+            ]
+            if "InstrumentType" in candidates:
+                idx = candidates[candidates["InstrumentType"].str.contains("AMXIDX", na=False)]
+                if not idx.empty:
+                    candidates = idx
+        else:
+            target_symbols = {f"{alias}-EQ" for alias in aliases}
+            candidates["_symbol_upper"] = candidates["TradingSymbol"].str.upper()
+            exact = candidates[candidates["_symbol_upper"].isin(target_symbols)]
+            if not exact.empty:
+                candidates = exact
+            else:
+                candidates = candidates[candidates["Name"].isin(aliases)]
+                if not candidates.empty:
+                    equity = candidates[candidates["TradingSymbol"].str.upper().str.endswith("-EQ")]
+                    if not equity.empty:
+                        candidates = equity
+        if not candidates.empty:
+            row = candidates.iloc[0]
+            resolved = {
+                "exchange": str(row["Exchange"]).upper(),
+                "trading_symbol": str(row["TradingSymbol"]),
+                "token": str(row["Token"]),
+                "source": "Angel instrument master",
+            }
+            st.session_state["angel_last_instrument"] = resolved
+            return resolved
+
+    if fallback_token and fallback_symbol:
+        resolved = {
+            "exchange": fallback_exchange,
+            "trading_symbol": fallback_symbol,
+            "token": str(fallback_token),
+            "source": "Built-in fallback mapping",
+        }
+        st.session_state["angel_last_instrument"] = resolved
+        return resolved
+    st.session_state["angel_last_instrument"] = None
+    return None
+
+
 def get_angel_candles(api_key, client_code, pin, totp_secret, symbol_name, interval="FIVE_MINUTE"):
     try:
         angel, session = angel_login(api_key, client_code, pin, totp_secret)
         if angel is None or not session or not session.get("data"):
             return None
 
-        symbol_token = ANGEL_TOKENS.get(symbol_name)
-        if not symbol_token:
-            return {"status": False, "message": f"Missing Angel token for {symbol_name}"}
+        instrument = resolve_angel_instrument(symbol_name)
+        if not instrument:
+            return {"status": False, "message": f"Angel instrument master did not resolve {symbol_name}; check master connectivity and symbol spelling"}
 
         ist = timezone(timedelta(hours=5, minutes=30))
         to_date = datetime.now(ist)
-        from_date = to_date - timedelta(days=10)
+        # Angel One's documented per-request maximum differs by interval.
+        # Use practical lookbacks that provide enough history without exceeding it.
+        lookback_days = {
+            "ONE_MINUTE": 20,
+            "THREE_MINUTE": 45,
+            "FIVE_MINUTE": 75,
+            "TEN_MINUTE": 75,
+            "FIFTEEN_MINUTE": 120,
+            "THIRTY_MINUTE": 120,
+            "ONE_HOUR": 180,
+            "ONE_DAY": 365,
+        }.get(interval, 20)
+        from_date = to_date - timedelta(days=lookback_days)
 
         params = {
-            "exchange": "NSE",
-            "symboltoken": symbol_token,
+            "exchange": instrument["exchange"],
+            "symboltoken": instrument["token"],
             "interval": interval,
             "fromdate": from_date.strftime("%Y-%m-%d %H:%M"),
             "todate": to_date.strftime("%Y-%m-%d %H:%M")
@@ -597,6 +746,44 @@ def get_angel_candles(api_key, client_code, pin, totp_secret, symbol_name, inter
     except Exception as e:
         log_app_error("get_angel_candles", e)
         return {"status": False, "message": str(e)}
+
+
+def get_angel_candles_cached(api_key, client_code, pin, totp_secret, symbol_name,
+                              interval="FIVE_MINUTE", force_refresh=False):
+    """Session-scoped short cache to avoid duplicate MTF calls and broker rate bursts."""
+    try:
+        cache = st.session_state.get("angel_history_cache")
+        if not isinstance(cache, dict):
+            cache = {}
+        cache_key = hashlib.sha256(
+            f"{api_key}|{client_code}|{symbol_name}|{interval}".encode("utf-8")
+        ).hexdigest()
+        now = pytime.time()
+        entry = cache.get(cache_key)
+        if not force_refresh and isinstance(entry, dict):
+            age = now - float(entry.get("fetched_at", 0))
+            ttl = 15 if entry.get("usable") else 5
+            if age <= ttl:
+                return entry.get("response")
+
+        response = get_angel_candles(
+            api_key, client_code, pin, totp_secret, symbol_name, interval
+        )
+        payload = response.get("data") if isinstance(response, dict) else None
+        usable = bool(isinstance(response, dict) and response.get("status") and payload)
+        cache[cache_key] = {
+            "fetched_at": now,
+            "usable": usable,
+            "response": response,
+        }
+        # Bound session cache growth when the user changes instruments/timeframes.
+        if len(cache) > 80:
+            cache = dict(list(cache.items())[-60:])
+        st.session_state["angel_history_cache"] = cache
+        return response
+    except Exception as exc:
+        log_app_error("get_angel_candles_cached", exc)
+        return get_angel_candles(api_key, client_code, pin, totp_secret, symbol_name, interval)
 
 
 def candles_to_df(candles):
@@ -678,27 +865,83 @@ def summarize_angel_candle_response(response):
 
 
 def get_angel_ltp_polling(api_key, client_code, pin, totp_secret, symbol_name):
-    """Fetch the latest quote through Angel One REST LTP API (not candle history)."""
+    """Fetch Angel LTP with bounded REST timeout and retain safe diagnostic details."""
+    diagnostic = {"status": "not_requested", "symbol": str(symbol_name)}
     try:
         angel, session = angel_login(api_key, client_code, pin, totp_secret)
         if angel is None or not session or not session.get("data"):
+            diagnostic.update(status="not_authenticated", message="No matching authenticated Angel session")
+            st.session_state["angel_last_ltp_diagnostic"] = diagnostic
             return None
 
-        token = ANGEL_TOKENS.get(symbol_name)
-        trading_symbol = ANGEL_TRADING_SYMBOLS.get(symbol_name)
-        if not token or not trading_symbol:
-            log_app_error("get_angel_ltp_polling", f"Missing Angel symbol/token mapping for {symbol_name}")
+        instrument = resolve_angel_instrument(symbol_name)
+        if not instrument:
+            diagnostic.update(status="mapping_missing", message=f"Angel instrument master did not resolve {symbol_name}")
+            st.session_state["angel_last_ltp_diagnostic"] = diagnostic
+            log_app_error("get_angel_ltp_polling", diagnostic["message"])
             return None
-
-        response = angel.getLTPData("NSE", trading_symbol, str(token))
-        if not isinstance(response, dict) or response.get("status") is False:
+        token = instrument["token"]
+        trading_symbol = instrument["trading_symbol"]
+        exchange = instrument["exchange"]
+        diagnostic.update(status="request_sent", exchange=exchange, trading_symbol=trading_symbol, token=str(token), instrument_source=instrument["source"])
+        # Official smartapi-python method is ltpData(exchange, tradingsymbol, token).
+        # Keep getLTPData as a compatibility fallback for wrappers that expose it.
+        ltp_method = getattr(angel, "ltpData", None)
+        if not callable(ltp_method):
+            ltp_method = getattr(angel, "getLTPData", None)
+        if not callable(ltp_method):
+            diagnostic.update(status="sdk_method_missing", message="SmartAPI client exposes neither ltpData nor getLTPData")
+            st.session_state["angel_last_ltp_diagnostic"] = diagnostic
+            log_app_error("get_angel_ltp_polling", diagnostic["message"])
+            return None
+        response = ltp_method(exchange, trading_symbol, str(token))
+        if not isinstance(response, dict):
+            diagnostic.update(status="invalid_response", response_type=type(response).__name__, message=str(response)[:300])
+            st.session_state["angel_last_ltp_diagnostic"] = diagnostic
             log_app_error("get_angel_ltp_polling", response)
             return None
-        quote = response.get("data") or {}
-        value = quote.get("ltp") or quote.get("LTP")
-        price = float(value) if value is not None else None
-        return price if price and price > 0 else None
+        if response.get("status") is False:
+            diagnostic.update(status="broker_error", message=str(response.get("message") or response.get("error") or "Angel quote request failed")[:400], error_code=response.get("errorcode") or response.get("errorCode"))
+            st.session_state["angel_last_ltp_diagnostic"] = diagnostic
+            log_app_error("get_angel_ltp_polling", diagnostic)
+            return None
+        quote_payload = response.get("data") or {}
+        quote = None
+        if isinstance(quote_payload, dict):
+            # Some SDK/API responses wrap the quote inside data.fetched.
+            fetched = quote_payload.get("fetched")
+            if isinstance(fetched, list):
+                quote = next((item for item in fetched if isinstance(item, dict)), None)
+            else:
+                quote = quote_payload
+        elif isinstance(quote_payload, list):
+            quote = next((item for item in quote_payload if isinstance(item, dict)), None)
+
+        value = None
+        if isinstance(quote, dict):
+            for key in ("ltp", "LTP", "last_traded_price", "lastTradedPrice"):
+                if quote.get(key) not in (None, ""):
+                    value = quote.get(key)
+                    break
+        try:
+            price = float(value) if value is not None else None
+        except (TypeError, ValueError):
+            price = None
+        if price is not None and np.isfinite(price) and price > 0:
+            diagnostic.update(status="received", price=price, quote_shape=type(quote_payload).__name__)
+            st.session_state["angel_last_ltp_diagnostic"] = diagnostic
+            return price
+        diagnostic.update(
+            status="empty_quote",
+            message="Successful response did not contain a usable LTP",
+            response_keys=list(response.keys())[:20],
+            quote_shape=type(quote_payload).__name__,
+        )
+        st.session_state["angel_last_ltp_diagnostic"] = diagnostic
+        return None
     except Exception as e:
+        diagnostic.update(status="exception_or_timeout", message=str(e)[:500])
+        st.session_state["angel_last_ltp_diagnostic"] = diagnostic
         log_app_error("get_angel_ltp_polling", e)
         return None
 
@@ -803,9 +1046,15 @@ def start_angel_websocket(api_key, client_code, pin, totp_secret, symbol_name):
         sync_ws_state_to_session()
         return
 
-    symbol_token = ANGEL_TOKENS.get(symbol_name)
-    if not symbol_token:
-        ws_set_state(error=f"Missing token for {symbol_name}")
+    instrument = resolve_angel_instrument(symbol_name)
+    if not instrument:
+        ws_set_state(error=f"Angel instrument master did not resolve {symbol_name}")
+        sync_ws_state_to_session()
+        return
+    symbol_token = instrument["token"]
+    exchange_type = 1 if instrument["exchange"] == "NSE" else 3 if instrument["exchange"] == "BSE" else None
+    if exchange_type is None:
+        ws_set_state(error=f"WebSocket exchange mapping unsupported: {instrument['exchange']}")
         sync_ws_state_to_session()
         return
 
@@ -849,7 +1098,7 @@ def start_angel_websocket(api_key, client_code, pin, totp_secret, symbol_name):
 
                 correlation_id = f"elite_feed_{symbol_name}"
                 mode = 1
-                token_list = [{"exchangeType": 1, "tokens": [str(symbol_token)]}]
+                token_list = [{"exchangeType": exchange_type, "tokens": [str(symbol_token)]}]
 
                 def on_data(wsapp, message):
                     ltp = extract_ltp_from_message(message)
@@ -1253,35 +1502,161 @@ def classify_stock_timeframe(frame):
         return "N/A", 0
 
 
+def _normalize_yahoo_frame(frame):
+    """Normalize one Yahoo OHLCV frame, including either MultiIndex layout."""
+    if frame is None or not isinstance(frame, pd.DataFrame) or frame.empty:
+        return pd.DataFrame()
+    df = frame.copy()
+    needed = ["Open", "High", "Low", "Close"]
+    if isinstance(df.columns, pd.MultiIndex):
+        best_level = None
+        best_count = -1
+        for level in range(df.columns.nlevels):
+            vals = [str(v).strip() for v in df.columns.get_level_values(level)]
+            count = sum(col in vals for col in needed)
+            if count > best_count:
+                best_count, best_level = count, level
+        if best_level is not None and best_count >= 4:
+            df.columns = df.columns.get_level_values(best_level)
+    # Case-insensitive normalization protects against provider/schema changes.
+    rename = {}
+    for col in df.columns:
+        key = str(col).strip().lower()
+        if key in {"open", "high", "low", "close", "volume"}:
+            rename[col] = key.title()
+    df = df.rename(columns=rename)
+    if not all(col in df.columns for col in needed):
+        return pd.DataFrame()
+    df = df.loc[:, ~pd.Index(df.columns).duplicated()].copy()
+    if "Volume" not in df.columns:
+        df["Volume"] = 0
+    df.index = pd.to_datetime(df.index, errors="coerce")
+    df = df[~df.index.isna()].copy()
+    for col in needed + ["Volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=needed)
+    df["Volume"] = df["Volume"].fillna(0)
+    return df[needed + ["Volume"]].loc[~df.index.duplicated(keep="last")].sort_index()
+
+
+@st.cache_data(ttl=45, show_spinner=False)
+def fetch_yahoo_batch(tickers, interval, period):
+    """Fetch many Yahoo tickers in one HTTP batch and return {ticker: OHLCV}.
+
+    This replaces 60 serial downloads in the NIFTY-30 scanner with two batch
+    requests (one intraday, one daily). Failed symbols stay empty; no values are
+    fabricated or copied from another ticker.
+    """
+    ticker_list = tuple(str(t).strip() for t in tickers if str(t).strip())
+    empty_result = {ticker: pd.DataFrame() for ticker in ticker_list}
+    if not ticker_list:
+        return empty_result
+    try:
+        try:
+            raw = yf.download(
+                tickers=list(ticker_list), period=period, interval=interval,
+                group_by="ticker", auto_adjust=False, progress=False,
+                threads=True, timeout=20, multi_level_index=True
+            )
+        except TypeError:
+            raw = yf.download(
+                tickers=list(ticker_list), period=period, interval=interval,
+                group_by="ticker", auto_adjust=False, progress=False,
+                threads=True, timeout=20
+            )
+        if raw is None or not isinstance(raw, pd.DataFrame) or raw.empty:
+            log_app_error("fetch_yahoo_batch", f"Yahoo batch returned no rows for {len(ticker_list)} tickers at {interval}/{period}.")
+            return empty_result
+
+        results = {}
+        if isinstance(raw.columns, pd.MultiIndex):
+            for ticker in ticker_list:
+                subset = None
+                for level in range(raw.columns.nlevels):
+                    values = [str(v) for v in raw.columns.get_level_values(level)]
+                    if ticker in values:
+                        try:
+                            actual = raw.columns.get_level_values(level)[values.index(ticker)]
+                            subset = raw.xs(actual, axis=1, level=level, drop_level=True)
+                            break
+                        except Exception:
+                            continue
+                results[ticker] = _normalize_yahoo_frame(subset) if subset is not None else pd.DataFrame()
+        elif len(ticker_list) == 1:
+            results[ticker_list[0]] = _normalize_yahoo_frame(raw)
+        else:
+            # Some provider responses flatten a batch unexpectedly. Do not map
+            # one combined series to every company; leave symbols explicitly N/A.
+            log_app_error("fetch_yahoo_batch", f"Unexpected single-level columns for multi-ticker request ({interval}).")
+            results = dict(empty_result)
+        return results
+    except Exception as exc:
+        log_app_error("fetch_yahoo_batch", exc)
+        return empty_result
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def build_nifty_top30_scanner():
-    rows=[]
-    intervals={"3m":"3min", "5m":"5min", "10m":"10min", "15m":"15min"}
+    rows = []
+    intervals = {"3m": "3min", "5m": "5min", "10m": "10min", "15m": "15min"}
+    symbols = tuple(NIFTY_TOP30.values())
+
+    # Two batched requests instead of 60 sequential requests.
+    intraday_data = fetch_yahoo_batch(symbols, "1m", "7d")
+    daily_data = fetch_yahoo_batch(symbols, "1d", "5d")
+
     for company, ticker_symbol in NIFTY_TOP30.items():
         try:
-            intraday=fetch_data(ticker_symbol, "1m", "7d")
-            daily=fetch_data(ticker_symbol, "1d", "5d")
-            if intraday.empty:
-                rows.append({"Company":company,"CMP":np.nan,"% Change":np.nan,"3m":"N/A","5m":"N/A","10m":"N/A","15m":"N/A","Score":0})
-                continue
-            cmp=float(intraday["Close"].iloc[-1])
-            prev_close=float(daily["Close"].iloc[-2]) if len(daily)>=2 else np.nan
-            pct=((cmp-prev_close)/prev_close*100) if pd.notna(prev_close) and prev_close else np.nan
-            item={"Company":company,"CMP":round(cmp,2),"% Change":round(pct,2) if pd.notna(pct) else np.nan}
-            scores=[]
-            for label,rule in intervals.items():
-                tf_data=resample_ohlcv(intraday,rule)
-                trend,score=classify_stock_timeframe(tf_data)
-                item[label]=trend
-                scores.append(score if trend!="N/A" else 0)
-            item["Score"]=int(sum(scores))
-            valid=[item[k] for k in intervals if item[k] in ("Bullish","Bearish")]
-            bulls=valid.count("Bullish"); bears=valid.count("Bearish")
-            item["Overall"]="Bullish" if bulls>bears else "Bearish" if bears>bulls else "Neutral"
+            intraday = intraday_data.get(ticker_symbol, pd.DataFrame())
+            daily = daily_data.get(ticker_symbol, pd.DataFrame())
+            cmp = np.nan
+            pct = np.nan
+            status = "N/A"
+
+            if not intraday.empty:
+                cmp = float(intraday["Close"].iloc[-1])
+                if len(daily) >= 2:
+                    previous_close = float(daily["Close"].iloc[-2])
+                    if previous_close:
+                        pct = (cmp - previous_close) / previous_close * 100.0
+                status = "Intraday OHLC"
+            elif not daily.empty:
+                # Daily close is a transparent last-known CMP fallback. Trend
+                # votes remain N/A because intraday bars were not available.
+                daily_close = daily["Close"].dropna()
+                if len(daily_close) >= 1:
+                    cmp = float(daily_close.iloc[-1])
+                    if len(daily_close) >= 2 and float(daily_close.iloc[-2]) != 0:
+                        pct = (cmp - float(daily_close.iloc[-2])) / float(daily_close.iloc[-2]) * 100.0
+                    status = "Daily close only"
+
+            item = {
+                "Company": company,
+                "CMP": round(cmp, 2) if pd.notna(cmp) else np.nan,
+                "% Change": round(pct, 2) if pd.notna(pct) else np.nan,
+                "3m": "N/A", "5m": "N/A", "10m": "N/A", "15m": "N/A",
+                "Overall": "N/A", "Score": 0, "Data Status": status,
+            }
+            if not intraday.empty:
+                scores = []
+                for label, rule in intervals.items():
+                    tf_data = resample_ohlcv(intraday, rule)
+                    trend, score = classify_stock_timeframe(tf_data)
+                    item[label] = trend
+                    scores.append(score if trend != "N/A" else 0)
+                item["Score"] = int(sum(scores))
+                valid = [item[k] for k in intervals if item[k] in ("Bullish", "Bearish", "Neutral")]
+                bulls = valid.count("Bullish")
+                bears = valid.count("Bearish")
+                item["Overall"] = "Bullish" if bulls > bears else "Bearish" if bears > bulls else "Neutral"
             rows.append(item)
         except Exception as exc:
             log_app_error("nifty_top30_scanner", f"{company}: {exc}")
-            rows.append({"Company":company,"CMP":np.nan,"% Change":np.nan,"3m":"N/A","5m":"N/A","10m":"N/A","15m":"N/A","Score":0,"Overall":"N/A"})
+            rows.append({
+                "Company": company, "CMP": np.nan, "% Change": np.nan,
+                "3m": "N/A", "5m": "N/A", "10m": "N/A", "15m": "N/A",
+                "Overall": "N/A", "Score": 0, "Data Status": f"Error: {str(exc)[:100]}"
+            })
     return pd.DataFrame(rows)
 
 
@@ -1304,6 +1679,76 @@ def scanner_breadth_summary(scanner_df):
                    "Bullish %":round(100*bull/total,1) if total else 0.0,
                    "Bearish %":round(100*bear/total,1) if total else 0.0,"Coverage":total})
     return pd.DataFrame(result)
+
+
+
+def blank_nifty_scanner_frame():
+    """Show all 30 requested constituents before a network scan is started."""
+    return pd.DataFrame([
+        {
+            "Company": company, "CMP": np.nan, "% Change": np.nan,
+            "3m": "N/A", "5m": "N/A", "10m": "N/A", "15m": "N/A",
+            "Overall": "N/A", "Score": 0, "Data Status": "Not fetched — press Run Scanner",
+        }
+        for company in NIFTY_TOP30
+    ])
+
+
+def render_nifty_scanner_result(scanner_df):
+    """Render a scanner table only from real provider values; missing values stay N/A."""
+    if scanner_df is None or scanner_df.empty:
+        st.warning("Yahoo Finance did not return scanner rows. Check outbound network access and Recent App Errors.")
+        return
+    breadth = scanner_breadth_summary(scanner_df)
+    st.markdown("**NIFTY market breadth by timeframe**")
+    st.dataframe(breadth, use_container_width=True, hide_index=True)
+    overall_row = breadth[breadth["Timeframe"] == "Overall (all 4 TF votes)"]
+    if not overall_row.empty:
+        br = overall_row.iloc[0]
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Overall Bullish %", f"{br['Bullish %']:.1f}%", f"{int(br['Bullish'])} bullish votes")
+        k2.metric("Overall Bearish %", f"{br['Bearish %']:.1f}%", f"{int(br['Bearish'])} bearish votes")
+        k3.metric("Neutral Votes", int(br["Neutral"]))
+        k4.metric("Total Valid TF Votes", int(br["Coverage"]))
+    display_cols = ["Company", "CMP", "% Change", "3m", "5m", "10m", "15m", "Overall", "Score", "Data Status"]
+    st.markdown("**Company-wise CMP, daily % change and 3m / 5m / 10m / 15m trend**")
+    st.dataframe(scanner_df[display_cols].sort_values("Score", ascending=False), use_container_width=True, hide_index=True)
+    bull_tab, bear_tab, neutral_tab = st.tabs(["Bullish Companies", "Bearish Companies", "Neutral / N/A"])
+    with bull_tab:
+        bullish = scanner_df[scanner_df["Overall"] == "Bullish"].sort_values("Score", ascending=False)
+        if bullish.empty:
+            st.info("No bullish companies confirmed across the selected timeframes.")
+        else:
+            st.dataframe(bullish[display_cols], use_container_width=True, hide_index=True)
+    with bear_tab:
+        bearish = scanner_df[scanner_df["Overall"] == "Bearish"].sort_values("Score", ascending=True)
+        if bearish.empty:
+            st.info("No bearish companies confirmed across the selected timeframes.")
+        else:
+            st.dataframe(bearish[display_cols], use_container_width=True, hide_index=True)
+    with neutral_tab:
+        neutral = scanner_df[scanner_df["Overall"].isin(["Neutral", "N/A"])]
+        if neutral.empty:
+            st.info("No neutral / unavailable companies.")
+        else:
+            st.dataframe(neutral[display_cols], use_container_width=True, hide_index=True)
+    top_bull = scanner_df[scanner_df["Overall"] == "Bullish"].sort_values("Score", ascending=False).head(5)
+    top_bear = scanner_df[scanner_df["Overall"] == "Bearish"].sort_values("Score", ascending=True).head(5)
+    top_b1, top_b2 = st.columns(2)
+    with top_b1:
+        st.markdown("**Top Bullish Companies**")
+        if not top_bull.empty:
+            st.dataframe(top_bull[["Company", "CMP", "% Change", "3m", "5m", "10m", "15m", "Score"]], use_container_width=True, hide_index=True)
+        else:
+            st.info("No top bullish candidate currently.")
+    with top_b2:
+        st.markdown("**Top Bearish Companies**")
+        if not top_bear.empty:
+            st.dataframe(top_bear[["Company", "CMP", "% Change", "3m", "5m", "10m", "15m", "Score"]], use_container_width=True, hide_index=True)
+        else:
+            st.info("No top bearish candidate currently.")
+    if scanner_df["CMP"].notna().sum() == 0:
+        st.warning("Scanner ran, but Yahoo returned no valid prices for any constituent. The table shows N/A rather than invented values.")
 
 
 # =========================================================
@@ -1401,6 +1846,8 @@ def get_option_chain_snapshot(symbol="NIFTY"):
 def get_dynamic_option_chain_symbol(selected_symbol):
     if selected_symbol == "BANKNIFTY":
         return "BANKNIFTY"
+    if selected_symbol == "SENSEX":
+        return None  # NSE's NIFTY option-chain PCR is not a SENSEX option-chain value.
     return "NIFTY"
 
 
@@ -3109,7 +3556,7 @@ def get_data_for_timeframe(data_source, selected, ticker, tf, angel_creds):
 
     api_key, client_code, pin, totp_secret = angel_creds
     interval = map_angel_interval(tf)
-    candles = get_angel_candles(api_key, client_code, pin, totp_secret, selected, interval)
+    candles = get_angel_candles_cached(api_key, client_code, pin, totp_secret, selected, interval)
     data = candles_to_df(candles)
     if data.empty:
         return data
@@ -3172,32 +3619,66 @@ init_ws_state()
 stocks = {
     "NIFTY": "^NSEI",
     "BANKNIFTY": "^NSEBANK",
+    "SENSEX": "^BSESN",
     "RELIANCE": "RELIANCE.NS",
+    "HDFCBANK": "HDFCBANK.NS",
+    "ICICIBANK": "ICICIBANK.NS",
+    "SBIN": "SBIN.NS",
+    "AXISBANK": "AXISBANK.NS",
+    "KOTAKBANK": "KOTAKBANK.NS",
     "TCS": "TCS.NS",
     "INFY": "INFY.NS",
-    "HDFCBANK": "HDFCBANK.NS",
-    "SBIN": "SBIN.NS",
-    "ICICIBANK": "ICICIBANK.NS",
-    "ITC": "ITC.NS"
+    "HCLTECH": "HCLTECH.NS",
+    "WIPRO": "WIPRO.NS",
+    "TECHM": "TECHM.NS",
+    "TMPV": "TMPV.NS",
+    "MARUTI": "MARUTI.NS",
+    "M&M": "M&M.NS",
+    "BAJAJ-AUTO": "BAJAJ-AUTO.NS",
+    "HEROMOTOCO": "HEROMOTOCO.NS",
+    "ITC": "ITC.NS",
+    "LT": "LT.NS",
+    "BHARTIARTL": "BHARTIARTL.NS",
+    "SUNPHARMA": "SUNPHARMA.NS",
+    "TITAN": "TITAN.NS",
+    "NTPC": "NTPC.NS",
+    "BEL": "BEL.NS",
+    "ONGC": "ONGC.NS",
+    "ADANIPORTS": "ADANIPORTS.NS",
+    "POWERGRID": "POWERGRID.NS",
+    "TRENT": "TRENT.NS",
+    "JSWSTEEL": "JSWSTEEL.NS",
+    "TATASTEEL": "TATASTEEL.NS"
 }
 
 ANGEL_TOKENS = {
-    "SBIN": "3045",
-    "RELIANCE": "2885",
-    "INFY": "1594",
-    "TCS": "11536",
-    "NIFTY": "99926000",
-    "BANKNIFTY": "99926009",
-    "HDFCBANK": "1333",
-    "ICICIBANK": "4963",
-    "ITC": "1660"
+    "SBIN": "3045", "RELIANCE": "2885", "INFY": "1594", "TCS": "11536",
+    "NIFTY": "99926000", "BANKNIFTY": "99926009", "HDFCBANK": "1333",
+    "ICICIBANK": "4963", "ITC": "1660"
 }
 
-# SmartAPI quote endpoint requires the exchange trading symbol as well as token.
+# SmartAPI quote endpoint requires exchange + trading symbol + symbol token.
 ANGEL_TRADING_SYMBOLS = {
     "SBIN": "SBIN-EQ", "RELIANCE": "RELIANCE-EQ", "INFY": "INFY-EQ",
     "TCS": "TCS-EQ", "NIFTY": "Nifty 50", "BANKNIFTY": "Nifty Bank",
     "HDFCBANK": "HDFCBANK-EQ", "ICICIBANK": "ICICIBANK-EQ", "ITC": "ITC-EQ"
+}
+ANGEL_EXCHANGES = {key: "NSE" for key in ANGEL_TOKENS}
+ANGEL_EXCHANGES["SENSEX"] = "BSE"
+ANGEL_NAME_ALIASES = {
+    "NIFTY": ["NIFTY", "NIFTY 50"],
+    "BANKNIFTY": ["BANKNIFTY", "NIFTY BANK"],
+    "SENSEX": ["SENSEX", "BSE SENSEX", "S&P BSE SENSEX"],
+    "TMPV": ["TMPV", "TATA MOTORS"],
+    "M&M": ["M&M", "M AND M", "MAHINDRA AND MAHINDRA"],
+    "BAJAJ-AUTO": ["BAJAJ-AUTO", "BAJAJ AUTO"],
+    "HEROMOTOCO": ["HEROMOTOCO", "HERO MOTOCORP"],
+    "LT": ["LT", "LARSEN"],
+    "BHARTIARTL": ["BHARTIARTL", "BHARTI AIRTEL"],
+    "ADANIPORTS": ["ADANIPORTS", "ADANI PORTS"],
+    "POWERGRID": ["POWERGRID", "POWER GRID"],
+    "JSWSTEEL": ["JSWSTEEL", "JSW STEEL"],
+    "TATASTEEL": ["TATASTEEL", "TATA STEEL"],
 }
 
 st.title("Elite Trading Dashboard Final Ultimate")
@@ -3208,8 +3689,14 @@ debug_mode = st.sidebar.checkbox("Debug Mode", value=False)
 selected = st.selectbox("Select Stock / Index", list(stocks.keys()))
 data_source = st.radio("Data Source", ["Yahoo", "Angel"], horizontal=True)
 timeframe = st.selectbox("Select Time Frame", ["1m", "3m", "5m", "10m", "15m", "30m", "1h", "1d"])
-auto_refresh = st.checkbox("Enable Auto Refresh", value=True)
+auto_refresh = st.checkbox("Enable Auto Refresh", value=False, help="Keep OFF during the first data connection test. Turn ON after candles load.")
 refresh_seconds = st.selectbox("Refresh Every (seconds)", [5, 10, 15, 30, 60], index=1)
+refresh_market_now = st.button("Refresh market data now", key="refresh_primary_market_data")
+if refresh_market_now:
+    fetch_data.clear()
+    fetch_yahoo_batch.clear()
+    build_nifty_top30_scanner.clear()
+    st.session_state["angel_history_cache"] = {}
 
 with st.expander("Telegram Alert Settings"):
     telegram_enabled = st.checkbox("Enable Telegram Alerts", value=False)
@@ -3350,12 +3837,6 @@ if debug_mode:
 
 ticker = stocks[selected]
 
-if auto_refresh:
-    if AUTO_REFRESH_AVAILABLE:
-        st_autorefresh(interval=refresh_seconds * 1000, key="elite_ultimate_refresh")
-    else:
-        st.caption("Auto-refresh helper is not installed; use the manual browser refresh or install streamlit-autorefresh.")
-
 if timeframe == "1m":
     yf_interval, yf_period = "1m", "7d"
 elif timeframe == "3m":
@@ -3374,6 +3855,8 @@ else:
     yf_interval, yf_period = "1d", "1y"
 
 data = pd.DataFrame()
+yahoo_primary_rows = 0
+yahoo_fallback_rows = 0
 active_data_source = data_source
 angel_candles_response = None
 angel_candle_diagnostics = {"status": "not_requested"}
@@ -3381,8 +3864,8 @@ angel_ltp_value = None
 angel_ltp_status = "not_requested"
 angel_session_ready = False
 
-if "last_good_candles" not in st.session_state:
-    st.session_state["last_good_candles"] = None
+if "last_good_candles_by_key" not in st.session_state:
+    st.session_state["last_good_candles_by_key"] = {}
 
 # A successful login stores the authenticated SmartAPI object/session.  Use
 # this same session for both candle history and LTP polling.
@@ -3414,6 +3897,11 @@ _angel_credentials_ready = bool(
     and (_angel_session_ready or (str(angel_pin).strip() and str(angel_totp_secret).strip()))
 )
 
+st.info(
+    f"Market data request: {data_source} | {selected} | {timeframe}. "
+    "The app will show broker diagnostics if the feed returns an error or no candles."
+)
+
 if data_source == "Angel":
     if not _angel_credentials_ready:
         missing_text = ", ".join(_angel_missing_fields) or "authenticated Angel session"
@@ -3430,32 +3918,41 @@ if data_source == "Angel":
         # Poll the LTP independently of historical candles. LTP can be available
         # even when the candle-history endpoint returns an empty/error response.
         if polling_mode:
-            angel_ltp_value = get_angel_ltp_polling(
-                angel_api_key, angel_client_code, angel_pin,
-                angel_totp_secret, selected
-            )
+            with st.spinner(f"Angel One: requesting LTP quote for {selected}…"):
+                angel_ltp_value = get_angel_ltp_polling(
+                    angel_api_key, angel_client_code, angel_pin,
+                    angel_totp_secret, selected
+                )
             angel_ltp_status = "received" if angel_ltp_value is not None else "no_quote"
 
         angel_interval = map_angel_interval(timeframe)
-        angel_candles_response = get_angel_candles(
-            angel_api_key, angel_client_code, angel_pin,
-            angel_totp_secret, selected, angel_interval
-        )
+        with st.spinner(f"Angel One: requesting {angel_interval} historical candles for {selected}…"):
+            angel_candles_response = get_angel_candles_cached(
+                angel_api_key, angel_client_code, angel_pin,
+                angel_totp_secret, selected, angel_interval,
+                force_refresh=refresh_market_now
+            )
         angel_candle_diagnostics = summarize_angel_candle_response(angel_candles_response)
         data = candles_to_df(angel_candles_response)
 
+        angel_history_key = f"{selected}|{angel_interval}"
         if not data.empty:
-            st.session_state["last_good_candles"] = angel_candles_response
+            last_good_map = st.session_state.get("last_good_candles_by_key", {})
+            last_good_map[angel_history_key] = angel_candles_response
+            st.session_state["last_good_candles_by_key"] = last_good_map
         else:
-            last_good = st.session_state.get("last_good_candles")
+            last_good_map = st.session_state.get("last_good_candles_by_key", {})
+            last_good = last_good_map.get(angel_history_key)
             data = candles_to_df(last_good)
             if not data.empty:
-                st.warning("Angel One returned no new usable candles; showing the last successful Angel candle history from this session.")
+                st.warning(f"Angel One returned no usable new candles for {selected} / {angel_interval}; showing only the last successful history for this same instrument/timeframe.")
 
         # Transparent secondary OHLC fallback: keep Angel as the selected broker
         # for LTP, but use Yahoo history if Angel's candle endpoint is empty.
         if data.empty:
-            yahoo_fallback = fetch_data(ticker, yf_interval, yf_period)
+            with st.spinner(f"Angel candles unavailable; trying Yahoo Finance fallback for {selected}…"):
+                yahoo_fallback = fetch_data(ticker, yf_interval, yf_period)
+            yahoo_fallback_rows = int(len(yahoo_fallback))
             if not yahoo_fallback.empty:
                 data = yahoo_fallback
                 active_data_source = "Yahoo"
@@ -3465,14 +3962,17 @@ if data_source == "Angel":
             start_angel_websocket(angel_api_key, angel_client_code, angel_pin, angel_totp_secret, selected)
             sync_ws_state_to_session()
 else:
-    data = fetch_data(ticker, yf_interval, yf_period)
+    with st.spinner(f"Yahoo Finance: loading {ticker} ({yf_interval})…"):
+        data = fetch_data(ticker, yf_interval, yf_period)
+    yahoo_primary_rows = int(len(data))
     if data.empty and _angel_credentials_ready:
         # Optional failover if Yahoo is temporarily unavailable but the user has
         # already connected Angel One in this same session.
         angel_interval = map_angel_interval(timeframe)
-        angel_candles_response = get_angel_candles(
+        angel_candles_response = get_angel_candles_cached(
             angel_api_key, angel_client_code, angel_pin,
-            angel_totp_secret, selected, angel_interval
+            angel_totp_secret, selected, angel_interval,
+            force_refresh=refresh_market_now
         )
         angel_candle_diagnostics = summarize_angel_candle_response(angel_candles_response)
         angel_fallback = candles_to_df(angel_candles_response)
@@ -3516,27 +4016,49 @@ if data.empty:
         "Angel SDK available": SMART_API_AVAILABLE,
         "Angel authenticated session ready": _diag_session_ready,
         "Angel missing inputs (names only)": _angel_missing_fields,
-        "Angel symbol token": ANGEL_TOKENS.get(selected),
+        "Angel instrument mapping": st.session_state.get("angel_last_instrument") or {
+            "token": ANGEL_TOKENS.get(selected),
+            "trading_symbol": ANGEL_TRADING_SYMBOLS.get(selected),
+            "exchange": ANGEL_EXCHANGES.get(selected, "NSE"),
+            "source": "Built-in fallback mapping" if ANGEL_TOKENS.get(selected) else "Not resolved yet",
+        },
         "Angel interval": map_angel_interval(timeframe),
         "Angel candle response": angel_candle_diagnostics,
         "Angel LTP status": angel_ltp_status,
-        "Angel last successful candles cached": bool(st.session_state.get("last_good_candles")),
+        "Angel LTP response diagnostics": st.session_state.get("angel_last_ltp_diagnostic", {"status": "not_requested"}),
+        "Angel candle rows parsed": int(len(candles_to_df(angel_candles_response))),
+        "Angel client method available": bool(callable(getattr(st.session_state.get("angel_api"), "getCandleData", None))),
+        "Angel LTP method available": bool(callable(getattr(st.session_state.get("angel_api"), "ltpData", None))),
+        "Yahoo primary rows": yahoo_primary_rows,
+        "Yahoo fallback rows": yahoo_fallback_rows,
+        "Angel last successful candles cached for this symbol/timeframe": bool(
+            st.session_state.get("last_good_candles_by_key", {}).get(f"{selected}|{map_angel_interval(timeframe)}")
+        ),
     })
+    st.subheader("Market Dashboard — awaiting valid OHLC candles")
+    st.info("Angel login and quote polling are separate from historical candles. The dashboard will not invent OHLC bars or indicator values when both sources return no usable history.")
     st.subheader("Major Stocks Scanner — NIFTY Top 30")
-    st.caption("Scanner uses Yahoo Finance independently of the selected primary data source.")
-    if st.button("Retry NIFTY Top 30 Scanner", key="retry_scanner_no_main_data"):
+    st.caption("Yahoo Finance scanner: 30 constituents across 3m / 5m / 10m / 15m. It runs separately from the primary candle feed.")
+    st.info("The scanner is deliberately not auto-started on a failed main feed. This prevents slow bulk requests from making the whole page appear blank.")
+    if st.button("Run / refresh NIFTY Top 30 scanner", key="run_scanner_no_main_data"):
+        fetch_yahoo_batch.clear()
         build_nifty_top30_scanner.clear()
-        fetch_data.clear()
-        st.rerun()
-    try:
-        empty_feed_scanner = build_nifty_top30_scanner()
-        if empty_feed_scanner.empty:
-            st.info("Scanner feed is also unavailable right now. No prices or trends will be fabricated.")
-        else:
-            st.dataframe(empty_feed_scanner, use_container_width=True, hide_index=True)
-            st.dataframe(scanner_breadth_summary(empty_feed_scanner), use_container_width=True, hide_index=True)
-    except Exception as scanner_error:
-        st.error(f"Scanner error: {scanner_error}")
+        try:
+            with st.spinner("Fetching NIFTY Top 30 in two Yahoo Finance batch requests…"):
+                st.session_state["nifty30_scanner_result"] = build_nifty_top30_scanner()
+            st.session_state["nifty30_scanner_last_run"] = now_str()
+        except Exception as scanner_error:
+            st.error(f"Scanner error: {scanner_error}")
+            log_app_error("nifty_top30_scanner_ui", scanner_error)
+    scanner_result = st.session_state.get("nifty30_scanner_result")
+    if isinstance(scanner_result, pd.DataFrame) and not scanner_result.empty:
+        st.caption("Last scanner run: " + str(st.session_state.get("nifty30_scanner_last_run", "unknown")))
+        render_nifty_scanner_result(scanner_result)
+    else:
+        st.dataframe(blank_nifty_scanner_frame(), use_container_width=True, hide_index=True)
+        st.caption("Press Run / refresh NIFTY Top 30 scanner to retrieve market data. Prices and trends are not fabricated.")
+    st.subheader("Charts and analytics")
+    st.info("Heikin-Ashi candles, MACD, RSI, VWAP, ADX, MTF, signal scoring and backtest are paused until a real OHLC history response is received.")
     st.subheader("Saved Trade Journal")
     try:
         saved_journal = load_journal()
@@ -3554,6 +4076,8 @@ if data.empty:
         except Exception as error_read_exc:
             st.caption(f"Could not read local error log: {error_read_exc}")
     st.info("On Sundays/market holidays, live ticks are not expected. Historical candles from prior sessions should still be available; use the Angel candle response above to identify broker/API errors.")
+    if auto_refresh:
+        st.caption("Auto-refresh is paused while the selected source has no valid OHLC data. Use the Refresh market data and scanner button above.")
     st.stop()
 
 if active_data_source != data_source:
@@ -3603,7 +4127,10 @@ bull_count = sum("Bullish" in sig for sig in mtf_table["Trend"])
 bear_count = sum("Bearish" in sig for sig in mtf_table["Trend"])
 
 dynamic_oc_symbol = get_dynamic_option_chain_symbol(selected)
-option_metrics = parse_option_chain_metrics(dynamic_oc_symbol)
+option_metrics = parse_option_chain_metrics(dynamic_oc_symbol) if dynamic_oc_symbol else {
+    "pcr": None, "oi_bias": "Neutral", "long_unwinding": False,
+    "short_covering": False, "call_oi": 0, "put_oi": 0
+}
 
 news_info = {"allow_trade": True, "message": "News filter disabled", "events": []}
 if news_filter_enabled:
@@ -3949,54 +4476,24 @@ if news_filter_enabled:
         st.info(news_info["message"])
 
 st.subheader("Major Stocks Scanner — NIFTY Top 30 | CMP & % Change")
-st.caption("30 major NIFTY constituents scanned on 3m, 5m, 10m and 15m. Scanner uses Yahoo Finance 1-minute candles resampled to each timeframe; unavailable feeds are shown as N/A, never fabricated.")
-scanner_enabled = st.checkbox("Enable NIFTY Top 30 multi-timeframe scanner", value=True, key="enable_nifty_top30_scanner")
-if scanner_enabled:
-    with st.spinner("Scanning NIFTY Top 30 stocks across 3m / 5m / 10m / 15m..."):
-        nifty30_df = build_nifty_top30_scanner()
-    if nifty30_df.empty:
-        st.warning("NIFTY Top 30 scanner data is currently unavailable. Check Yahoo Finance connectivity or retry after a short interval.")
-    else:
-        breadth = scanner_breadth_summary(nifty30_df)
-        st.markdown("**NIFTY market breadth by timeframe**")
-        st.dataframe(breadth, use_container_width=True, hide_index=True)
-        overall_row = breadth[breadth["Timeframe"] == "Overall (all 4 TF votes)"]
-        if not overall_row.empty:
-            br = overall_row.iloc[0]
-            k1,k2,k3,k4 = st.columns(4)
-            k1.metric("Overall Bullish %", f"{br['Bullish %']:.1f}%", f"{int(br['Bullish'])} bullish votes")
-            k2.metric("Overall Bearish %", f"{br['Bearish %']:.1f}%", f"{int(br['Bearish'])} bearish votes")
-            k3.metric("Neutral Votes", int(br["Neutral"]))
-            k4.metric("Total Valid TF Votes", int(br["Coverage"]))
-        st.markdown("**Company-wise CMP, daily % change and 3m / 5m / 10m / 15m trend**")
-        display_cols=["Company","CMP","% Change","3m","5m","10m","15m","Overall","Score"]
-        st.dataframe(nifty30_df[display_cols].sort_values("Score", ascending=False), use_container_width=True, hide_index=True)
-        bull_tab, bear_tab, neutral_tab = st.tabs(["Bullish Companies", "Bearish Companies", "Neutral / N/A"])
-        with bull_tab:
-            bullish_companies=nifty30_df[nifty30_df["Overall"]=="Bullish"].sort_values("Score",ascending=False)
-            if bullish_companies.empty: st.info("No bullish companies confirmed across the selected timeframes.")
-            else: st.dataframe(bullish_companies[display_cols],use_container_width=True,hide_index=True)
-        with bear_tab:
-            bearish_companies=nifty30_df[nifty30_df["Overall"]=="Bearish"].sort_values("Score",ascending=True)
-            if bearish_companies.empty: st.info("No bearish companies confirmed across the selected timeframes.")
-            else: st.dataframe(bearish_companies[display_cols],use_container_width=True,hide_index=True)
-        with neutral_tab:
-            neutral_companies=nifty30_df[nifty30_df["Overall"].isin(["Neutral","N/A"]) ]
-            if neutral_companies.empty: st.info("No neutral / unavailable companies.")
-            else: st.dataframe(neutral_companies[display_cols],use_container_width=True,hide_index=True)
-        top_bull=nifty30_df[nifty30_df["Overall"]=="Bullish"].sort_values("Score",ascending=False).head(5)
-        top_bear=nifty30_df[nifty30_df["Overall"]=="Bearish"].sort_values("Score",ascending=True).head(5)
-        top_b1,top_b2=st.columns(2)
-        with top_b1:
-            st.markdown("**Top Bullish Companies**")
-            if not top_bull.empty: st.dataframe(top_bull[["Company","CMP","% Change","3m","5m","10m","15m","Score"]],use_container_width=True,hide_index=True)
-            else: st.info("No top bullish candidate currently.")
-        with top_b2:
-            st.markdown("**Top Bearish Companies**")
-            if not top_bear.empty: st.dataframe(top_bear[["Company","CMP","% Change","3m","5m","10m","15m","Score"]],use_container_width=True,hide_index=True)
-            else: st.info("No top bearish candidate currently.")
+st.caption("30 major NIFTY constituents scanned on 3m, 5m, 10m and 15m. Yahoo Finance is independent of the primary Angel/Yahoo candle selection.")
+if st.button("Run / refresh NIFTY Top 30 scanner", key="run_scanner_with_main_data"):
+    fetch_yahoo_batch.clear()
+    build_nifty_top30_scanner.clear()
+    try:
+        with st.spinner("Scanning NIFTY Top 30 across 3m / 5m / 10m / 15m…"):
+            st.session_state["nifty30_scanner_result"] = build_nifty_top30_scanner()
+        st.session_state["nifty30_scanner_last_run"] = now_str()
+    except Exception as scanner_error:
+        st.error(f"Scanner error: {scanner_error}")
+        log_app_error("nifty_top30_scanner_ui", scanner_error)
+scanner_result = st.session_state.get("nifty30_scanner_result")
+if isinstance(scanner_result, pd.DataFrame) and not scanner_result.empty:
+    st.caption("Last scanner run: " + str(st.session_state.get("nifty30_scanner_last_run", "unknown")))
+    render_nifty_scanner_result(scanner_result)
 else:
-    st.info("NIFTY Top 30 scanner is paused. Enable the checkbox to load the breadth dashboard.")
+    st.dataframe(blank_nifty_scanner_frame(), use_container_width=True, hide_index=True)
+    st.info("The 30-stock scanner is ready. Press Run / refresh NIFTY Top 30 scanner to fetch provider data.")
 
 st.subheader("Backtest Analytics")
 st.caption(f"Backtest input: {len(backtest_data):,} candles | {backtest_data.index.min()} to {backtest_data.index.max()} | {selected} | {timeframe}")
@@ -4141,3 +4638,13 @@ if debug_mode:
     st.write("Live price:", current_display_price)
     st.write("WebSocket state:", st.session_state.get("ws_connected", False))
     st.write("Last WebSocket tick:", st.session_state.get("ws_last_tick"))
+    st.write("Angel instrument mapping:", st.session_state.get("angel_last_instrument", "Not requested in this session"))
+    st.write("Angel LTP diagnostics:", st.session_state.get("angel_last_ltp_diagnostic", {"status": "not_requested"}))
+
+
+# Auto-refresh is deliberately rendered after dashboard output so it cannot
+# interrupt the first market-data request during initial page load.
+if auto_refresh and AUTO_REFRESH_AVAILABLE:
+    st_autorefresh(interval=refresh_seconds * 1000, key="elite_ultimate_refresh_after_dashboard")
+elif auto_refresh and not AUTO_REFRESH_AVAILABLE:
+    st.caption("Auto-refresh helper is not installed; use the manual browser refresh or install streamlit-autorefresh.")
