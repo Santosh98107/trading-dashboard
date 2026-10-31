@@ -3131,7 +3131,7 @@ major_stocks = {
 }
 
 st.title("Elite Trading Dashboard Final Ultimate")
-st.caption("Polling Primary | WebSocket Secondary | Yahoo / Angel One | NSE Website LTP fallback | Heikin-Ashi | Staged Paper Exits | OI/PCR | FII/DII")
+st.caption("Polling Primary | WebSocket Secondary | Yahoo / Angel One | NSE Website LTP fallback | Heikin-Ashi | Candlestick Patterns | OI/PCR | FII/DII | Paper Simulation Only — no broker orders")
 
 debug_mode = st.sidebar.checkbox("Debug Mode", value=False)
 selected = st.selectbox("Select Stock / Index", list(stocks.keys()))
@@ -3161,6 +3161,10 @@ with st.expander("Angel One API Settings"):
     angel_pin = st.text_input("Angel PIN", type="password")
     angel_totp_secret = st.text_input("Angel TOTP Secret", type="password")
     st.caption("Polling is the PRIMARY feed. WebSocket is a SECONDARY optional feed/fallback.")
+    if SmartConnect is None or pyotp is None:
+        st.warning("Angel One connector packages are not installed. Yahoo Finance will continue to work; install the optional Angel dependencies from requirements-angel.txt to enable Angel One data.")
+    if not SMART_WS_AVAILABLE:
+        st.info("Angel One WebSocket connector is unavailable until the optional SmartAPI package is installed. Polling remains the preferred mode when Angel One is available.")
     polling_mode = st.checkbox("Enable REST LTP Polling (Primary)", value=True)
     ws_enable = st.checkbox("Enable Angel WebSocket (Secondary / Optional)", value=False)
 
