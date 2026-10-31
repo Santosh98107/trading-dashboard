@@ -15,7 +15,7 @@ import streamlit as st
 import yfinance as yf
 
 # Visible deployment marker: confirms which source file Streamlit Cloud is running.
-APP_BUILD_ID = "2026-11-01-ANGEL-OHLC-FAILOVER-DIAGNOSTIC-02"
+APP_BUILD_ID = "2026-11-01-ANGEL-REQUEST-GATE-DIAGNOSTIC-03"
 # Optional integrations: Yahoo mode must still start if Angel SDK/TOTP or
 # the auto-refresh helper is not installed.
 try:
@@ -3367,15 +3367,38 @@ _angel_session_ready = bool(
     and _angel_cached_session.get("data")
     and st.session_state.get("angel_cache_key") == _angel_cache_key
 )
+# Distinguish missing inputs from an authenticated-session cache. After a Cloud
+# redeploy/restart, in-memory SmartAPI sessions are reset and the user must log in
+# again in this running app session. A prior successful login from an older build
+# is not proof that this new session is authenticated.
+_angel_missing_fields = []
+if not str(angel_api_key).strip():
+    _angel_missing_fields.append("API Key")
+if not str(angel_client_code).strip():
+    _angel_missing_fields.append("Client Code")
+if not _angel_session_ready:
+    if not str(angel_pin).strip():
+        _angel_missing_fields.append("PIN")
+    if not str(angel_totp_secret).strip():
+        _angel_missing_fields.append("TOTP Secret")
 _angel_credentials_ready = bool(
-    str(angel_api_key).strip() and str(angel_client_code).strip()
-    and str(angel_totp_secret).strip()
-    and (str(angel_pin).strip() or _angel_session_ready)
+    str(angel_api_key).strip()
+    and str(angel_client_code).strip()
+    and (_angel_session_ready or (str(angel_pin).strip() and str(angel_totp_secret).strip()))
 )
 
 if data_source == "Angel":
     if not _angel_credentials_ready:
-        st.error("Angel One credentials/session are incomplete. Use Test Angel Login first.")
+        missing_text = ", ".join(_angel_missing_fields) or "authenticated Angel session"
+        angel_ltp_status = "not_requested_missing_credentials"
+        angel_candle_diagnostics = {
+            "status": "not_requested",
+            "reason": f"Required fields/session missing: {missing_text}",
+        }
+        st.error(
+            f"Angel One data requests were NOT sent. Missing: {missing_text}. "
+            "Re-enter credentials and click Test Angel Login in this deployed app session."
+        )
     else:
         # Poll the LTP independently of historical candles. LTP can be available
         # even when the candle-history endpoint returns an empty/error response.
@@ -3435,10 +3458,26 @@ if data.empty:
     if data_source == "Angel" and polling_mode:
         if angel_ltp_value is not None:
             st.metric("Angel One Latest Traded Price (LTP)", f"{angel_ltp_value:,.2f}")
+        elif angel_ltp_status == "not_requested_missing_credentials":
+            st.warning(
+                "Angel LTP polling was skipped because the current app session is not authenticated. "
+                f"Missing: {', '.join(_angel_missing_fields) or 'Angel session'}."
+            )
+        elif angel_ltp_status == "no_quote":
+            st.warning("Angel LTP request was attempted but returned no usable quote. Check the broker response, exchange/symbol mapping and token.")
         else:
-            st.warning("Angel One LTP polling did not return a quote. Check the selected symbol/token and broker quote response.")
+            st.caption(f"Angel LTP polling status: {angel_ltp_status}")
     st.warning("No usable OHLC candles were returned by the selected source or its available fallback. The chart and indicator calculations are paused rather than displaying invented candles.")
     st.subheader("Data Diagnostics")
+    # Re-read the cache after the request attempt: a fresh login may have been
+    # created by angel_login() during this same rerun.
+    _diag_session_obj = st.session_state.get("angel_session")
+    _diag_session_data = _diag_session_obj.get("data") if isinstance(_diag_session_obj, dict) else None
+    _diag_session_ready = bool(
+        st.session_state.get("angel_api") is not None
+        and _diag_session_data
+        and st.session_state.get("angel_cache_key") == f"{angel_client_code}_{angel_api_key}"
+    )
     st.write({
         "Selected source": data_source,
         "OHLC source attempted": active_data_source,
@@ -3448,7 +3487,8 @@ if data.empty:
         "Yahoo interval": yf_interval,
         "Yahoo period": yf_period,
         "Angel SDK available": SMART_API_AVAILABLE,
-        "Angel authenticated session ready": _angel_session_ready,
+        "Angel authenticated session ready": _diag_session_ready,
+        "Angel missing inputs (names only)": _angel_missing_fields,
         "Angel symbol token": ANGEL_TOKENS.get(selected),
         "Angel interval": map_angel_interval(timeframe),
         "Angel candle response": angel_candle_diagnostics,
