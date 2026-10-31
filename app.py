@@ -15,7 +15,7 @@ import streamlit as st
 import yfinance as yf
 
 # Visible deployment marker: confirms which source file Streamlit Cloud is running.
-APP_BUILD_ID = "2026-11-01-ANGEL-PIN-DIAGNOSTIC-01"
+APP_BUILD_ID = "2026-11-01-ANGEL-OHLC-FAILOVER-DIAGNOSTIC-02"
 # Optional integrations: Yahoo mode must still start if Angel SDK/TOTP or
 # the auto-refresh helper is not installed.
 try:
@@ -644,6 +644,37 @@ def candles_to_df(candles):
     except Exception as e:
         log_app_error("candles_to_df", e)
         return pd.DataFrame()
+
+
+def summarize_angel_candle_response(response):
+    """Return safe, compact broker-response diagnostics (never credentials)."""
+    if response is None:
+        return {"response_type": "None", "status": None, "message": "No response object returned", "bars_received": 0}
+    if isinstance(response, dict):
+        payload = response.get("data")
+        if isinstance(payload, (list, tuple, pd.DataFrame)):
+            count = len(payload)
+            payload_type = type(payload).__name__
+        elif isinstance(payload, dict):
+            count = len(payload.get("candles", [])) if isinstance(payload.get("candles"), list) else 0
+            payload_type = "dict"
+        else:
+            count = 0
+            payload_type = type(payload).__name__ if payload is not None else "None"
+        return {
+            "response_type": "dict",
+            "status": response.get("status"),
+            "message": str(response.get("message") or response.get("error") or "")[:500],
+            "error_code": response.get("errorcode") or response.get("errorCode"),
+            "payload_type": payload_type,
+            "bars_received": count,
+            "response_keys": list(response.keys())[:20],
+        }
+    if isinstance(response, (list, tuple, pd.DataFrame)):
+        return {"response_type": type(response).__name__, "status": None,
+                "message": "", "bars_received": len(response)}
+    return {"response_type": type(response).__name__, "status": None,
+            "message": str(response)[:500], "bars_received": 0}
 
 
 def get_angel_ltp_polling(api_key, client_code, pin, totp_secret, symbol_name):
@@ -3316,59 +3347,119 @@ else:
     yf_interval, yf_period = "1d", "1y"
 
 data = pd.DataFrame()
+active_data_source = data_source
+angel_candles_response = None
+angel_candle_diagnostics = {"status": "not_requested"}
+angel_ltp_value = None
+angel_ltp_status = "not_requested"
+angel_session_ready = False
 
 if "last_good_candles" not in st.session_state:
     st.session_state["last_good_candles"] = None
 
+# A successful login stores the authenticated SmartAPI object/session.  Use
+# this same session for both candle history and LTP polling.
+_angel_cache_key = f"{angel_client_code}_{angel_api_key}"
+_angel_cached_session = st.session_state.get("angel_session")
+_angel_session_ready = bool(
+    st.session_state.get("angel_api") is not None
+    and isinstance(_angel_cached_session, dict)
+    and _angel_cached_session.get("data")
+    and st.session_state.get("angel_cache_key") == _angel_cache_key
+)
+_angel_credentials_ready = bool(
+    str(angel_api_key).strip() and str(angel_client_code).strip()
+    and str(angel_totp_secret).strip()
+    and (str(angel_pin).strip() or _angel_session_ready)
+)
+
 if data_source == "Angel":
-    # A successful login already stores the authenticated SmartAPI session in
-    # Streamlit session_state. Password widgets may be blanked on a later rerun;
-    # in that case a matching authenticated session is sufficient and the PIN
-    # is not needed again until a fresh login is required.
-    _angel_cache_key = f"{angel_client_code}_{angel_api_key}"
-    _angel_cached_session = st.session_state.get("angel_session")
-    _angel_session_ready = bool(
-        st.session_state.get("angel_api") is not None
-        and isinstance(_angel_cached_session, dict)
-        and _angel_cached_session.get("data")
-        and st.session_state.get("angel_cache_key") == _angel_cache_key
-    )
-    _angel_required_missing = [
-        name for name, value in (("API Key", angel_api_key), ("Client Code", angel_client_code), ("TOTP Secret", angel_totp_secret))
-        if not str(value).strip()
-    ]
-    if not angel_pin.strip() and not _angel_session_ready:
-        _angel_required_missing.append("PIN (required for a fresh login)")
-    if _angel_required_missing:
-        st.error("Angel One data session is not ready. Missing fields: " + ", ".join(_angel_required_missing) + ". Enter the fields and use Test Angel Login.")
-        data = pd.DataFrame()
+    if not _angel_credentials_ready:
+        st.error("Angel One credentials/session are incomplete. Use Test Angel Login first.")
     else:
+        # Poll the LTP independently of historical candles. LTP can be available
+        # even when the candle-history endpoint returns an empty/error response.
+        if polling_mode:
+            angel_ltp_value = get_angel_ltp_polling(
+                angel_api_key, angel_client_code, angel_pin,
+                angel_totp_secret, selected
+            )
+            angel_ltp_status = "received" if angel_ltp_value is not None else "no_quote"
+
         angel_interval = map_angel_interval(timeframe)
-        candles = get_angel_candles(angel_api_key, angel_client_code, angel_pin, angel_totp_secret, selected, angel_interval)
-        data = candles_to_df(candles)
-        if data.empty:
+        angel_candles_response = get_angel_candles(
+            angel_api_key, angel_client_code, angel_pin,
+            angel_totp_secret, selected, angel_interval
+        )
+        angel_candle_diagnostics = summarize_angel_candle_response(angel_candles_response)
+        data = candles_to_df(angel_candles_response)
+
+        if not data.empty:
+            st.session_state["last_good_candles"] = angel_candles_response
+        else:
             last_good = st.session_state.get("last_good_candles")
             data = candles_to_df(last_good)
-            if isinstance(candles, dict):
-                st.error(f"Angel One candle response: {candles.get('message', 'No candle data returned')}")
             if not data.empty:
-                st.warning("Using last successful Angel candle data.")
-        else:
-            st.session_state["last_good_candles"] = candles
+                st.warning("Angel One returned no new usable candles; showing the last successful Angel candle history from this session.")
+
+        # Transparent secondary OHLC fallback: keep Angel as the selected broker
+        # for LTP, but use Yahoo history if Angel's candle endpoint is empty.
+        if data.empty:
+            yahoo_fallback = fetch_data(ticker, yf_interval, yf_period)
+            if not yahoo_fallback.empty:
+                data = yahoo_fallback
+                active_data_source = "Yahoo"
+                st.warning("Angel One candle history is unavailable. Using Yahoo Finance OHLC as a clearly-labelled fallback; Angel LTP polling remains separate.")
+
         if ws_enable:
             start_angel_websocket(angel_api_key, angel_client_code, angel_pin, angel_totp_secret, selected)
             sync_ws_state_to_session()
 else:
     data = fetch_data(ticker, yf_interval, yf_period)
-    if data.empty:
-        st.error(f"Yahoo Finance returned no OHLCV rows for {ticker} ({yf_interval}, {yf_period}). Check internet access, Yahoo availability, symbol and market session. See Debug Mode / app_error_log.csv for details.")
+    if data.empty and _angel_credentials_ready:
+        # Optional failover if Yahoo is temporarily unavailable but the user has
+        # already connected Angel One in this same session.
+        angel_interval = map_angel_interval(timeframe)
+        angel_candles_response = get_angel_candles(
+            angel_api_key, angel_client_code, angel_pin,
+            angel_totp_secret, selected, angel_interval
+        )
+        angel_candle_diagnostics = summarize_angel_candle_response(angel_candles_response)
+        angel_fallback = candles_to_df(angel_candles_response)
+        if not angel_fallback.empty:
+            data = angel_fallback
+            active_data_source = "Angel"
+            st.warning("Yahoo Finance returned no OHLC rows. Using connected Angel One candle history as a clearly-labelled fallback.")
 
 if data.empty:
-    st.warning("Live price charts and signal calculations need valid OHLC candles. The independent scanner and saved journal are still shown below.")
+    if data_source == "Angel" and polling_mode:
+        if angel_ltp_value is not None:
+            st.metric("Angel One Latest Traded Price (LTP)", f"{angel_ltp_value:,.2f}")
+        else:
+            st.warning("Angel One LTP polling did not return a quote. Check the selected symbol/token and broker quote response.")
+    st.warning("No usable OHLC candles were returned by the selected source or its available fallback. The chart and indicator calculations are paused rather than displaying invented candles.")
+    st.subheader("Data Diagnostics")
+    st.write({
+        "Selected source": data_source,
+        "OHLC source attempted": active_data_source,
+        "Selected symbol": selected,
+        "Yahoo ticker": ticker,
+        "Timeframe": timeframe,
+        "Yahoo interval": yf_interval,
+        "Yahoo period": yf_period,
+        "Angel SDK available": SMART_API_AVAILABLE,
+        "Angel authenticated session ready": _angel_session_ready,
+        "Angel symbol token": ANGEL_TOKENS.get(selected),
+        "Angel interval": map_angel_interval(timeframe),
+        "Angel candle response": angel_candle_diagnostics,
+        "Angel LTP status": angel_ltp_status,
+        "Angel last successful candles cached": bool(st.session_state.get("last_good_candles")),
+    })
     st.subheader("Major Stocks Scanner — NIFTY Top 30")
     st.caption("Scanner uses Yahoo Finance independently of the selected primary data source.")
     if st.button("Retry NIFTY Top 30 Scanner", key="retry_scanner_no_main_data"):
         build_nifty_top30_scanner.clear()
+        fetch_data.clear()
         st.rerun()
     try:
         empty_feed_scanner = build_nifty_top30_scanner()
@@ -3385,12 +3476,21 @@ if data.empty:
         st.dataframe(saved_journal.tail(100), use_container_width=True, hide_index=True)
     except Exception as journal_error:
         st.error(f"Journal error: {journal_error}")
-    st.subheader("Data Diagnostics")
-    st.write({"Selected source": data_source, "Selected symbol": selected, "Ticker": ticker,
-              "Timeframe": timeframe, "Yahoo interval": yf_interval, "Yahoo period": yf_period,
-              "Angel SDK available": SMART_API_AVAILABLE, "Last successful Angel candles": bool(st.session_state.get("last_good_candles"))})
-    st.info("For Angel One, verify all four credentials in the Angel One API Settings expander. For Yahoo, retry after a short interval; intraday feeds can be rate-limited or unavailable.")
+    if debug_mode:
+        st.subheader("Recent App Errors")
+        try:
+            recent_errors = safe_read_csv(ERROR_LOG_FILE, pd.DataFrame())
+            if not recent_errors.empty:
+                st.dataframe(recent_errors.tail(30), use_container_width=True, hide_index=True)
+            else:
+                st.caption("No application errors have been logged in this session's local data directory.")
+        except Exception as error_read_exc:
+            st.caption(f"Could not read local error log: {error_read_exc}")
+    st.info("On Sundays/market holidays, live ticks are not expected. Historical candles from prior sessions should still be available; use the Angel candle response above to identify broker/API errors.")
     st.stop()
+
+if active_data_source != data_source:
+    st.info(f"Selected source: {data_source} | Actual OHLC candle source: {active_data_source}. The data source is labelled separately so fallback data is not mistaken for broker data.")
 
 if timeframe == "3m":
     data = resample_ohlcv(data, "3min")
@@ -3410,7 +3510,7 @@ if len(data) < 35:
 
 htf_interval, _ = get_higher_timeframe(timeframe)
 angel_creds = (angel_api_key, angel_client_code, angel_pin, angel_totp_secret)
-htf_data = get_data_for_timeframe(data_source, selected, ticker, htf_interval, angel_creds)
+htf_data = get_data_for_timeframe(active_data_source, selected, ticker, htf_interval, angel_creds)
 
 if not htf_data.empty:
     htf_data = add_indicators(htf_data).bfill().ffill()
@@ -3425,10 +3525,10 @@ else:
 mtf_table = pd.DataFrame({
     "Timeframe": ["1m", "3m", "5m", "15m"],
     "Trend": [
-        get_mtf_signal(data_source, selected, ticker, "1m", angel_creds),
-        get_mtf_signal(data_source, selected, ticker, "3m", angel_creds),
-        get_mtf_signal(data_source, selected, ticker, "5m", angel_creds),
-        get_mtf_signal(data_source, selected, ticker, "15m", angel_creds)
+        get_mtf_signal(active_data_source, selected, ticker, "1m", angel_creds),
+        get_mtf_signal(active_data_source, selected, ticker, "3m", angel_creds),
+        get_mtf_signal(active_data_source, selected, ticker, "5m", angel_creds),
+        get_mtf_signal(active_data_source, selected, ticker, "15m", angel_creds)
     ]
 })
 
@@ -3506,10 +3606,11 @@ elif quality_score >= 55:
 else:
     signal_quality = "Weak"
 
-live_price = None
-if data_source == "Angel" and polling_mode:
+live_price = angel_ltp_value if data_source == "Angel" and polling_mode else None
+if data_source == "Angel" and polling_mode and live_price is None:
+    # One retry after OHLC is available; no credentials are exposed in UI/logs.
     live_price = get_angel_ltp_polling(angel_api_key, angel_client_code, angel_pin, angel_totp_secret, selected)
-elif data_source == "Angel" and ws_enable:
+elif data_source == "Angel" and ws_enable and not polling_mode:
     sync_ws_state_to_session()
     live_price = st.session_state.get("live_price")
 
