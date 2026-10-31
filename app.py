@@ -1,7 +1,3 @@
-
-
-File Name: Elite_Trading_Dashboard_Ultimate+
-
 # ==============================================================================
 # File: Elite_Trading_Dashboard_Pro.py
 # Complete Production Merged Trading Dashboard
