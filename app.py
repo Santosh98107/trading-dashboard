@@ -4246,8 +4246,8 @@ def walk_forward_validation(df, symbol="", timeframe_label="", option_metrics=No
 
         fold_results = []
         total_len = len(df)
-        train_size = int(total_len * 0.6)
-        test_size = int(total_len * 0.2)
+        train_size = int(total_len * 0.5)
+        test_size = int(total_len * 0.1)
         start = 0
         fold_no = 1
         while (start + train_size + test_size) <= total_len:
