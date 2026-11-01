@@ -1507,7 +1507,7 @@ def add_indicators(df):
     df["BB_Lower"] = df["SMA20"] - 2 * std20
 
     df["Volume_MA20"] = df["Volume"].rolling(20).mean()
-    df["Volume_Spike"] = df["Volume"] > (1.8 * df["Volume_MA20"])
+    df["Volume_Spike"] = df["Volume"] > (1.5 * df["Volume_MA20"])
 
     df["PivotHigh"] = df["High"].rolling(20).max()
     df["PivotLow"] = df["Low"].rolling(20).min()
