@@ -16,7 +16,7 @@ import streamlit as st
 import yfinance as yf
 
 # Visible deployment marker: confirms which source file Streamlit Cloud is running.
-APP_BUILD_ID = "2026-11-01-SIGNAL-ENGINE-AUDIT-16"
+APP_BUILD_ID = "2026-11-02-PERFORMANCE-DATA-STALL-FIX-18"
 # Optional integrations: Yahoo mode must still start if Angel SDK/TOTP or
 # the auto-refresh helper is not installed.
 try:
@@ -91,7 +91,7 @@ MIN_VALIDATION_SCORE_FOR_ALERT = 70
 DEFAULT_INITIAL_BALANCE = 100000.0
 DATA_INTEGRITY_MIN_ROWS = 30
 BACKUP_RETENTION_COUNT = 30
-USE_POLLING_AS_PRIMARY = True
+USE_POLLING_AS_PRIMARY = False  # WebSocket is primary for Angel live LTP; REST polling is fallback.
 
 WS_STATE_LOCK = threading.Lock()
 WS_SHARED_STATE = {
@@ -106,6 +106,9 @@ WS_SHARED_STATE = {
     "symbol": None,
     "socket": None,
     "last_data_time": None,
+    "last_tick_epoch": None,
+    "generation": 0,
+    "retry_exhausted": False,
     "log": []
 }
 
@@ -543,11 +546,11 @@ def fetch_data(ticker, interval, period):
     try:
         try:
             df = yf.download(ticker, interval=interval, period=period,
-                             progress=False, auto_adjust=False, threads=False, timeout=15,
+                             progress=False, auto_adjust=False, threads=False, timeout=8,
                              multi_level_index=False)
         except TypeError:
             df = yf.download(ticker, interval=interval, period=period,
-                             progress=False, auto_adjust=False, threads=False, timeout=15)
+                             progress=False, auto_adjust=False, threads=False, timeout=8)
         except Exception as exc:
             errors.append(f"download: {exc}")
 
@@ -569,7 +572,7 @@ def fetch_data(ticker, interval, period):
             # Ticker.history is a useful fallback when download returns a changed schema.
             try:
                 hist = yf.Ticker(ticker).history(period=period, interval=interval,
-                                                 auto_adjust=False, prepost=False, timeout=15)
+                                                 auto_adjust=False, prepost=False, timeout=8)
                 if not hist.empty and all(c in hist.columns for c in needed):
                     df = hist[needed].copy()
             except Exception as exc:
@@ -691,7 +694,7 @@ def get_angel_instrument_master():
     """Download and normalize Angel One's public instrument master once per day."""
     url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
     try:
-        response = requests.get(url, timeout=20)
+        response = requests.get(url, timeout=8)
         response.raise_for_status()
         payload = response.json()
         frame = pd.DataFrame(payload)
@@ -1072,10 +1075,13 @@ def sync_ws_state_to_session():
         "ws_connected": state["connected"],
         "ws_error": state["error"],
         "ws_last_tick": state["last_tick"],
+        "ws_last_tick_epoch": state.get("last_tick_epoch"),
         "live_price": state["live_price"],
         "ws_retries": state["retries"],
         "ws_should_run": state["should_run"],
         "ws_thread_started": state["thread_started"],
+        "ws_symbol": state.get("symbol"),
+        "ws_retry_exhausted": state.get("retry_exhausted", False),
         "ws_log": state["log"]
     }.items():
         st.session_state[k] = v
@@ -1087,10 +1093,12 @@ def init_ws_state():
         "ws_connected": False,
         "ws_error": "",
         "ws_last_tick": None,
+        "ws_last_tick_epoch": None,
         "ws_thread_started": False,
         "live_price": None,
         "ws_retries": 0,
         "ws_should_run": False,
+        "ws_retry_exhausted": False,
         "ws_log": []
     }
     for k, v in defaults.items():
@@ -1099,24 +1107,49 @@ def init_ws_state():
     sync_ws_state_to_session()
 
 
-def stop_angel_websocket():
+def ws_live_quote(max_age_seconds=20, symbol_name=None):
+    """Return a fresh WebSocket LTP only while its socket is connected."""
+    state = ws_get_state()
+    if symbol_name and str(state.get("symbol")) != str(symbol_name):
+        return None
+    price = state.get("live_price")
+    received_at = state.get("last_tick_epoch")
+    if not state.get("connected") or price is None or received_at is None:
+        return None
     try:
-        ws_log("Stop requested")
-        ws_set_state(should_run=False, connected=False, running=False, error="WebSocket stopped")
+        age = pytime.time() - float(received_at)
+        price = float(price)
+        if age < 0 or age > float(max_age_seconds) or not np.isfinite(price) or price <= 0:
+            return None
+        return price
+    except Exception:
+        return None
+
+
+def stop_angel_websocket():
+    """Invalidate the worker generation before closing the active socket."""
+    try:
         state = ws_get_state()
-        sws = state.get("socket")
-        if sws is not None:
+        socket_obj = state.get("socket")
+        next_generation = int(state.get("generation", 0)) + 1
+        ws_set_state(
+            generation=next_generation, should_run=False, connected=False,
+            running=False, thread_started=False, socket=None,
+            live_price=None, last_tick=None, last_tick_epoch=None,
+            retry_exhausted=False, error="WebSocket stopped"
+        )
+        if socket_obj is not None:
             try:
-                if hasattr(sws, "close_connection"):
-                    sws.close_connection()
-                elif hasattr(sws, "close"):
-                    sws.close()
-            except Exception as e:
-                ws_log(f"Socket close error: {e}")
-        ws_set_state(socket=None, thread_started=False)
-    except Exception as e:
-        ws_set_state(error=f"Stop error: {e}")
-        log_app_error("stop_angel_websocket", e)
+                if hasattr(socket_obj, "close_connection"):
+                    socket_obj.close_connection()
+                elif hasattr(socket_obj, "close"):
+                    socket_obj.close()
+            except Exception as exc:
+                ws_log(f"Socket close error: {exc}")
+        sync_ws_state_to_session()
+    except Exception as exc:
+        ws_set_state(error=f"Stop error: {exc}")
+        log_app_error("stop_angel_websocket", exc)
 
 
 def extract_ltp_from_message(message):
@@ -1127,129 +1160,166 @@ def extract_ltp_from_message(message):
         if key in message and message.get(key) is not None:
             try:
                 val = float(message[key])
-                if val > 10000:
+                # SmartAPI WebSocket v2 binary last_traded_price is in paise.
+                # Alternate wrapper keys (ltp/lastTradedPrice/close) are already
+                # expressed in rupees and must not be divided merely because an
+                # index value is greater than 10,000.
+                if key in {"last_traded_price", "last_traded_price_int"} and val > 0:
                     val /= 100.0
-                return val
+                return val if np.isfinite(val) and val > 0 else None
             except Exception:
                 return None
     return None
 
 
 def start_angel_websocket(api_key, client_code, pin, totp_secret, symbol_name):
+    """Start SmartWebSocketV2 as the live-LTP primary without using Streamlit state in its worker."""
     init_ws_state()
-    ws_log("Entered start_angel_websocket")
-
-    if not SMART_WS_AVAILABLE:
-        ws_set_state(error="SmartWebSocketV2 not available")
+    if not SMART_WS_AVAILABLE or not SMART_API_AVAILABLE:
+        ws_set_state(error="SmartAPI WebSocket/TOTP dependencies are unavailable", connected=False, running=False)
         sync_ws_state_to_session()
         return
 
     instrument = resolve_angel_instrument(symbol_name)
     if not instrument:
-        ws_set_state(error=f"Angel instrument master did not resolve {symbol_name}")
+        ws_set_state(error=f"Angel instrument master did not resolve {symbol_name}", connected=False, running=False)
         sync_ws_state_to_session()
         return
-    symbol_token = instrument["token"]
     exchange_type = 1 if instrument["exchange"] == "NSE" else 3 if instrument["exchange"] == "BSE" else None
     if exchange_type is None:
-        ws_set_state(error=f"WebSocket exchange mapping unsupported: {instrument['exchange']}")
+        ws_set_state(error=f"WebSocket exchange mapping unsupported: {instrument['exchange']}", connected=False, running=False)
         sync_ws_state_to_session()
         return
 
-    state = ws_get_state()
-    if state.get("thread_started") and state.get("symbol") == symbol_name and state.get("should_run"):
+    current = ws_get_state()
+    if (current.get("thread_started") and current.get("symbol") == symbol_name
+            and current.get("should_run")):
         sync_ws_state_to_session()
         return
 
-    ws_set_state(should_run=True, thread_started=True, symbol=symbol_name, error="", retries=0)
+    # Reuse the already-authenticated Streamlit session for the first socket
+    # connection. This avoids generating a second Angel login just to obtain a
+    # WebSocket token, which could invalidate the REST polling fallback session.
+    try:
+        _angel_api_for_ws = st.session_state.get("angel_api")
+        _angel_session_for_ws = st.session_state.get("angel_session") or {}
+        _angel_auth_data_for_ws = _angel_session_for_ws.get("data") or {}
+        initial_auth_token = _angel_auth_data_for_ws.get("jwtToken") or _angel_auth_data_for_ws.get("jwt_token")
+        if _angel_api_for_ws is None or not initial_auth_token:
+            raise RuntimeError("No authenticated Angel API session is available for WebSocket startup")
+        _feed_response_for_ws = _angel_api_for_ws.getfeedToken()
+        if isinstance(_feed_response_for_ws, dict):
+            initial_feed_token = (_feed_response_for_ws.get("data") or {}).get("feedToken") or _feed_response_for_ws.get("feedToken")
+        else:
+            initial_feed_token = _feed_response_for_ws
+        if not initial_feed_token:
+            raise RuntimeError("Authenticated Angel session did not return a WebSocket feed token")
+    except Exception as exc:
+        ws_set_state(error=f"Could not prepare authenticated WebSocket tokens: {str(exc)[:250]}", connected=False, running=False)
+        log_app_error("prepare_angel_websocket_tokens", exc)
+        sync_ws_state_to_session()
+        return
+
+    old_socket = current.get("socket")
+    generation = int(current.get("generation", 0)) + 1
+    ws_set_state(
+        generation=generation, should_run=True, thread_started=True,
+        symbol=symbol_name, error="Connecting to Angel One WebSocket…",
+        retries=0, retry_exhausted=False, running=False, connected=False, socket=None,
+        live_price=None, last_tick=None, last_tick_epoch=None, last_data_time=None
+    )
+    if old_socket is not None:
+        try:
+            old_socket.close_connection()
+        except Exception:
+            pass
+
+    def generation_is_current():
+        snapshot = ws_get_state()
+        return snapshot.get("generation") == generation and snapshot.get("should_run")
+
+    def create_worker_session():
+        # Use the authenticated tokens captured on the Streamlit main thread.
+        # The worker never reads st.session_state or creates a duplicate login.
+        return initial_auth_token, initial_feed_token
 
     def run_socket():
         retry_count = 0
-        while True:
-            state_now = ws_get_state()
-            if not state_now.get("should_run"):
-                break
-            if retry_count >= MAX_WS_RETRIES:
-                ws_set_state(error="Max reconnect attempts reached", running=False, connected=False, retries=retry_count, thread_started=False, socket=None)
-                break
-
+        while generation_is_current():
+            sws = None
             try:
-                angel, session = angel_login(api_key, client_code, pin, totp_secret, force_refresh=True)
-                if angel is None or session is None or not session.get("data"):
-                    raise Exception("Angel login failed during reconnect")
-
-                auth_token = session["data"].get("jwtToken")
-                if not auth_token:
-                    raise Exception("JWT missing")
-
-                feed_token_resp = angel.getfeedToken()
-                if isinstance(feed_token_resp, dict):
-                    feed_token = feed_token_resp.get("data", {}).get("feedToken") or feed_token_resp.get("feedToken")
-                else:
-                    feed_token = feed_token_resp
-
-                if not feed_token:
-                    raise Exception("Feed token missing")
-
-                sws = SmartWebSocketV2(auth_token, api_key, client_code, feed_token)
-                ws_set_state(socket=sws, running=True, connected=False, retries=retry_count, error="")
-
-                correlation_id = f"elite_feed_{symbol_name}"
-                mode = 1
-                token_list = [{"exchangeType": exchange_type, "tokens": [str(symbol_token)]}]
+                auth_token, feed_token = create_worker_session()
+                if not generation_is_current():
+                    break
+                sws = SmartWebSocketV2(auth_token, str(api_key).strip(), str(client_code).strip(), feed_token, max_retry_attempt=0)
+                ws_set_state(socket=sws, running=True, connected=False, error="WebSocket authenticated; waiting for market ticks…")
+                correlation_id = f"EL{generation:08d}"[-10:]
+                token_list = [{"exchangeType": exchange_type, "tokens": [str(instrument["token"])]}]
 
                 def on_data(wsapp, message):
+                    if not generation_is_current():
+                        return
                     ltp = extract_ltp_from_message(message)
-                    current_state = ws_get_state()
-                    ws_set_state(
-                        last_tick=message,
-                        connected=True,
-                        running=True,
-                        error="",
-                        live_price=ltp if ltp is not None else current_state.get("live_price"),
-                        last_data_time=now_str()
-                    )
+                    if ltp is not None:
+                        ws_set_state(
+                            last_tick=message, connected=True, running=True, error="",
+                            live_price=ltp, last_data_time=now_str(), last_tick_epoch=pytime.time()
+                        )
 
                 def on_open(wsapp):
+                    if not generation_is_current():
+                        return
                     try:
-                        ws_set_state(connected=True, running=True, error="")
-                        sws.subscribe(correlation_id, mode, token_list)
-                    except Exception as e:
-                        ws_set_state(error=f"Subscribe error: {e}", connected=False)
+                        ws_set_state(connected=True, running=True, error="WebSocket connected; subscription sent")
+                        sws.subscribe(correlation_id, 1, token_list)
+                    except Exception as exc:
+                        ws_set_state(error=f"WebSocket subscribe error: {exc}", connected=False)
 
                 def on_error(wsapp, error):
-                    ws_set_state(error=f"WS error: {error}", connected=False, running=False)
+                    if generation_is_current():
+                        ws_set_state(error=f"WebSocket error: {error}", connected=False, running=False)
 
                 def on_close(wsapp, *args):
-                    reason = " | ".join([str(x) for x in args if x is not None]) if args else ""
-                    ws_set_state(connected=False, running=False, error=f"WS closed {reason}")
+                    if generation_is_current():
+                        reason = " | ".join(str(item) for item in args if item is not None)
+                        ws_set_state(connected=False, running=False, error=f"WebSocket closed {reason}".strip())
 
                 sws.on_open = on_open
                 sws.on_data = on_data
                 sws.on_error = on_error
                 sws.on_close = on_close
+                sws.connect()
+                if generation_is_current():
+                    ws_set_state(connected=False, running=False, socket=None, error="WebSocket connection ended; retrying")
+            except Exception as exc:
+                if generation_is_current():
+                    ws_set_state(error=f"WebSocket attempt {retry_count + 1}: {str(exc)[:350]}", connected=False, running=False, socket=None)
+                log_app_error("start_angel_websocket", exc)
+            finally:
+                if sws is not None and not generation_is_current():
+                    try:
+                        sws.close_connection()
+                    except Exception:
+                        pass
 
-                try:
-                    sws.connect()
-                finally:
-                    ws_set_state(connected=False, running=False, socket=None)
-
-            except Exception as e:
-                ws_set_state(
-                    error=f"Reconnect attempt {retry_count + 1}/{MAX_WS_RETRIES}: {e}",
-                    connected=False, running=False, socket=None
-                )
-                log_app_error("start_angel_websocket", e)
-
+            if not generation_is_current():
+                break
             retry_count += 1
             ws_set_state(retries=retry_count)
-            if not ws_get_state().get("should_run"):
+            if retry_count >= MAX_WS_RETRIES:
+                ws_set_state(
+                    should_run=False, running=False, connected=False,
+                    thread_started=False, socket=None, retry_exhausted=True,
+                    error=f"WebSocket stopped after {MAX_WS_RETRIES} reconnect attempts; REST polling fallback remains available"
+                )
                 break
             pytime.sleep(WS_RETRY_DELAY_SEC)
 
-        ws_set_state(running=False, connected=False, socket=None, thread_started=False)
+        final_state = ws_get_state()
+        if final_state.get("generation") == generation:
+            ws_set_state(running=False, connected=False, thread_started=False, socket=None)
 
-    threading.Thread(target=run_socket, daemon=True).start()
+    threading.Thread(target=run_socket, name=f"AngelWS-{symbol_name}-{generation}", daemon=True).start()
     sync_ws_state_to_session()
 
 
@@ -1692,13 +1762,13 @@ def fetch_yahoo_batch(tickers, interval, period):
             raw = yf.download(
                 tickers=list(ticker_list), period=period, interval=interval,
                 group_by="ticker", auto_adjust=False, progress=False,
-                threads=True, timeout=20, multi_level_index=True
+                threads=True, timeout=8, multi_level_index=True
             )
         except TypeError:
             raw = yf.download(
                 tickers=list(ticker_list), period=period, interval=interval,
                 group_by="ticker", auto_adjust=False, progress=False,
-                threads=True, timeout=20
+                threads=True, timeout=8
             )
         if raw is None or not isinstance(raw, pd.DataFrame) or raw.empty:
             log_app_error("fetch_yahoo_batch", f"Yahoo batch returned no rows for {len(ticker_list)} tickers at {interval}/{period}.")
@@ -1866,32 +1936,62 @@ def _render_market_quote_grid(rows, columns_per_row=5):
 
 
 def render_live_global_india_market_board():
-    """Top-level global and Indian market performance panel."""
+    """Render cached market board; network fetches are explicit or at 60s cadence.
+
+    Previously this function fetched two large Yahoo batches on every Streamlit
+    rerun before the main chart. A slow Yahoo response could make the entire app
+    look frozen. Now the board never blocks initial dashboard rendering.
+    """
     st.divider()
     st.header("Global / Macro Performance")
     st.caption(
-        "Latest available market quote: 5-minute Yahoo bars where available; otherwise latest daily close. "
-        "The market board is independent of the selected primary Angel/Yahoo candle source."
+        "Latest available Yahoo quote: 5-minute bars where available, otherwise latest daily close. "
+        "This independent board does not block the selected Angel/Yahoo chart feed."
     )
-    if st.button("Refresh Global + Indian Market Data", key="refresh_global_india_market_board"):
-        fetch_yahoo_batch.clear()
-    with st.spinner("Refreshing global indices, macro instruments and major Indian stocks…"):
-        global_rows, indian_rows = build_live_market_board_rows()
-    st.caption(f"Board checked: {datetime.now().strftime('%d-%b-%Y %H:%M:%S')} | Yahoo batch cache: 30 seconds")
-    _render_market_quote_grid(global_rows, columns_per_row=5)
-    unavailable_global = sum(pd.isna(row.get("Price", np.nan)) for row in global_rows)
-    if unavailable_global:
-        st.warning(f"{unavailable_global} global/macro instruments returned no quote. They remain N/A rather than showing stale values from another symbol.")
+    refresh_clicked = st.button("Refresh Global + Indian Market Data", key="refresh_global_india_market_board")
+    auto_on = bool(st.session_state.get("auto_refresh_enabled", False))
+    now_epoch = pytime.time()
+    last_fetch_epoch = float(st.session_state.get("market_board_last_fetch_epoch", 0) or 0)
+    auto_due = auto_on and (now_epoch - last_fetch_epoch >= 60)
+    should_fetch = refresh_clicked or auto_due
 
+    if should_fetch:
+        try:
+            fetch_yahoo_batch.clear()
+            with st.spinner("Loading global indices and Indian stocks (bounded Yahoo requests)…"):
+                global_rows, indian_rows = build_live_market_board_rows()
+            st.session_state["market_board_cache"] = {
+                "global": global_rows, "indian": indian_rows,
+                "checked_at": datetime.now().strftime("%d-%b-%Y %H:%M:%S"),
+            }
+            st.session_state["market_board_last_fetch_epoch"] = now_epoch
+        except Exception as exc:
+            log_app_error("render_live_global_india_market_board", exc)
+            st.warning(f"Market board refresh failed: {type(exc).__name__}. Main chart and scanner remain independent.")
+
+    cached = st.session_state.get("market_board_cache")
+    if not isinstance(cached, dict):
+        st.info("Market overview has not been fetched yet. Press Refresh Global + Indian Market Data. The main dashboard will continue loading without waiting for this optional board.")
+        global_rows, indian_rows = [], []
+    else:
+        global_rows = cached.get("global", [])
+        indian_rows = cached.get("indian", [])
+        st.caption(f"Last successful board refresh: {cached.get('checked_at', 'N/A')} | Auto refresh checks this board at most once per 60 seconds.")
+
+    if global_rows:
+        _render_market_quote_grid(global_rows, columns_per_row=5)
+        unavailable_global = sum(pd.isna(row.get("Price", np.nan)) for row in global_rows)
+        if unavailable_global:
+            st.warning(f"{unavailable_global} global/macro instruments returned no quote. They remain N/A.")
     st.subheader("🇮🇳 Major Indian Stocks — Banks, IT, Auto and Index Leaders")
-    _render_market_quote_grid(indian_rows, columns_per_row=5)
-    unavailable_indian = sum(pd.isna(row.get("Price", np.nan)) for row in indian_rows)
-    if unavailable_indian:
-        st.warning(f"{unavailable_indian} Indian stocks returned no quote in this Yahoo batch. Check the symbol and provider availability.")
-    st.caption(
-        "Source: Yahoo Finance. Yahoo data latency differs by exchange and instrument. "
-        "GIFT Nifty is shown only when its Yahoo futures symbol resolves; otherwise the card is explicitly labelled as a NIFTY spot proxy."
-    )
+    if indian_rows:
+        _render_market_quote_grid(indian_rows, columns_per_row=5)
+        unavailable_indian = sum(pd.isna(row.get("Price", np.nan)) for row in indian_rows)
+        if unavailable_indian:
+            st.warning(f"{unavailable_indian} Indian stocks returned no quote in this Yahoo batch.")
+    else:
+        st.caption("Indian stock board will appear after the first manual refresh.")
+    st.caption("Source: Yahoo Finance. Yahoo latency varies by instrument. GIFT Nifty proxy is labelled separately and is not represented as a futures quote.")
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -2361,7 +2461,7 @@ def get_news_events(api_key, symbol, provider="Marketaux", lookback_hours=6, art
                 "group_similar": "true",
                 "limit": article_limit,
             }
-            response = requests.get(MARKETAUX_NEWS_URL, params=params, timeout=12)
+            response = requests.get(MARKETAUX_NEWS_URL, params=params, timeout=6)
             if response.status_code != 200:
                 detail = ""
                 try:
@@ -2393,7 +2493,7 @@ def get_news_events(api_key, symbol, provider="Marketaux", lookback_hours=6, art
                 "from": after_utc.strftime("%Y-%m-%dT%H:%M:%S"),
                 "apiKey": str(api_key).strip(),
             }
-            response = requests.get("https://newsapi.org/v2/everything", params=params, timeout=12)
+            response = requests.get("https://newsapi.org/v2/everything", params=params, timeout=6)
             if response.status_code != 200:
                 try:
                     payload = response.json()
@@ -2537,8 +2637,8 @@ def get_option_chain_snapshot(symbol="NIFTY"):
             "Accept-Language": "en-US,en;q=0.9"
         }
         session = requests.Session()
-        session.get("https://www.nseindia.com", headers=headers, timeout=10)
-        resp = session.get(url, headers=headers, timeout=10)
+        session.get("https://www.nseindia.com", headers=headers, timeout=4)
+        resp = session.get(url, headers=headers, timeout=4)
         if resp.status_code != 200:
             return None
         data = resp.json()
@@ -4108,7 +4208,10 @@ def simple_backtest(df, symbol="", timeframe_label="", option_metrics=None, news
     trades = []
     # EMA50 and the signal structure need a meaningful warm-up window.
     for i in range(55, len(work) - 10):
-        mini_df = work.iloc[:i + 1].copy()
+        # analyze_signal only needs the current/prior bar, recent 20-bar levels,
+        # recent HA candles and already-computed indicators. A rolling 250-bar
+        # view avoids repeatedly copying an ever-growing history (O(n^2)).
+        mini_df = work.iloc[max(0, i - 249):i + 1]
         latest = mini_df.iloc[-1]
         # Do not inject the current option chain or synthetic 4/4 MTF alignment
         # into historical observations; those values were not known then.
@@ -4243,11 +4346,14 @@ def walk_forward_validation(df, symbol="", timeframe_label="", option_metrics=No
     try:
         if df.empty or len(df) < 150:
             return {"folds": 0, "validated_folds": 0, "avg_win_rate": None, "avg_profit_factor": None, "avg_expectancy": None, "table": pd.DataFrame()}
+        # Walk-forward is an interactive report, not a full-history batch job.
+        # Bound its workload so long 1m histories cannot freeze the Streamlit run.
+        df = df.tail(1200).copy()
 
         fold_results = []
         total_len = len(df)
-        train_size = int(total_len * 0.5)
-        test_size = int(total_len * 0.1)
+        train_size = int(total_len * 0.6)
+        test_size = int(total_len * 0.2)
         start = 0
         fold_no = 1
         while (start + train_size + test_size) <= total_len:
@@ -4621,7 +4727,7 @@ ANGEL_NAME_ALIASES = {
 }
 
 st.title("Elite Trading Dashboard Final Ultimate")
-st.caption("Polling First | Walk Forward | Auto Exit | News Filter | Dynamic Option Chain")
+st.caption("WebSocket Primary | REST Polling Fallback | Walk Forward | Auto Exit | News Filter | Dynamic Option Chain")
 st.sidebar.caption(f"App build: {APP_BUILD_ID}")
 
 selected = st.selectbox("Select Stock / Index", list(stocks.keys()))
@@ -4784,8 +4890,17 @@ with st.expander("Angel One API Settings"):
         )
         connect_angel = st.form_submit_button("Test Angel Login", use_container_width=True)
 
-    polling_mode = st.checkbox("Use Angel LTP Polling Mode", value=True, key="angel_polling_mode")
-    ws_enable = st.checkbox("Enable Angel WebSocket (Optional)", value=False, key="angel_ws_enable")
+    ws_enable = st.checkbox(
+        "Use Angel WebSocket as Primary Live Feed", value=True,
+        key="angel_ws_primary_enable_v17",
+        help="WebSocket is used first for live LTP. If it is disconnected or stale, REST LTP polling is used as fallback. Historical OHLC candles still come from the broker REST candle API."
+    )
+    polling_mode = st.checkbox(
+        "Enable Angel LTP Polling Fallback", value=True,
+        key="angel_ltp_polling_fallback_v17",
+        help="Automatically use Angel REST LTP if the WebSocket is not connected or its last tick is stale."
+    )
+    st.caption("WebSocket is primary for live LTP. REST polling is the automatic fallback. Historical OHLC candles continue to come from the broker REST Candle API. Turn the dashboard Auto Refresh ON to repaint incoming WebSocket ticks on screen; manual refresh remains available.")
 
     if connect_angel:
         # Use the values submitted by the form directly; do not depend on a
@@ -4825,10 +4940,18 @@ with st.expander("Angel One API Settings"):
                 st.session_state["angel_credentials_login_ok"] = False
                 st.error("Angel login failed. Check API key, Client Code, PIN and TOTP Secret, and review the app error log.")
 
-    if st.button("Stop WebSocket"):
-        stop_angel_websocket()
-        sync_ws_state_to_session()
-        st.warning("WebSocket stop requested.")
+    ws_action_col1, ws_action_col2 = st.columns(2)
+    with ws_action_col1:
+        if st.button("Stop WebSocket"):
+            st.session_state["ws_manual_pause_requested"] = True
+            stop_angel_websocket()
+            sync_ws_state_to_session()
+            st.warning("WebSocket stopped. REST LTP polling fallback will remain available.")
+    with ws_action_col2:
+        if st.button("Reconnect / Resume WebSocket"):
+            st.session_state["ws_manual_pause_requested"] = False
+            ws_set_state(retry_exhausted=False, retries=0)
+            st.success("WebSocket reconnect requested. It will start on this rerun.")
 
 # Resolve credentials from the visible widgets first, then the independent
 # server-session copy saved during Test Angel Login. This avoids losing them
@@ -4894,6 +5017,7 @@ angel_candles_response = None
 angel_candle_diagnostics = {"status": "not_requested"}
 angel_ltp_value = None
 angel_ltp_status = "not_requested"
+angel_ltp_source = "Not requested"
 angel_session_ready = False
 
 if "last_good_candles_by_key" not in st.session_state:
@@ -4931,11 +5055,20 @@ _angel_credentials_ready = bool(
 
 st.info(
     f"Market data request: {data_source} | {selected} | {timeframe}. "
-    "Live market data depends on provider availability, authenticated access and instrument support."
+    "Angel live LTP priority: WebSocket primary with REST polling fallback. Historical OHLC remains REST candle data. "
+    "Network requests use bounded timeouts; optional market-board and walk-forward jobs no longer block initial page load."
 )
+
+if data_source != "Angel":
+    _ws_snapshot = ws_get_state()
+    if _ws_snapshot.get("should_run"):
+        stop_angel_websocket()
 
 if data_source == "Angel":
     if not _angel_credentials_ready:
+        _ws_snapshot = ws_get_state()
+        if _ws_snapshot.get("should_run"):
+            stop_angel_websocket()
         missing_text = ", ".join(_angel_missing_fields) or "authenticated Angel session"
         angel_ltp_status = "not_requested_missing_credentials"
         angel_candle_diagnostics = {
@@ -4947,15 +5080,45 @@ if data_source == "Angel":
             "Re-enter credentials and click Test Angel Login in this deployed app session."
         )
     else:
-        # Poll the LTP independently of historical candles. LTP can be available
-        # even when the candle-history endpoint returns an empty/error response.
-        if polling_mode:
-            with st.spinner(f"Angel One: requesting LTP quote for {selected}…"):
+        # WebSocket is the primary live-LTP source. REST polling is requested
+        # only when the socket is not connected, has no tick yet, or its tick is stale.
+        _ws_manual_paused = bool(st.session_state.get("ws_manual_pause_requested", False))
+        _ws_snapshot = ws_get_state()
+        _ws_retry_blocked_for_same_symbol = bool(
+            _ws_snapshot.get("retry_exhausted", False)
+            and str(_ws_snapshot.get("symbol")) == str(selected)
+        )
+        if ws_enable and not _ws_manual_paused and not _ws_retry_blocked_for_same_symbol:
+            start_angel_websocket(angel_api_key, angel_client_code, angel_pin, angel_totp_secret, selected)
+        elif (not ws_enable or _ws_manual_paused) and _ws_snapshot.get("should_run"):
+            stop_angel_websocket()
+
+        _ws_quote = ws_live_quote(
+            max_age_seconds=max(20, int(refresh_seconds) * 2 if auto_refresh else 20),
+            symbol_name=selected
+        ) if ws_enable else None
+        if _ws_quote is not None:
+            angel_ltp_value = _ws_quote
+            angel_ltp_status = "received_websocket_primary"
+            angel_ltp_source = "Angel WebSocket (Primary)"
+        elif polling_mode:
+            with st.spinner(f"Angel One: WebSocket unavailable/stale; requesting REST LTP fallback for {selected}…"):
                 angel_ltp_value = get_angel_ltp_polling(
                     angel_api_key, angel_client_code, angel_pin,
                     angel_totp_secret, selected
                 )
-            angel_ltp_status = "received" if angel_ltp_value is not None else "no_quote"
+            angel_ltp_status = "received_polling_fallback" if angel_ltp_value is not None else "polling_fallback_no_quote"
+            angel_ltp_source = "Angel REST Polling (Fallback)" if angel_ltp_value is not None else "No live quote"
+        else:
+            if ws_enable and st.session_state.get("ws_manual_pause_requested", False):
+                angel_ltp_status = "websocket_manually_paused"
+                angel_ltp_source = "WebSocket paused; no polling quote"
+            elif ws_enable and ws_get_state().get("retry_exhausted", False):
+                angel_ltp_status = "websocket_retry_limit_reached"
+                angel_ltp_source = "WebSocket reconnect required"
+            else:
+                angel_ltp_status = "websocket_waiting_no_polling_fallback" if ws_enable else "all_live_quote_sources_disabled"
+                angel_ltp_source = "Waiting for WebSocket tick" if ws_enable else "Live quote disabled"
 
         angel_interval = map_angel_interval(timeframe)
         with st.spinner(f"Angel One: requesting {angel_interval} historical candles for {selected}…"):
@@ -4990,9 +5153,6 @@ if data_source == "Angel":
                 active_data_source = "Yahoo"
                 st.warning("Angel One candle history is unavailable. Using Yahoo Finance OHLC as a clearly-labelled fallback; Angel LTP polling remains separate.")
 
-        if ws_enable:
-            start_angel_websocket(angel_api_key, angel_client_code, angel_pin, angel_totp_secret, selected)
-            sync_ws_state_to_session()
 else:
     with st.spinner(f"Yahoo Finance: loading {ticker} ({yf_interval})…"):
         data = fetch_data(ticker, yf_interval, yf_period)
@@ -5014,9 +5174,9 @@ else:
             st.warning("Yahoo Finance returned no OHLC rows. Using connected Angel One candle history as a clearly-labelled fallback.")
 
 if data.empty:
-    if data_source == "Angel" and polling_mode:
+    if data_source == "Angel" and (polling_mode or ws_enable):
         if angel_ltp_value is not None:
-            st.metric("Angel One Latest Traded Price (LTP)", f"{angel_ltp_value:,.2f}")
+            st.metric(f"Angel One Latest Traded Price — {angel_ltp_source}", f"{angel_ltp_value:,.2f}")
         elif angel_ltp_status == "not_requested_missing_credentials":
             st.warning(
                 "Angel LTP polling was skipped because the current app session is not authenticated. "
@@ -5088,7 +5248,10 @@ if not ok:
     st.stop()
 
 data = add_indicators(data).replace([np.inf, -np.inf], np.nan).ffill()
-backtest_data = data.copy()
+# Keep interactive backtests bounded. Indicator columns are already computed on
+# the full chart frame; 1,200 recent bars provide a responsive intraday sample.
+MAX_BACKTEST_BARS = 1200
+backtest_data = data.tail(MAX_BACKTEST_BARS).copy()
 
 if len(data) < 35:
     st.warning(f"Only {len(data)} candles available. Live price / chart can display, but backtest and some long-period indicators need more history.")
@@ -5147,13 +5310,32 @@ historical_news_context = {
     "events": [],
     "status": "historical_not_replayed",
 }
-wins, losses, total_trades, backtest_win_rate, backtest_trades_df = simple_backtest(
-    backtest_data,
-    symbol=selected,
-    timeframe_label=timeframe,
-    option_metrics=option_metrics,
-    news_info=historical_news_context
-)
+# Cache the interactive backtest by the actual recent candle content. Streamlit
+# auto-refresh can rerun the page every few seconds even when no new candle exists;
+# do not recompute the same 1,200-bar simulation on every browser repaint.
+try:
+    _bt_hash = int(pd.util.hash_pandas_object(backtest_data, index=True).sum()) if not backtest_data.empty else 0
+except Exception:
+    _bt_hash = len(backtest_data)
+_backtest_cache_key = f"{selected}|{timeframe}|{len(backtest_data)}|{_bt_hash}"
+_backtest_cache = st.session_state.get("backtest_result_cache")
+if isinstance(_backtest_cache, dict) and _backtest_cache.get("key") == _backtest_cache_key:
+    wins, losses, total_trades, backtest_win_rate, backtest_trades_df = _backtest_cache["result"]
+else:
+    with st.spinner("Calculating recent-history backtest…"):
+        _backtest_result = simple_backtest(
+            backtest_data,
+            symbol=selected,
+            timeframe_label=timeframe,
+            option_metrics=option_metrics,
+            news_info=historical_news_context
+        )
+    wins, losses, total_trades, backtest_win_rate, backtest_trades_df = _backtest_result
+    st.session_state["backtest_result_cache"] = {
+        "key": _backtest_cache_key,
+        "result": _backtest_result,
+        "calculated_at": now_str(),
+    }
 
 backtest_is_comparable = bool(
     total_trades >= 30 and
@@ -5172,14 +5354,6 @@ analysis = analyze_signal(
     news_info=news_info,
     backtest_trade_count=total_trades,
     backtest_is_comparable=backtest_is_comparable,
-)
-
-walk_forward_result = walk_forward_validation(
-    backtest_data,
-    symbol=selected,
-    timeframe_label=timeframe,
-    option_metrics=option_metrics,
-    news_info=historical_news_context
 )
 
 stats = compute_trade_statistics(backtest_trades_df, initial_capital=DEFAULT_INITIAL_BALANCE)
@@ -5224,15 +5398,23 @@ elif quality_score >= 55:
 else:
     signal_quality = "Weak"
 
-live_price = angel_ltp_value if data_source == "Angel" and polling_mode else None
-if data_source == "Angel" and polling_mode and live_price is None:
-    # One retry after OHLC is available; no credentials are exposed in UI/logs.
-    live_price = get_angel_ltp_polling(angel_api_key, angel_client_code, angel_pin, angel_totp_secret, selected)
-elif data_source == "Angel" and ws_enable and not polling_mode:
+live_price = None
+live_price_source = "OHLC candle close"
+if data_source == "Angel":
+    _fresh_ws_quote = ws_live_quote(
+        max_age_seconds=max(20, int(refresh_seconds) * 2 if auto_refresh else 20),
+        symbol_name=selected
+    ) if ws_enable else None
+    if _fresh_ws_quote is not None:
+        live_price = _fresh_ws_quote
+        live_price_source = "Angel WebSocket (Primary)"
+        angel_ltp_source = live_price_source
+    elif angel_ltp_value is not None:
+        live_price = float(angel_ltp_value)
+        live_price_source = angel_ltp_source or "Angel REST Polling (Fallback)"
     sync_ws_state_to_session()
-    live_price = st.session_state.get("live_price")
 
-current_display_price = live_price if live_price else analysis["close_price"]
+current_display_price = live_price if live_price is not None and live_price > 0 else analysis["close_price"]
 
 closed_auto = 0
 
@@ -5321,14 +5503,32 @@ st.subheader("Live Signal Analytics")
 
 if data_source == "Angel":
     p1, p2, p3, p4 = st.columns(4)
+    _ws_status_snapshot = ws_get_state()
+    _ws_is_effectively_primary = bool(
+        ws_enable
+        and not st.session_state.get("ws_manual_pause_requested", False)
+        and not (_ws_status_snapshot.get("retry_exhausted") and str(_ws_status_snapshot.get("symbol")) == str(selected))
+    )
     with p1:
-        st.metric("Polling Mode", "Primary" if polling_mode else "Off")
+        st.metric("Live Feed Priority", "WebSocket Primary" if _ws_is_effectively_primary else ("REST Polling Primary" if polling_mode else "Live LTP Disabled"))
     with p2:
-        st.metric("WebSocket Mode", "Optional" if ws_enable else "Off")
+        if _ws_status_snapshot.get("connected"):
+            _ws_status_text = "Connected"
+        elif _ws_status_snapshot.get("retry_exhausted") and str(_ws_status_snapshot.get("symbol")) == str(selected):
+            _ws_status_text = "Retry limit reached"
+        elif st.session_state.get("ws_manual_pause_requested", False):
+            _ws_status_text = "Paused manually"
+        else:
+            _ws_status_text = "Connecting / Offline"
+        st.metric("WebSocket Status", _ws_status_text)
     with p3:
-        st.metric("Live Price", round(live_price, 2) if live_price else "-")
+        st.metric("Live Price Source", live_price_source)
     with p4:
-        st.metric("Exit Mode", "AUTO ENABLED" if st.session_state.get("paper_exit_mode") == "Auto Exit (Enabled)" else "MANUAL")
+        st.metric("Live Price", round(live_price, 2) if live_price is not None else "-")
+    if ws_enable and not _ws_status_snapshot.get("connected"):
+        st.caption("WebSocket is the primary live-LTP source. REST polling is the configured fallback while the socket connects or reconnects.")
+    elif ws_enable:
+        st.caption("WebSocket is connected. Historical candles are still loaded through Angel REST Candle API; WebSocket ticks update the live LTP display.")
 
 if analysis["signal_type"] == "buy":
     st.success(alert_text)
@@ -5774,6 +5974,94 @@ with bc4:
     st.metric("Profitability Score", stats["profitability_score"])
 
 st.subheader("Walk Forward Validation")
+wf_ctrl1, wf_ctrl2, wf_ctrl3 = st.columns([1.35, 1.0, 1.0])
+with wf_ctrl1:
+    wf_manual_refresh = st.button(
+        "Run / Refresh Walk Forward Now", key="walk_forward_manual_refresh_v17",
+        type="primary", use_container_width=True,
+        help="Run the chronological walk-forward validation immediately using the current selected symbol, timeframe and available candle history."
+    )
+with wf_ctrl2:
+    wf_auto_refresh = st.toggle(
+        "Auto Refresh Walk Forward", value=False,
+        key="walk_forward_auto_refresh_enabled_v17",
+        help="Re-run the walk-forward report at the selected interval. This is independent from market-data auto refresh."
+    )
+with wf_ctrl3:
+    wf_refresh_seconds = st.selectbox(
+        "Walk-forward interval", [60, 180, 300, 600, 900], index=2,
+        format_func=lambda x: f"{x // 60} min",
+        key="walk_forward_auto_refresh_interval_v17",
+        disabled=not wf_auto_refresh
+    )
+
+wf_auto_tick = None
+if wf_auto_refresh and AUTO_REFRESH_AVAILABLE:
+    wf_auto_tick = st_autorefresh(
+        interval=int(wf_refresh_seconds) * 1000,
+        key="walk_forward_independent_auto_refresh_v17"
+    )
+elif wf_auto_refresh and not AUTO_REFRESH_AVAILABLE:
+    st.warning("Walk-forward auto refresh needs streamlit-autorefresh. Manual Run / Refresh remains available.")
+
+# Store the latest report in session state. Global market auto-refresh does not
+# repeatedly recompute this expensive report unless its own auto-refresh is ON.
+try:
+    _wf_tail = backtest_data.tail(500)
+    _wf_content_hash = int(pd.util.hash_pandas_object(_wf_tail, index=True).sum()) if not _wf_tail.empty else 0
+    _wf_data_key = f"{selected}|{timeframe}|{len(backtest_data)}|{_wf_content_hash}"
+except Exception:
+    _wf_data_key = f"{selected}|{timeframe}|{len(backtest_data)}"
+
+_wf_cached = st.session_state.get("walk_forward_cached_result")
+_wf_cached_key = st.session_state.get("walk_forward_cached_data_key")
+_wf_previous_auto = bool(st.session_state.get("walk_forward_auto_was_enabled", False))
+_wf_previous_tick = st.session_state.get("walk_forward_last_auto_tick")
+_wf_auto_tick_changed = bool(
+    wf_auto_refresh and wf_auto_tick is not None
+    and (_wf_previous_tick is None or wf_auto_tick != _wf_previous_tick)
+)
+_wf_auto_just_enabled = bool(wf_auto_refresh and not _wf_previous_auto)
+_wf_should_run = bool(
+    wf_manual_refresh
+    or (wf_auto_refresh and (_wf_auto_tick_changed or _wf_auto_just_enabled))
+)
+
+if _wf_should_run:
+    with st.spinner("Running chronological walk-forward validation…"):
+        walk_forward_result = walk_forward_validation(
+            backtest_data, symbol=selected, timeframe_label=timeframe,
+            option_metrics=None, news_info=historical_news_context
+        )
+    st.session_state["walk_forward_cached_result"] = walk_forward_result
+    st.session_state["walk_forward_cached_data_key"] = _wf_data_key
+    st.session_state["walk_forward_last_run_at"] = now_str()
+    st.session_state["walk_forward_last_auto_tick"] = wf_auto_tick
+    st.session_state["walk_forward_auto_was_enabled"] = wf_auto_refresh
+else:
+    st.session_state["walk_forward_auto_was_enabled"] = wf_auto_refresh
+    if wf_auto_tick is not None:
+        st.session_state["walk_forward_last_auto_tick"] = wf_auto_tick
+    if _wf_cached_key == _wf_data_key and _wf_cached is not None:
+        walk_forward_result = _wf_cached
+    else:
+        walk_forward_result = {
+            "folds": 0, "validated_folds": 0, "avg_win_rate": None,
+            "avg_profit_factor": None, "avg_expectancy": None,
+            "table": pd.DataFrame()
+        }
+        if _wf_cached is None:
+            st.info("Walk-forward has not run yet. Press Run / Refresh Walk Forward Now, or enable its independent Auto Refresh. It will not run automatically during initial page load.")
+        if _wf_cached is not None:
+            st.info("Market history has changed since the last walk-forward run. Press Run / Refresh Walk Forward Now, or enable its Auto Refresh option. The displayed metrics are not silently carried over from the previous dataset.")
+
+if st.session_state.get("walk_forward_last_run_at"):
+    st.caption("Last walk-forward calculation: " + str(st.session_state["walk_forward_last_run_at"]))
+if wf_auto_refresh and AUTO_REFRESH_AVAILABLE:
+    st.caption(f"Walk-forward auto refresh is ON — every {wf_refresh_seconds // 60} minute(s).")
+else:
+    st.caption("Walk-forward auto refresh is OFF. Use Run / Refresh Walk Forward Now whenever you want to recalculate.")
+
 wf1, wf2, wf3, wf4 = st.columns(4)
 with wf1:
     st.metric("Folds", walk_forward_result["folds"])
