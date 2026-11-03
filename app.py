@@ -2966,14 +2966,15 @@ def analyze_signal(
 
     latest = df.iloc[-1]
     prev = df.iloc[-2]
-
+    
     def num(row, key, default=0.0):
         try:
             value = float(row.get(key, default))
             return value if np.isfinite(value) else float(default)
         except Exception:
             return float(default)
-
+    ema9 = num(latest, "EMA9", 0)
+    ema21 = num(latest, "EMA21", 0)
     close_price = num(latest, "Close")
     ema20 = num(latest, "EMA20", close_price)
     ema50 = num(latest, "EMA50", close_price)
