@@ -3252,6 +3252,15 @@ def analyze_signal(
     stop_loss = target1 = target2 = target3 = partial_exit = trailing_stop = rr_ratio = None
     selected_blockers = []
     selected_side = None
+    if early_buy_alert and not buy_allowed and not sell_allowed:
+        signal_type = "early_buy"
+        signal_text = "EARLY BUY ALERT"
+        strength = "Medium"
+ 
+    elif early_sell_alert and not buy_allowed and not sell_allowed:
+        signal_type = "early_sell"
+        signal_text = "EARLY SELL ALERT"
+        strength = "Medium"    
     if buy_allowed and (not sell_allowed or bullish - bearish >= bearish - bullish):
         selected_side = "BUY"
     elif sell_allowed:
