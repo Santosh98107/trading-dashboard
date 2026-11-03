@@ -3232,6 +3232,17 @@ def analyze_signal(
 
     buy_blockers = blockers("BUY")
     sell_blockers = blockers("SELL")
+    early_buy_alert = (
+        ema9 > ema21
+        and rsi > 50
+        and macd > macd_signal
+    )
+    
+    early_sell_alert = (
+        ema9 < ema21
+        and rsi < 50
+        and macd < macd_signal
+    )
     buy_allowed = is_buy_candidate and not buy_blockers
     sell_allowed = is_sell_candidate and not sell_blockers
 
