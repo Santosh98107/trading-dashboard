@@ -3256,11 +3256,11 @@ def analyze_signal(
         signal_type = "early_buy"
         signal_text = "EARLY BUY ALERT"
         strength = "Medium"
- 
+    
     elif early_sell_alert and not buy_allowed and not sell_allowed:
         signal_type = "early_sell"
         signal_text = "EARLY SELL ALERT"
-        strength = "Medium"    
+        strength = "Medium"
     if buy_allowed and (not sell_allowed or bullish - bearish >= bearish - bullish):
         selected_side = "BUY"
     elif sell_allowed:
