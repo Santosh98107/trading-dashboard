@@ -1568,8 +1568,7 @@ def detect_candlestick_patterns(df):
 
 def add_indicators(df):
     df = df.copy()
-    df["EMA9"] = df["Close"].ewm(span=9, adjust=False).mean()
-    df["EMA21"] = df["Close"].ewm(span=21, adjust=False).mean()
+
     df["EMA20"] = df["Close"].ewm(span=20, adjust=False).mean()
     df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
     df["EMA200"] = df["Close"].ewm(span=200, adjust=False).mean()
@@ -2966,15 +2965,14 @@ def analyze_signal(
 
     latest = df.iloc[-1]
     prev = df.iloc[-2]
-    
+
     def num(row, key, default=0.0):
         try:
             value = float(row.get(key, default))
             return value if np.isfinite(value) else float(default)
         except Exception:
             return float(default)
-    ema9 = num(latest, "EMA9", 0)
-    ema21 = num(latest, "EMA21", 0)
+
     close_price = num(latest, "Close")
     ema20 = num(latest, "EMA20", close_price)
     ema50 = num(latest, "EMA50", close_price)
@@ -3232,17 +3230,6 @@ def analyze_signal(
 
     buy_blockers = blockers("BUY")
     sell_blockers = blockers("SELL")
-    early_buy_alert = (
-        ema9 > ema21
-        and rsi > 50
-        and macd > macd_signal
-    )
-    
-    early_sell_alert = (
-        ema9 < ema21
-        and rsi < 50
-        and macd < macd_signal
-    )
     buy_allowed = is_buy_candidate and not buy_blockers
     sell_allowed = is_sell_candidate and not sell_blockers
 
@@ -3252,15 +3239,6 @@ def analyze_signal(
     stop_loss = target1 = target2 = target3 = partial_exit = trailing_stop = rr_ratio = None
     selected_blockers = []
     selected_side = None
-    if early_buy_alert and not buy_allowed and not sell_allowed:
-        signal_type = "early_buy"
-        signal_text = "EARLY BUY ALERT"
-        strength = "Medium"
-    
-    elif early_sell_alert and not buy_allowed and not sell_allowed:
-        signal_type = "early_sell"
-        signal_text = "EARLY SELL ALERT"
-        strength = "Medium"
     if buy_allowed and (not sell_allowed or bullish - bearish >= bearish - bullish):
         selected_side = "BUY"
     elif sell_allowed:
