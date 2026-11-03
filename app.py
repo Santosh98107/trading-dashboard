@@ -1568,7 +1568,8 @@ def detect_candlestick_patterns(df):
 
 def add_indicators(df):
     df = df.copy()
-
+    df["EMA9"] = df["Close"].ewm(span=9, adjust=False).mean()
+    df["EMA21"] = df["Close"].ewm(span=21, adjust=False).mean()
     df["EMA20"] = df["Close"].ewm(span=20, adjust=False).mean()
     df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
     df["EMA200"] = df["Close"].ewm(span=200, adjust=False).mean()
