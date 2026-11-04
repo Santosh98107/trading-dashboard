@@ -3554,39 +3554,62 @@ def apply_adaptive_signal_intelligence(df, analysis, symbol, timeframe, mtf_bull
     return analysis
 
 
-def train_trade_success_model(min_trades=500):
-    """Optional research-only ML fit. No model is trained or used below 500 closed trades."""
+def train_trade_success_model(min_trades=30):
+    """Evaluate journal readiness immediately; fit a research-only model after 30 usable trades."""
     journal = load_journal()
     if journal.empty:
-        return {"ok": False, "message": "No completed journal trades yet."}
+        return {"ok": False, "trained": False, "message": "No completed journal trades yet.", "trades": 0}
     closed = journal[journal.get("Status", pd.Series("", index=journal.index)).astype(str).str.upper().eq("CLOSED")].copy()
-    if len(closed) < int(min_trades):
-        return {"ok": False, "message": f"ML training requires at least {min_trades} completed trades; currently {len(closed)}."}
+    total_closed = len(closed)
+    if total_closed == 0:
+        return {"ok": False, "trained": False, "message": "No completed journal trades yet.", "trades": 0}
+
     features = [c for c in ["EMA9", "EMA21", "EMA20", "EMA50", "EMA200", "RSI", "MACD", "ADX", "ATR", "VWAP", "Volume", "RelativeVolume", "VolumeDelta", "TrendSlope", "SupportDistancePct", "ResistanceDistancePct", "DistanceEMA20Pct", "DistanceEMA50Pct", "DistanceVWAPPct", "RiskRewardRatio", "TradeQualityScore", "ValidationScore"] if c in closed.columns]
     if len(features) < 6 or "PnL" not in closed.columns:
-        return {"ok": False, "message": "Not enough captured numeric feature columns to train a model."}
-    X = closed[features].apply(pd.to_numeric, errors="coerce")
-    y = (pd.to_numeric(closed["PnL"], errors="coerce").fillna(0) > 0).astype(int)
+        return {"ok": False, "trained": False, "message": "Dataset evaluation complete: insufficient captured numeric feature columns or PnL field. Ensure new closed trades save setup snapshots.", "trades": total_closed, "features_found": len(features)}
+
+    X = closed[features].apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    y_raw = pd.to_numeric(closed["PnL"], errors="coerce")
     valid = X.notna().sum(axis=1) >= 6
-    X, y = X.loc[valid], y.loc[valid]
-    if len(X) < min_trades or y.nunique() < 2:
-        return {"ok": False, "message": "Training sample is incomplete or contains only one outcome class."}
-    X = X.replace([np.inf, -np.inf], np.nan).fillna(X.median()).fillna(0)
+    valid &= y_raw.notna()
+    X, y = X.loc[valid], (y_raw.loc[valid] > 0).astype(int)
+    wins = int((y == 1).sum()); losses = int((y == 0).sum())
+    coverage = float(valid.mean() * 100) if len(valid) else 0.0
+    readiness = {"trades": int(len(X)), "total_closed": int(total_closed), "wins": wins,
+                 "losses": losses, "win_rate": float(wins / len(y) * 100) if len(y) else None,
+                 "feature_count": len(features), "features": features, "coverage_pct": coverage}
+    if len(X) < int(min_trades):
+        return {"ok": True, "trained": False, "readiness": readiness,
+                "message": f"Dataset evaluation completed. {len(X)}/{min_trades} usable closed trades collected; model training remains locked until {min_trades}. Add more completed trades with captured setup metrics."}
+    if y.nunique() < 2 or min(wins, losses) < 5:
+        return {"ok": True, "trained": False, "readiness": readiness,
+                "message": "Dataset evaluation completed, but both win and loss classes need at least 5 examples before a meaningful model evaluation."}
+
+    X = X.fillna(X.median()).fillna(0)
+    # Preserve chronological order: older trades train the model, newer trades test it.
+    split_at = int(len(X) * 0.70)
+    X_train, X_test = X.iloc[:split_at], X.iloc[split_at:]
+    y_train, y_test = y.iloc[:split_at], y.iloc[split_at:]
+    if y_train.nunique() < 2 or y_test.nunique() < 2:
+        return {"ok": True, "trained": False, "readiness": readiness,
+                "message": "Dataset is large enough, but the chronological train/test windows do not both contain wins and losses. Collect more varied trades before fitting."}
     try:
-        from sklearn.model_selection import train_test_split
         from sklearn.ensemble import RandomForestClassifier
-        from sklearn.metrics import accuracy_score, roc_auc_score
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.25, random_state=42, stratify=y)
+        from sklearn.metrics import accuracy_score, roc_auc_score, balanced_accuracy_score
         model_name = "Random Forest"
-        model = RandomForestClassifier(n_estimators=300, max_depth=6, min_samples_leaf=5, class_weight="balanced", random_state=42)
+        model = RandomForestClassifier(n_estimators=250, max_depth=5, min_samples_leaf=2,
+                                       class_weight="balanced", random_state=42)
         try:
             from xgboost import XGBClassifier
-            model = XGBClassifier(n_estimators=250, max_depth=3, learning_rate=0.04, subsample=0.85, colsample_bytree=0.85, eval_metric="logloss", random_state=42)
+            model = XGBClassifier(n_estimators=180, max_depth=3, learning_rate=0.04,
+                                  subsample=0.85, colsample_bytree=0.85,
+                                  eval_metric="logloss", random_state=42)
             model_name = "XGBoost"
         except Exception:
             try:
                 from lightgbm import LGBMClassifier
-                model = LGBMClassifier(n_estimators=250, max_depth=4, learning_rate=0.04, class_weight="balanced", verbosity=-1, random_state=42)
+                model = LGBMClassifier(n_estimators=180, max_depth=4, learning_rate=0.04,
+                                       class_weight="balanced", verbosity=-1, random_state=42)
                 model_name = "LightGBM"
             except Exception:
                 pass
@@ -3595,10 +3618,15 @@ def train_trade_success_model(min_trades=500):
         probabilities = model.predict_proba(X_test)[:, 1]
         try: auc = float(roc_auc_score(y_test, probabilities))
         except Exception: auc = None
-        return {"ok": True, "model": model_name, "trades": int(len(X)), "accuracy": float(accuracy_score(y_test, predictions)), "auc": auc, "features": features,
-                "warning": "Research/backtest use only. Validate out-of-sample and account for fees/slippage before considering any signal integration."}
+        return {"ok": True, "trained": True, "model": model_name, "trades": int(len(X)),
+                "train_trades": int(len(X_train)), "test_trades": int(len(X_test)),
+                "accuracy": float(accuracy_score(y_test, predictions)),
+                "balanced_accuracy": float(balanced_accuracy_score(y_test, predictions)),
+                "auc": auc, "features": features, "readiness": readiness,
+                "warning": "Research-only chronological holdout evaluation. This model is not connected to live signals and is not a profitability guarantee. Validate with more out-of-sample trades and realistic fees/slippage."}
     except Exception as exc:
-        return {"ok": False, "message": f"ML dependencies or training unavailable: {type(exc).__name__}: {exc}"}
+        return {"ok": False, "trained": False, "readiness": readiness,
+                "message": f"ML dependencies or training unavailable: {type(exc).__name__}: {exc}"}
 
 
 # =========================================================
@@ -4912,6 +4940,70 @@ def get_data_for_timeframe(data_source, selected, ticker, tf, angel_creds):
     return data
 
 
+def get_mtf_setup_metrics(data_source, selected, ticker, tf, angel_creds):
+    """Return real timeframe-specific EMA/RSI/ADX/relative-volume metrics."""
+    result = {"timeframe": tf, "available": False, "ema9": np.nan, "ema21": np.nan,
+              "ema50": np.nan, "rsi": np.nan, "adx": np.nan, "relative_volume": np.nan,
+              "trend": "Unavailable"}
+    try:
+        frame = get_data_for_timeframe(data_source, selected, ticker, tf, angel_creds)
+        if frame is None or frame.empty:
+            return result
+        frame = add_indicators(frame).replace([np.inf, -np.inf], np.nan)
+        if len(frame) < 25:
+            return result
+        row = frame.iloc[-1]
+        for out_key, col in (("ema9", "EMA9"), ("ema21", "EMA21"), ("ema50", "EMA50"),
+                             ("rsi", "RSI"), ("adx", "ADX"), ("relative_volume", "RelativeVolume")):
+            result[out_key] = _safe_num(row.get(col))
+        result["available"] = all(np.isfinite(result[k]) for k in ("ema9", "ema21", "ema50", "rsi", "adx"))
+        if result["available"]:
+            result["trend"] = "Bullish" if result["ema9"] > result["ema21"] else "Bearish" if result["ema9"] < result["ema21"] else "Neutral"
+        return result
+    except Exception:
+        return result
+
+
+def apply_tiered_early_alerts(analysis, metrics_by_tf):
+    """Apply user-defined 3m early, 3m+5m confirmed, and 3m+5m+15m strong stages."""
+    m3, m5, m15 = (metrics_by_tf.get(tf, {}) for tf in ("3m", "5m", "15m"))
+    valid = lambda m: bool(m.get("available"))
+    def bullish(m): return valid(m) and m["ema9"] > m["ema21"]
+    def bearish(m): return valid(m) and m["ema9"] < m["ema21"]
+    def stacked_bull(m): return bullish(m) and m["ema21"] > m["ema50"]
+    def stacked_bear(m): return bearish(m) and m["ema21"] < m["ema50"]
+    r3 = _safe_num(m3.get("rsi")); a3 = _safe_num(m3.get("adx")); v3 = _safe_num(m3.get("relative_volume"))
+    r5 = _safe_num(m5.get("rsi")); a5 = _safe_num(m5.get("adx")); v5 = _safe_num(m5.get("relative_volume"))
+    # Early alert is deliberately a watch state, not an entry approval.
+    buy_early = bullish(m3) and np.isfinite(r3) and r3 > 50
+    buy_confirmed = bullish(m3) and bullish(m5) and r3 > 55 and a3 > 20 and np.isfinite(v3) and v3 > 1.5
+    buy_strong = (stacked_bull(m3) and stacked_bull(m5) and stacked_bull(m15)
+                  and r3 > 60 and a3 > 25 and np.isfinite(v3) and v3 > 1.8)
+    sell_early = bearish(m3) and np.isfinite(r3) and r3 < 50
+    sell_confirmed = bearish(m3) and bearish(m5) and r3 < 45 and a3 > 20 and np.isfinite(v3) and v3 > 1.5
+    sell_strong = (stacked_bear(m3) and stacked_bear(m5) and stacked_bear(m15)
+                   and r3 < 40 and a3 > 25 and np.isfinite(v3) and v3 > 1.8)
+    if buy_strong: stage, direction, tier = "STRONG ENTRY – BUY", "BUY", 3
+    elif buy_confirmed: stage, direction, tier = "CONFIRMED ENTRY – BUY", "BUY", 2
+    elif buy_early: stage, direction, tier = "EARLY ALERT – TREND START (BUY WATCH)", "BUY", 1
+    elif sell_strong: stage, direction, tier = "STRONG ENTRY – SELL", "SELL", 3
+    elif sell_confirmed: stage, direction, tier = "CONFIRMED ENTRY – SELL", "SELL", 2
+    elif sell_early: stage, direction, tier = "EARLY ALERT – TREND START (SELL WATCH)", "SELL", 1
+    else: stage, direction, tier = "NO TIERED ALERT", "NEUTRAL", 0
+    analysis["signal_stage"] = stage
+    analysis["tiered_alert_direction"] = direction
+    analysis["tiered_alert_level"] = tier
+    analysis["tiered_alert_metrics"] = metrics_by_tf
+    analysis["tiered_alert_rules"] = {
+        "3m_trend_start": "EMA9 > EMA21 and RSI > 50",
+        "confirmed_buy": "3m + 5m EMA9 > EMA21; 3m RSI > 55; 3m ADX > 20; 3m Relative Volume > 1.5x Volume MA20",
+        "strong_buy": "3m + 5m + 15m EMA9 > EMA21 > EMA50; 3m RSI > 60; 3m ADX > 25; 3m Relative Volume > 1.8x Volume MA20",
+        "confirmed_sell": "Mirrored bearish conditions; 3m RSI < 45",
+        "strong_sell": "Mirrored bearish EMA stack; 3m RSI < 40"
+    }
+    return analysis
+
+
 def get_mtf_signal(data_source, selected, ticker, tf, angel_creds):
     data = get_data_for_timeframe(data_source, selected, ticker, tf, angel_creds)
     if data.empty:
@@ -5570,6 +5662,11 @@ if not htf_data.empty:
 else:
     htf_bias = None
 
+tiered_tf_metrics = {
+    tf: get_mtf_setup_metrics(active_data_source, selected, ticker, tf, angel_creds)
+    for tf in ("3m", "5m", "15m")
+}
+
 mtf_table = pd.DataFrame({
     "Timeframe": ["1m", "3m", "5m", "15m"],
     "Trend": [
@@ -5660,6 +5757,7 @@ analysis = apply_adaptive_signal_intelligence(
     mtf_bull_count=bull_count, mtf_bear_count=bear_count,
     mtf_available_count=mtf_available_count
 )
+analysis = apply_tiered_early_alerts(analysis, tiered_tf_metrics)
 
 stats = compute_trade_statistics(backtest_trades_df, initial_capital=DEFAULT_INITIAL_BALANCE)
 equity_curve_df, max_drawdown = compute_equity_curve_from_trades(backtest_trades_df, initial_capital=DEFAULT_INITIAL_BALANCE)
@@ -5672,6 +5770,18 @@ with st.expander("🧠 Loss Intelligence & Similar Historical Setups", expanded=
     i3.metric("Historical Win Rate", f"{intel['win_rate']:.1f}%" if intel.get("win_rate") is not None else "N/A")
     i4.metric("Historical Loss Rate", f"{intel['loss_rate']:.1f}%" if intel.get("loss_rate") is not None else "N/A")
     i5.metric("Expected PnL / Trade", f"₹{intel['expected_value']:,.2f}" if intel.get("expected_value") is not None else "N/A")
+    st.markdown("**Tiered early-alert rules (3m / 5m / 15m)**")
+    st.caption("Early alert = 3m EMA9 > EMA21 and RSI > 50. Confirmed BUY = 3m + 5m EMA9 > EMA21, 3m RSI > 55, ADX > 20 and relative volume > 1.5x. Strong BUY = 3m + 5m + 15m EMA9 > EMA21 > EMA50, 3m RSI > 60, ADX > 25 and relative volume > 1.8x. SELL alerts use mirrored bearish conditions.")
+    tf_cols = st.columns(3)
+    for col, tf in zip(tf_cols, ("3m", "5m", "15m")):
+        m = analysis.get("tiered_alert_metrics", {}).get(tf, {})
+        if m.get("available"):
+            col.metric(f"{tf} Trend", m.get("trend", "N/A"))
+            col.caption(f"EMA9 {m['ema9']:.2f} | EMA21 {m['ema21']:.2f} | EMA50 {m['ema50']:.2f}")
+            col.caption(f"RSI {m['rsi']:.1f} | ADX {m['adx']:.1f} | Rel.Vol {m['relative_volume']:.2f}x" if np.isfinite(m.get("relative_volume", np.nan)) else f"RSI {m['rsi']:.1f} | ADX {m['adx']:.1f} | Rel.Vol N/A")
+        else:
+            col.metric(f"{tf} Trend", "N/A")
+            col.caption("Insufficient or unavailable timeframe data; alert tier not confirmed.")
     st.caption(f"Adaptive confidence: {analysis.get('confidence', 'N/A')} / 100 | {analysis.get('adaptive_confidence_label', '')} | Similarity matching is heuristic and only uses stored, available fields.")
     block_repeat_losers = st.toggle("Block signals matching repeated historical losing setups", value=False, key="block_repeat_loser_setups")
     repeat_loss_block_active = bool(block_repeat_losers and analysis.get("similar_trade_block_suggested"))
@@ -5691,13 +5801,20 @@ with st.expander("🧠 Loss Intelligence & Similar Historical Setups", expanded=
         value = snap_view.get(key)
         col.metric(key, f"{value:.2f}" if isinstance(value, (int, float)) and np.isfinite(value) else "N/A")
     st.caption("Loss labels are probable diagnostic categories, not proof of causation. News reversal and execution/slippage causes require reliable event and fill data.")
-    closed_count_ml = int((load_journal().get("Status", pd.Series(dtype=str)).astype(str).str.upper() == "CLOSED").sum()) if not load_journal().empty else 0
-    st.caption(f"Optional ML layer: {closed_count_ml}/500 completed trades collected. Model training remains disabled until the minimum sample is reached.")
-    if st.button("Train / Evaluate ML Model (500+ trades)", key="train_loss_intelligence_ml", disabled=closed_count_ml < 500):
-        with st.spinner("Training optional historical trade classifier…"):
-            ml_result = train_trade_success_model(500)
-        if ml_result.get("ok"):
-            st.success(f"{ml_result['model']} evaluated on held-out data | Accuracy: {ml_result['accuracy']:.1%} | AUC: {ml_result['auc']:.3f}" if ml_result.get("auc") is not None else f"{ml_result['model']} evaluated | Accuracy: {ml_result['accuracy']:.1%}")
+    _ml_journal = load_journal()
+    closed_count_ml = int((_ml_journal.get("Status", pd.Series(dtype=str)).astype(str).str.upper() == "CLOSED").sum()) if not _ml_journal.empty else 0
+    st.caption(f"Optional ML layer: {closed_count_ml}/30 completed trades collected. Dataset evaluation is available now; model fitting unlocks after 30 usable trades with at least 5 wins and 5 losses.")
+    if st.button("Evaluate Dataset / Train ML Model", key="train_loss_intelligence_ml"):
+        with st.spinner("Evaluating historical trade dataset…"):
+            ml_result = train_trade_success_model(30)
+        if ml_result.get("ok") and not ml_result.get("trained"):
+            readiness = ml_result.get("readiness", {})
+            st.info(ml_result.get("message", "Dataset evaluation completed."))
+            if readiness:
+                st.write(f"Usable trades: {readiness.get('trades', 0)} | Wins: {readiness.get('wins', 0)} | Losses: {readiness.get('losses', 0)} | Feature coverage: {readiness.get('coverage_pct', 0):.1f}% | Numeric features: {readiness.get('feature_count', 0)}")
+        elif ml_result.get("ok") and ml_result.get("trained"):
+            auc_text = f" | AUC: {ml_result['auc']:.3f}" if ml_result.get("auc") is not None else ""
+            st.success(f"{ml_result['model']} chronological holdout evaluation | Accuracy: {ml_result['accuracy']:.1%} | Balanced accuracy: {ml_result['balanced_accuracy']:.1%}{auc_text} | Train: {ml_result['train_trades']} | Test: {ml_result['test_trades']}")
             st.caption(ml_result.get("warning", ""))
         else:
             st.warning(ml_result.get("message", "ML training is not available."))
