@@ -5264,8 +5264,8 @@ with st.expander("News Filter API"):
         else:
             st.warning(f"Enter your {news_provider} API key. The news filter will pause new signal entries until the provider can be checked.")
 
-with st.expander("Economic Calendar — Plain-Text Keyword Filter", expanded=False):
-    st.caption("Filters fetched news headlines by the event names below. This is a keyword watchlist, not an official scheduled-release calendar.")
+with st.expander("Economic News Keyword Filter", expanded=False):
+    st.caption("Filters fetched news headlines using the economic event keywords listed below. This is a keyword-based news filter, not an official economic calendar.")
     economic_keyword_text = st.text_input(
         "Economic event keywords (comma-separated)",
         value=st.session_state.get("economic_keyword_text", "RBI, CPI, GDP, NFP, FOMC"),
@@ -5279,7 +5279,7 @@ with st.expander("Economic Calendar — Plain-Text Keyword Filter", expanded=Fal
         item.strip().casefold() for item in str(economic_keyword_text).split(",") if item.strip()
     ]
     st.caption("Active keywords: " + (", ".join(item.upper() for item in economic_keywords) if economic_keywords else "None"))
-    st.caption("Official dates and times must be checked separately; this text filter does not create or verify event schedules.")
+    st.markdown("**Important:** This filter only searches fetched news headlines and related text for matching keywords. It does not confirm event dates, release times, or whether an announcement is scheduled. Verify official schedules separately.")
 
 with st.expander("Angel One API Settings"):
     # Submit the four credentials together. A Streamlit form prevents partial
