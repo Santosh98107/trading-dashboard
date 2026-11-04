@@ -5264,6 +5264,23 @@ with st.expander("News Filter API"):
         else:
             st.warning(f"Enter your {news_provider} API key. The news filter will pause new signal entries until the provider can be checked.")
 
+with st.expander("Economic Calendar — Plain-Text Keyword Filter", expanded=False):
+    st.caption("Filters fetched news headlines by the event names below. This is a keyword watchlist, not an official scheduled-release calendar.")
+    economic_keyword_text = st.text_input(
+        "Economic event keywords (comma-separated)",
+        value=st.session_state.get("economic_keyword_text", "RBI, CPI, GDP, NFP, FOMC"),
+        key="economic_keyword_text",
+        help="Edit the plain-text list. Matching is case-insensitive against available headline, source and entity text."
+    )
+    economic_calendar_filter_enabled = st.checkbox(
+        "Enable economic keyword filter", value=True, key="economic_calendar_filter_enabled"
+    )
+    economic_keywords = [
+        item.strip().casefold() for item in str(economic_keyword_text).split(",") if item.strip()
+    ]
+    st.caption("Active keywords: " + (", ".join(item.upper() for item in economic_keywords) if economic_keywords else "None"))
+    st.caption("Official dates and times must be checked separately; this text filter does not create or verify event schedules.")
+
 with st.expander("Angel One API Settings"):
     # Submit the four credentials together. A Streamlit form prevents partial
     # reruns while a password field is being edited and avoids stale widget reads.
@@ -6384,15 +6401,31 @@ if news_filter_enabled:
         st.warning(news_info.get("message", "News provider unavailable. New signal entries are paused."))
     elif news_info.get("events"):
         _news_df = pd.DataFrame(news_info["events"])
+        if economic_calendar_filter_enabled and economic_keywords:
+            _economic_search_cols = [c for c in ["Title", "Source", "Entities", "Risk Reason"] if c in _news_df.columns]
+            if _economic_search_cols:
+                _economic_text = _news_df[_economic_search_cols].fillna("").astype(str).agg(" ".join, axis=1).str.casefold()
+                _economic_mask = _economic_text.apply(lambda value: any(keyword in value for keyword in economic_keywords))
+                _economic_matches = _news_df.loc[_economic_mask].copy()
+            else:
+                _economic_matches = _news_df.iloc[0:0].copy()
+            st.markdown("**Economic keyword matches**")
+            st.caption(f"Matched {_economic_matches.shape[0]} of {_news_df.shape[0]} fetched news items using: {', '.join(item.upper() for item in economic_keywords)}")
+            if not _economic_matches.empty:
+                _news_df = _economic_matches
+            else:
+                st.info("No fetched headlines matched the economic keyword list. This does not mean no scheduled event is upcoming.")
+                _news_df = _news_df.iloc[0:0].copy()
         _news_columns = [c for c in ["Title", "Source", "Published (UTC)", "Sentiment", "Entities", "Risk Flag", "Risk Reason", "Article"] if c in _news_df.columns]
-        st.dataframe(
-            _news_df[_news_columns],
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "Article": st.column_config.LinkColumn("Article", display_text="Open article")
-            }
-        )
+        if not _news_df.empty:
+            st.dataframe(
+                _news_df[_news_columns],
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Article": st.column_config.LinkColumn("Article", display_text="Open article")
+                }
+            )
         st.caption(news_info.get("message", "News events loaded."))
     else:
         st.info(news_info.get("message", "No recent relevant news."))
