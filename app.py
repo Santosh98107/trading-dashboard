@@ -5,7 +5,6 @@ import shutil
 import hashlib
 import hmac
 from datetime import datetime, timedelta, time, timezone
-from zoneinfo import ZoneInfo
 import threading
 import time as pytime
 
@@ -17,7 +16,7 @@ import streamlit as st
 import yfinance as yf
 
 # Visible deployment marker: confirms which source file Streamlit Cloud is running.
-APP_BUILD_ID = "2026-11-02-WS-RECONNECT-FRESHNESS-19"
+APP_BUILD_ID = "2026-11-04-LOSS-INTELLIGENCE-SIGNAL-V2-01"
 # Optional integrations: Yahoo mode must still start if Angel SDK/TOTP or
 # the auto-refresh helper is not installed.
 try:
@@ -92,7 +91,7 @@ MIN_VALIDATION_SCORE_FOR_ALERT = 70
 DEFAULT_INITIAL_BALANCE = 100000.0
 DATA_INTEGRITY_MIN_ROWS = 30
 BACKUP_RETENTION_COUNT = 30
-USE_POLLING_AS_PRIMARY = True
+USE_POLLING_AS_PRIMARY = False  # WebSocket is primary for Angel live LTP; REST polling is fallback.
 
 WS_STATE_LOCK = threading.Lock()
 WS_SHARED_STATE = {
@@ -107,8 +106,9 @@ WS_SHARED_STATE = {
     "symbol": None,
     "socket": None,
     "last_data_time": None,
-    "last_tick_symbol": None,
+    "last_tick_epoch": None,
     "generation": 0,
+    "retry_exhausted": False,
     "log": []
 }
 
@@ -231,11 +231,17 @@ def init_journal():
     """Create the paper journal with backward-compatible partial-exit fields."""
     if not os.path.exists(JOURNAL_FILE):
         cols = [
-            "DateTime", "Symbol", "Timeframe", "Signal", "Side", "EntryPrice", "ExitPrice",
+            "DateTime", "TradeDate", "TradeTime", "Symbol", "Timeframe", "Signal", "SignalType", "Side", "EntryPrice", "ExitPrice",
             "Quantity", "RemainingQty", "StopLoss", "Target1", "Target2", "Target3", "TrailingStop",
             "ATR", "AutoExitEnabled", "Status", "PnL", "RealizedPnL", "PnLPercent", "Notes",
             "Result", "T1_Hit", "T2_Hit", "T3_Hit", "LastPrice", "LastUpdateTime",
-            "TradeQualityScore", "ValidationScore", "StrategyGrade"
+            "TradeQualityScore", "ValidationScore", "StrategyGrade",
+            "EMA9", "EMA21", "EMA20", "EMA50", "EMA200", "RSI", "MACD",
+            "ADX", "VWAP", "Volume", "RelativeVolume", "VolumeDelta", "MarketRegime",
+            "MTFTrendStatus", "TrendSlope", "SupportDistancePct", "ResistanceDistancePct",
+            "DistanceEMA20Pct", "DistanceEMA50Pct", "DistanceVWAPPct", "RiskRewardRatio",
+            "ConfidenceAtEntry", "HistoricalWinRateAtEntry", "SimilarTradesAtEntry",
+            "LossReason", "SignalStage"
         ]
         safe_write_csv(pd.DataFrame(columns=cols), JOURNAL_FILE)
 
@@ -332,8 +338,17 @@ def load_journal():
         return journal
     changed = False
     defaults = {
-        "Side": "", "RemainingQty": np.nan, "RealizedPnL": 0.0, "ATR": np.nan,
-        "AutoExitEnabled": False, "LastPrice": np.nan, "LastUpdateTime": ""
+        "TradeDate": "", "TradeTime": "", "SignalType": "", "Side": "", "RemainingQty": np.nan, "RealizedPnL": 0.0, "ATR": np.nan,
+        "AutoExitEnabled": False, "LastPrice": np.nan, "LastUpdateTime": "",
+        "EMA9": np.nan, "EMA21": np.nan, "EMA20": np.nan, "EMA50": np.nan,
+        "EMA200": np.nan, "RSI": np.nan, "MACD": np.nan, "ADX": np.nan,
+        "VWAP": np.nan, "Volume": np.nan, "RelativeVolume": np.nan, "VolumeDelta": np.nan,
+        "MarketRegime": "Unknown", "MTFTrendStatus": "Unavailable", "TrendSlope": np.nan,
+        "SupportDistancePct": np.nan, "ResistanceDistancePct": np.nan,
+        "DistanceEMA20Pct": np.nan, "DistanceEMA50Pct": np.nan, "DistanceVWAPPct": np.nan,
+        "RiskRewardRatio": np.nan, "ConfidenceAtEntry": np.nan,
+        "HistoricalWinRateAtEntry": np.nan, "SimilarTradesAtEntry": 0,
+        "LossReason": "", "SignalStage": ""
     }
     for col, default in defaults.items():
         if col not in journal.columns:
@@ -546,11 +561,11 @@ def fetch_data(ticker, interval, period):
     try:
         try:
             df = yf.download(ticker, interval=interval, period=period,
-                             progress=False, auto_adjust=False, threads=False, timeout=15,
+                             progress=False, auto_adjust=False, threads=False, timeout=8,
                              multi_level_index=False)
         except TypeError:
             df = yf.download(ticker, interval=interval, period=period,
-                             progress=False, auto_adjust=False, threads=False, timeout=15)
+                             progress=False, auto_adjust=False, threads=False, timeout=8)
         except Exception as exc:
             errors.append(f"download: {exc}")
 
@@ -572,7 +587,7 @@ def fetch_data(ticker, interval, period):
             # Ticker.history is a useful fallback when download returns a changed schema.
             try:
                 hist = yf.Ticker(ticker).history(period=period, interval=interval,
-                                                 auto_adjust=False, prepost=False, timeout=15)
+                                                 auto_adjust=False, prepost=False, timeout=8)
                 if not hist.empty and all(c in hist.columns for c in needed):
                     df = hist[needed].copy()
             except Exception as exc:
@@ -694,7 +709,7 @@ def get_angel_instrument_master():
     """Download and normalize Angel One's public instrument master once per day."""
     url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
     try:
-        response = requests.get(url, timeout=20)
+        response = requests.get(url, timeout=8)
         response.raise_for_status()
         payload = response.json()
         frame = pd.DataFrame(payload)
@@ -1075,13 +1090,14 @@ def sync_ws_state_to_session():
         "ws_connected": state["connected"],
         "ws_error": state["error"],
         "ws_last_tick": state["last_tick"],
+        "ws_last_tick_epoch": state.get("last_tick_epoch"),
         "live_price": state["live_price"],
         "ws_retries": state["retries"],
         "ws_should_run": state["should_run"],
         "ws_thread_started": state["thread_started"],
-        "ws_log": state["log"],
-        "ws_last_data_time": state.get("last_data_time"),
-        "ws_symbol": state.get("last_tick_symbol") or state.get("symbol")
+        "ws_symbol": state.get("symbol"),
+        "ws_retry_exhausted": state.get("retry_exhausted", False),
+        "ws_log": state["log"]
     }.items():
         st.session_state[k] = v
 
@@ -1092,13 +1108,13 @@ def init_ws_state():
         "ws_connected": False,
         "ws_error": "",
         "ws_last_tick": None,
+        "ws_last_tick_epoch": None,
         "ws_thread_started": False,
         "live_price": None,
         "ws_retries": 0,
         "ws_should_run": False,
-        "ws_log": [],
-        "ws_last_data_time": None,
-        "ws_symbol": None
+        "ws_retry_exhausted": False,
+        "ws_log": []
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -1106,49 +1122,49 @@ def init_ws_state():
     sync_ws_state_to_session()
 
 
-def stop_angel_websocket():
-    """Stop the current socket and invalidate callbacks from older connections."""
-    try:
-        ws_log("Stop requested")
-        with WS_STATE_LOCK:
-            WS_SHARED_STATE["generation"] = int(WS_SHARED_STATE.get("generation", 0)) + 1
-            WS_SHARED_STATE["should_run"] = False
-            WS_SHARED_STATE["connected"] = False
-            WS_SHARED_STATE["running"] = False
-            WS_SHARED_STATE["thread_started"] = False
-            WS_SHARED_STATE["error"] = "WebSocket stopped"
-            sws = WS_SHARED_STATE.get("socket")
-            WS_SHARED_STATE["socket"] = None
-        if sws is not None:
-            try:
-                if hasattr(sws, "close_connection"):
-                    sws.close_connection()
-                elif hasattr(sws, "close"):
-                    sws.close()
-            except Exception as e:
-                ws_log(f"Socket close error: {e}")
-        sync_ws_state_to_session()
-    except Exception as e:
-        ws_set_state(error=f"Stop error: {e}")
-        log_app_error("stop_angel_websocket", e)
-
-
-def ws_has_fresh_tick(symbol_name=None, max_age_seconds=30):
-    """True only for a recent tick belonging to the currently selected symbol."""
+def ws_live_quote(max_age_seconds=20, symbol_name=None):
+    """Return a fresh WebSocket LTP only while its socket is connected."""
     state = ws_get_state()
-    raw_time = state.get("last_data_time")
-    if not raw_time:
-        return False
-    if symbol_name and str(state.get("last_tick_symbol") or state.get("symbol")) != str(symbol_name):
-        return False
+    if symbol_name and str(state.get("symbol")) != str(symbol_name):
+        return None
+    price = state.get("live_price")
+    received_at = state.get("last_tick_epoch")
+    if not state.get("connected") or price is None or received_at is None:
+        return None
     try:
-        tick_time = datetime.strptime(str(raw_time), "%d-%m-%Y %H:%M:%S").replace(
-            tzinfo=ZoneInfo("Asia/Kolkata")
-        )
-        age = (datetime.now(ZoneInfo("Asia/Kolkata")) - tick_time).total_seconds()
-        return -2 <= age <= float(max_age_seconds)
+        age = pytime.time() - float(received_at)
+        price = float(price)
+        if age < 0 or age > float(max_age_seconds) or not np.isfinite(price) or price <= 0:
+            return None
+        return price
     except Exception:
-        return False
+        return None
+
+
+def stop_angel_websocket():
+    """Invalidate the worker generation before closing the active socket."""
+    try:
+        state = ws_get_state()
+        socket_obj = state.get("socket")
+        next_generation = int(state.get("generation", 0)) + 1
+        ws_set_state(
+            generation=next_generation, should_run=False, connected=False,
+            running=False, thread_started=False, socket=None,
+            live_price=None, last_tick=None, last_tick_epoch=None,
+            retry_exhausted=False, error="WebSocket stopped"
+        )
+        if socket_obj is not None:
+            try:
+                if hasattr(socket_obj, "close_connection"):
+                    socket_obj.close_connection()
+                elif hasattr(socket_obj, "close"):
+                    socket_obj.close()
+            except Exception as exc:
+                ws_log(f"Socket close error: {exc}")
+        sync_ws_state_to_session()
+    except Exception as exc:
+        ws_set_state(error=f"Stop error: {exc}")
+        log_app_error("stop_angel_websocket", exc)
 
 
 def extract_ltp_from_message(message):
@@ -1159,186 +1175,166 @@ def extract_ltp_from_message(message):
         if key in message and message.get(key) is not None:
             try:
                 val = float(message[key])
-                if val > 10000:
+                # SmartAPI WebSocket v2 binary last_traded_price is in paise.
+                # Alternate wrapper keys (ltp/lastTradedPrice/close) are already
+                # expressed in rupees and must not be divided merely because an
+                # index value is greater than 10,000.
+                if key in {"last_traded_price", "last_traded_price_int"} and val > 0:
                     val /= 100.0
-                return val
+                return val if np.isfinite(val) and val > 0 else None
             except Exception:
                 return None
     return None
 
 
 def start_angel_websocket(api_key, client_code, pin, totp_secret, symbol_name):
-    """Start a read-only Angel One WebSocket quote feed for the selected symbol.
-
-    A generation token prevents callbacks from an old symbol/session from
-    overwriting the latest quote after a reconnect or symbol change.
-    """
+    """Start SmartWebSocketV2 as the live-LTP primary without using Streamlit state in its worker."""
     init_ws_state()
-    if not SMART_WS_AVAILABLE:
-        ws_set_state(error="SmartWebSocketV2 not available; install the Angel One SmartAPI SDK.")
+    if not SMART_WS_AVAILABLE or not SMART_API_AVAILABLE:
+        ws_set_state(error="SmartAPI WebSocket/TOTP dependencies are unavailable", connected=False, running=False)
         sync_ws_state_to_session()
         return
 
     instrument = resolve_angel_instrument(symbol_name)
     if not instrument:
-        ws_set_state(error=f"Angel instrument master did not resolve {symbol_name}")
+        ws_set_state(error=f"Angel instrument master did not resolve {symbol_name}", connected=False, running=False)
         sync_ws_state_to_session()
         return
-
-    symbol_token = str(instrument["token"])
     exchange_type = 1 if instrument["exchange"] == "NSE" else 3 if instrument["exchange"] == "BSE" else None
     if exchange_type is None:
-        ws_set_state(error=f"WebSocket exchange mapping unsupported: {instrument['exchange']}")
+        ws_set_state(error=f"WebSocket exchange mapping unsupported: {instrument['exchange']}", connected=False, running=False)
         sync_ws_state_to_session()
         return
 
-    state = ws_get_state()
-    if state.get("thread_started") and state.get("symbol") == symbol_name and state.get("should_run"):
+    current = ws_get_state()
+    if (current.get("thread_started") and current.get("symbol") == symbol_name
+            and current.get("should_run")):
         sync_ws_state_to_session()
         return
 
-    # Stop an old symbol's socket before subscribing to the newly selected one.
-    if state.get("thread_started") or state.get("socket") is not None:
-        stop_angel_websocket()
-        pytime.sleep(0.25)
+    # Reuse the already-authenticated Streamlit session for the first socket
+    # connection. This avoids generating a second Angel login just to obtain a
+    # WebSocket token, which could invalidate the REST polling fallback session.
+    try:
+        _angel_api_for_ws = st.session_state.get("angel_api")
+        _angel_session_for_ws = st.session_state.get("angel_session") or {}
+        _angel_auth_data_for_ws = _angel_session_for_ws.get("data") or {}
+        initial_auth_token = _angel_auth_data_for_ws.get("jwtToken") or _angel_auth_data_for_ws.get("jwt_token")
+        if _angel_api_for_ws is None or not initial_auth_token:
+            raise RuntimeError("No authenticated Angel API session is available for WebSocket startup")
+        _feed_response_for_ws = _angel_api_for_ws.getfeedToken()
+        if isinstance(_feed_response_for_ws, dict):
+            initial_feed_token = (_feed_response_for_ws.get("data") or {}).get("feedToken") or _feed_response_for_ws.get("feedToken")
+        else:
+            initial_feed_token = _feed_response_for_ws
+        if not initial_feed_token:
+            raise RuntimeError("Authenticated Angel session did not return a WebSocket feed token")
+    except Exception as exc:
+        ws_set_state(error=f"Could not prepare authenticated WebSocket tokens: {str(exc)[:250]}", connected=False, running=False)
+        log_app_error("prepare_angel_websocket_tokens", exc)
+        sync_ws_state_to_session()
+        return
 
-    with WS_STATE_LOCK:
-        generation = int(WS_SHARED_STATE.get("generation", 0)) + 1
-        WS_SHARED_STATE.update({
-            "generation": generation,
-            "should_run": True,
-            "thread_started": True,
-            "symbol": symbol_name,
-            "last_tick_symbol": None,
-            "last_tick": None,
-            "last_data_time": None,
-            "live_price": None,
-            "connected": False,
-            "running": False,
-            "error": "",
-            "retries": 0,
-            "socket": None,
-        })
-    ws_log(f"Starting read-only live feed for {symbol_name} (token {symbol_token})")
+    old_socket = current.get("socket")
+    generation = int(current.get("generation", 0)) + 1
+    ws_set_state(
+        generation=generation, should_run=True, thread_started=True,
+        symbol=symbol_name, error="Connecting to Angel One WebSocket…",
+        retries=0, retry_exhausted=False, running=False, connected=False, socket=None,
+        live_price=None, last_tick=None, last_tick_epoch=None, last_data_time=None
+    )
+    if old_socket is not None:
+        try:
+            old_socket.close_connection()
+        except Exception:
+            pass
+
+    def generation_is_current():
+        snapshot = ws_get_state()
+        return snapshot.get("generation") == generation and snapshot.get("should_run")
+
+    def create_worker_session():
+        # Use the authenticated tokens captured on the Streamlit main thread.
+        # The worker never reads st.session_state or creates a duplicate login.
+        return initial_auth_token, initial_feed_token
 
     def run_socket():
         retry_count = 0
-        while True:
-            state_now = ws_get_state()
-            if state_now.get("generation") != generation or not state_now.get("should_run"):
-                break
-            if retry_count >= MAX_WS_RETRIES:
-                if ws_get_state().get("generation") == generation:
-                    ws_set_state(
-                        error="Maximum reconnect attempts reached",
-                        running=False, connected=False, thread_started=False, socket=None
-                    )
-                break
-
+        while generation_is_current():
+            sws = None
             try:
-                angel, session = angel_login(api_key, client_code, pin, totp_secret, force_refresh=True)
-                if angel is None or session is None or not session.get("data"):
-                    raise Exception("Angel login failed during WebSocket connection")
-
-                auth_token = session["data"].get("jwtToken")
-                if not auth_token:
-                    raise Exception("JWT missing from authenticated Angel session")
-
-                feed_token_resp = angel.getfeedToken()
-                if isinstance(feed_token_resp, dict):
-                    feed_token = (
-                        feed_token_resp.get("data", {}).get("feedToken")
-                        or feed_token_resp.get("feedToken")
-                    )
-                else:
-                    feed_token = feed_token_resp
-                if not feed_token:
-                    raise Exception("Feed token missing from Angel session")
-
-                sws = SmartWebSocketV2(auth_token, api_key, client_code, feed_token)
-                if ws_get_state().get("generation") != generation:
-                    try:
-                        sws.close_connection()
-                    except Exception:
-                        pass
+                auth_token, feed_token = create_worker_session()
+                if not generation_is_current():
                     break
-                ws_set_state(socket=sws, running=True, connected=False, retries=retry_count, error="")
-
-                correlation_id = f"readonly_{symbol_name}_{generation}"
-                token_list = [{"exchangeType": exchange_type, "tokens": [symbol_token]}]
+                sws = SmartWebSocketV2(auth_token, str(api_key).strip(), str(client_code).strip(), feed_token, max_retry_attempt=0)
+                ws_set_state(socket=sws, running=True, connected=False, error="WebSocket authenticated; waiting for market ticks…")
+                correlation_id = f"EL{generation:08d}"[-10:]
+                token_list = [{"exchangeType": exchange_type, "tokens": [str(instrument["token"])]}]
 
                 def on_data(wsapp, message):
-                    if ws_get_state().get("generation") != generation:
+                    if not generation_is_current():
                         return
                     ltp = extract_ltp_from_message(message)
-                    if ltp is None or not np.isfinite(ltp) or ltp <= 0:
-                        return
-                    tick_time = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%d-%m-%Y %H:%M:%S")
-                    ws_set_state(
-                        last_tick=message,
-                        last_tick_symbol=symbol_name,
-                        connected=True,
-                        running=True,
-                        error="",
-                        live_price=float(ltp),
-                        last_data_time=tick_time,
-                    )
+                    if ltp is not None:
+                        ws_set_state(
+                            last_tick=message, connected=True, running=True, error="",
+                            live_price=ltp, last_data_time=now_str(), last_tick_epoch=pytime.time()
+                        )
 
                 def on_open(wsapp):
-                    if ws_get_state().get("generation") != generation:
+                    if not generation_is_current():
                         return
                     try:
+                        ws_set_state(connected=True, running=True, error="WebSocket connected; subscription sent")
                         sws.subscribe(correlation_id, 1, token_list)
-                        ws_set_state(connected=True, running=True, error="")
-                        ws_log(f"Subscribed to {symbol_name} ({symbol_token})")
-                    except Exception as e:
-                        ws_set_state(error=f"WebSocket subscribe error: {e}", connected=False)
+                    except Exception as exc:
+                        ws_set_state(error=f"WebSocket subscribe error: {exc}", connected=False)
 
                 def on_error(wsapp, error):
-                    if ws_get_state().get("generation") == generation:
+                    if generation_is_current():
                         ws_set_state(error=f"WebSocket error: {error}", connected=False, running=False)
-                        ws_log(f"WebSocket error: {error}")
 
                 def on_close(wsapp, *args):
-                    if ws_get_state().get("generation") == generation:
-                        reason = " | ".join(str(x) for x in args if x is not None) if args else ""
+                    if generation_is_current():
+                        reason = " | ".join(str(item) for item in args if item is not None)
                         ws_set_state(connected=False, running=False, error=f"WebSocket closed {reason}".strip())
 
                 sws.on_open = on_open
                 sws.on_data = on_data
                 sws.on_error = on_error
                 sws.on_close = on_close
+                sws.connect()
+                if generation_is_current():
+                    ws_set_state(connected=False, running=False, socket=None, error="WebSocket connection ended; retrying")
+            except Exception as exc:
+                if generation_is_current():
+                    ws_set_state(error=f"WebSocket attempt {retry_count + 1}: {str(exc)[:350]}", connected=False, running=False, socket=None)
+                log_app_error("start_angel_websocket", exc)
+            finally:
+                if sws is not None and not generation_is_current():
+                    try:
+                        sws.close_connection()
+                    except Exception:
+                        pass
 
-                try:
-                    sws.connect()
-                finally:
-                    if ws_get_state().get("generation") == generation:
-                        ws_set_state(connected=False, running=False, socket=None)
-
-            except Exception as e:
-                if ws_get_state().get("generation") == generation:
-                    ws_set_state(
-                        error=f"Reconnect attempt {retry_count + 1}/{MAX_WS_RETRIES}: {e}",
-                        connected=False, running=False, socket=None
-                    )
-                    log_app_error("start_angel_websocket", e)
-
-            if ws_get_state().get("generation") != generation:
+            if not generation_is_current():
                 break
             retry_count += 1
             ws_set_state(retries=retry_count)
-            if not ws_get_state().get("should_run"):
+            if retry_count >= MAX_WS_RETRIES:
+                ws_set_state(
+                    should_run=False, running=False, connected=False,
+                    thread_started=False, socket=None, retry_exhausted=True,
+                    error=f"WebSocket stopped after {MAX_WS_RETRIES} reconnect attempts; REST polling fallback remains available"
+                )
                 break
             pytime.sleep(WS_RETRY_DELAY_SEC)
 
-        if ws_get_state().get("generation") == generation:
-            ws_set_state(running=False, connected=False, socket=None, thread_started=False)
+        final_state = ws_get_state()
+        if final_state.get("generation") == generation:
+            ws_set_state(running=False, connected=False, thread_started=False, socket=None)
 
-    threading.Thread(
-        target=run_socket,
-        name=f"AngelWS-{symbol_name}",
-        daemon=True
-    ).start()
+    threading.Thread(target=run_socket, name=f"AngelWS-{symbol_name}-{generation}", daemon=True).start()
     sync_ws_state_to_session()
 
 
@@ -1569,6 +1565,8 @@ def detect_candlestick_patterns(df):
 def add_indicators(df):
     df = df.copy()
 
+    df["EMA9"] = df["Close"].ewm(span=9, adjust=False).mean()
+    df["EMA21"] = df["Close"].ewm(span=21, adjust=False).mean()
     df["EMA20"] = df["Close"].ewm(span=20, adjust=False).mean()
     df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
     df["EMA200"] = df["Close"].ewm(span=200, adjust=False).mean()
@@ -1596,6 +1594,12 @@ def add_indicators(df):
     df["BB_Lower"] = df["SMA20"] - 2 * std20
 
     df["Volume_MA20"] = df["Volume"].rolling(20).mean()
+    df["RelativeVolume"] = (df["Volume"] / df["Volume_MA20"].replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
+    df["VolumeDelta"] = np.sign(df["Close"].diff()).fillna(0) * df["Volume"].fillna(0)
+    df["TrendSlope"] = df["EMA9"].diff(3) / 3.0
+    df["DistanceEMA20Pct"] = ((df["Close"] - df["EMA20"]) / df["EMA20"].replace(0, np.nan)) * 100
+    df["DistanceEMA50Pct"] = ((df["Close"] - df["EMA50"]) / df["EMA50"].replace(0, np.nan)) * 100
+    df["DistanceVWAPPct"] = ((df["Close"] - df["VWAP"]) / df["VWAP"].replace(0, np.nan)) * 100 if "VWAP" in df.columns else np.nan
     df["Volume_Spike"] = df["Volume"] > (1.5 * df["Volume_MA20"])
 
     df["PivotHigh"] = df["High"].rolling(20).max()
@@ -1781,13 +1785,13 @@ def fetch_yahoo_batch(tickers, interval, period):
             raw = yf.download(
                 tickers=list(ticker_list), period=period, interval=interval,
                 group_by="ticker", auto_adjust=False, progress=False,
-                threads=True, timeout=20, multi_level_index=True
+                threads=True, timeout=8, multi_level_index=True
             )
         except TypeError:
             raw = yf.download(
                 tickers=list(ticker_list), period=period, interval=interval,
                 group_by="ticker", auto_adjust=False, progress=False,
-                threads=True, timeout=20
+                threads=True, timeout=8
             )
         if raw is None or not isinstance(raw, pd.DataFrame) or raw.empty:
             log_app_error("fetch_yahoo_batch", f"Yahoo batch returned no rows for {len(ticker_list)} tickers at {interval}/{period}.")
@@ -1820,56 +1824,16 @@ def fetch_yahoo_batch(tickers, interval, period):
         return empty_result
 
 
-def _market_session_info(name):
-    """Return approximate local exchange session; holidays are not inferred."""
-    n = str(name).lower()
-    if any(x in n for x in ("s&p 500", "nasdaq", "dow jones")):
-        return "America/New_York", time(9, 30), time(16, 0)
-    if "hang seng" in n:
-        return "Asia/Hong_Kong", time(9, 30), time(16, 0)
-    if "shanghai" in n:
-        return "Asia/Shanghai", time(9, 30), time(15, 0)
-    if "nikkei" in n:
-        return "Asia/Tokyo", time(9, 0), time(15, 30)
-    if "ftse" in n:
-        return "Europe/London", time(8, 0), time(16, 30)
-    if "dax" in n:
-        return "Europe/Berlin", time(9, 0), time(17, 30)
-    if any(x in n for x in ("nifty", "sensex", "bank nifty", "india vix", "usd/inr")):
-        return "Asia/Kolkata", time(9, 15), time(15, 30)
-    # Commodity futures trade for extended hours; use the US futures session
-    # only as a conservative freshness reference, not as a holiday calendar.
-    if any(x in n for x in ("brent", "gold")):
-        return "America/New_York", time(8, 0), time(17, 0)
-    return "Asia/Kolkata", time(9, 15), time(15, 30)
-
-
-def _market_is_open(name, now_utc=None):
-    tz_name, session_start, session_end = _market_session_info(name)
-    now_local = (now_utc or datetime.now(timezone.utc)).astimezone(ZoneInfo(tz_name))
-    return now_local.weekday() < 5 and session_start <= now_local.time().replace(tzinfo=None) <= session_end
-
-
-def _timestamp_ist(value):
-    ts = pd.Timestamp(value)
-    if ts.tzinfo is None:
-        # Yahoo intraday timestamps are normally timezone-aware. If a provider
-        # returns naive values, treat them as UTC rather than silently localizing.
-        ts = ts.tz_localize("UTC")
-    return ts.tz_convert("Asia/Kolkata").strftime("%d-%b-%Y %H:%M:%S IST")
-
-
 def _market_quote_from_frames(name, ticker_used, intraday_frame, daily_frame, fallback_label=None):
-    """Build a quote that is explicitly tagged live, stale, or market-closed.
+    """Build one market quote using the newest 5-minute bar, else latest daily close.
 
-    A 5-minute bar is called LIVE only during the approximate exchange session
-    and only when it is no more than 20 minutes old. Outside the session the
-    latest daily close is preferred. Holiday calendars and vendor delays are
-    not available here, so session checks are intentionally conservative.
+    Daily % change is calculated against the last completed daily bar before the
+    current quote date. Missing quotes remain NaN; values are never copied from
+    other indices or companies.
     """
     empty = {
         "Name": name, "Ticker": ticker_used, "Price": np.nan,
-        "ChangePct": np.nan, "Status": "NO DATA", "AsOf": "N/A",
+        "ChangePct": np.nan, "Status": "No data returned", "AsOf": "N/A",
         "DisplayName": fallback_label or name,
     }
     try:
@@ -1877,26 +1841,23 @@ def _market_quote_from_frames(name, ticker_used, intraday_frame, daily_frame, fa
         daily = _normalize_yahoo_frame(daily_frame)
         intraday = intraday.dropna(subset=["Close"]) if not intraday.empty else intraday
         daily = daily.dropna(subset=["Close"]) if not daily.empty else daily
-        now_utc = datetime.now(timezone.utc)
-        market_open = _market_is_open(name, now_utc)
 
-        use_intraday = not intraday.empty and market_open
-        if use_intraday:
-            quote_timestamp = pd.Timestamp(intraday.index[-1])
-            if quote_timestamp.tzinfo is None:
-                quote_timestamp = quote_timestamp.tz_localize("UTC")
-            age_minutes = (pd.Timestamp(now_utc) - quote_timestamp.tz_convert("UTC")).total_seconds() / 60.0
-            if age_minutes < -2 or age_minutes > 20:
-                use_intraday = False
-                stale_intraday = True
-            else:
-                stale_intraday = False
-        else:
-            stale_intraday = bool(not intraday.empty and market_open)
+        use_intraday = not intraday.empty
+        if use_intraday and not daily.empty:
+            try:
+                intraday_date = pd.Timestamp(intraday.index[-1]).date()
+                daily_latest_date = pd.Timestamp(daily.index[-1]).date()
+                # If the latest intraday bar is older than a newer EOD bar,
+                # show the newer EOD value instead of a stale intraday quote.
+                if daily_latest_date > intraday_date:
+                    use_intraday = False
+            except Exception:
+                pass
 
         if use_intraday:
             price = float(intraday["Close"].iloc[-1])
-            quote_date = pd.Timestamp(intraday.index[-1]).date()
+            quote_timestamp = pd.Timestamp(intraday.index[-1])
+            quote_date = quote_timestamp.date()
             previous_close = np.nan
             if not daily.empty:
                 older_daily = daily[[pd.Timestamp(x).date() < quote_date for x in daily.index]]
@@ -1904,28 +1865,30 @@ def _market_quote_from_frames(name, ticker_used, intraday_frame, daily_frame, fa
                     previous_close = float(older_daily["Close"].iloc[-1])
                 elif len(daily) >= 2:
                     previous_close = float(daily["Close"].iloc[-2])
-            status = "LIVE · 5m bar"
-            as_of = _timestamp_ist(intraday.index[-1])
+            status = "Latest 5m bar"
         elif not daily.empty:
             price = float(daily["Close"].iloc[-1])
+            quote_timestamp = pd.Timestamp(daily.index[-1])
             previous_close = float(daily["Close"].iloc[-2]) if len(daily) >= 2 else np.nan
-            status = "STALE DATA · last daily close" if stale_intraday else "MARKET CLOSED · daily close"
-            as_of = _timestamp_ist(daily.index[-1])
-        elif not intraday.empty:
-            price = float(intraday["Close"].iloc[-1])
-            previous_close = np.nan
-            status = "STALE DATA · no fresh quote"
-            as_of = _timestamp_ist(intraday.index[-1])
+            status = "Latest daily close"
         else:
             return empty
 
         change_pct = np.nan
         if pd.notna(previous_close) and previous_close != 0:
             change_pct = ((price - previous_close) / previous_close) * 100.0
+
+        try:
+            as_of = quote_timestamp.strftime("%Y-%m-%d %H:%M %Z").strip()
+        except Exception:
+            as_of = str(quote_timestamp)
         return {
-            "Name": name, "Ticker": ticker_used, "Price": round(price, 4),
+            "Name": name,
+            "Ticker": ticker_used,
+            "Price": round(price, 4),
             "ChangePct": round(float(change_pct), 2) if pd.notna(change_pct) else np.nan,
-            "Status": status, "AsOf": as_of,
+            "Status": status,
+            "AsOf": as_of,
             "DisplayName": fallback_label or name,
         }
     except Exception as exc:
@@ -1996,33 +1959,62 @@ def _render_market_quote_grid(rows, columns_per_row=5):
 
 
 def render_live_global_india_market_board():
-    """Top-level global and Indian market performance panel."""
+    """Render cached market board; network fetches are explicit or at 60s cadence.
+
+    Previously this function fetched two large Yahoo batches on every Streamlit
+    rerun before the main chart. A slow Yahoo response could make the entire app
+    look frozen. Now the board never blocks initial dashboard rendering.
+    """
     st.divider()
     st.header("Global / Macro Performance")
     st.caption(
-        "LIVE means a 5-minute bar within 20 minutes during the approximate exchange session. "
-        "Outside session the board uses the latest daily close; old intraday quotes are marked STALE DATA. "
-        "Times are displayed in IST. Yahoo board data is independent of the selected primary Angel/Yahoo candle source."
+        "Latest available Yahoo quote: 5-minute bars where available, otherwise latest daily close. "
+        "This independent board does not block the selected Angel/Yahoo chart feed."
     )
-    if st.button("Refresh Global + Indian Market Data", key="refresh_global_india_market_board"):
-        fetch_yahoo_batch.clear()
-    with st.spinner("Refreshing global indices, macro instruments and major Indian stocks…"):
-        global_rows, indian_rows = build_live_market_board_rows()
-    st.caption(f"Board refreshed: {datetime.now(ZoneInfo('Asia/Kolkata')).strftime('%d-%b-%Y %H:%M:%S IST')} | Yahoo batch cache: 30 seconds")
-    _render_market_quote_grid(global_rows, columns_per_row=5)
-    unavailable_global = sum(pd.isna(row.get("Price", np.nan)) for row in global_rows)
-    if unavailable_global:
-        st.warning(f"{unavailable_global} global/macro instruments returned no quote. They remain N/A rather than showing stale values from another symbol.")
+    refresh_clicked = st.button("Refresh Global + Indian Market Data", key="refresh_global_india_market_board")
+    auto_on = bool(st.session_state.get("auto_refresh_enabled", False))
+    now_epoch = pytime.time()
+    last_fetch_epoch = float(st.session_state.get("market_board_last_fetch_epoch", 0) or 0)
+    auto_due = auto_on and (now_epoch - last_fetch_epoch >= 60)
+    should_fetch = refresh_clicked or auto_due
 
+    if should_fetch:
+        try:
+            fetch_yahoo_batch.clear()
+            with st.spinner("Loading global indices and Indian stocks (bounded Yahoo requests)…"):
+                global_rows, indian_rows = build_live_market_board_rows()
+            st.session_state["market_board_cache"] = {
+                "global": global_rows, "indian": indian_rows,
+                "checked_at": datetime.now().strftime("%d-%b-%Y %H:%M:%S"),
+            }
+            st.session_state["market_board_last_fetch_epoch"] = now_epoch
+        except Exception as exc:
+            log_app_error("render_live_global_india_market_board", exc)
+            st.warning(f"Market board refresh failed: {type(exc).__name__}. Main chart and scanner remain independent.")
+
+    cached = st.session_state.get("market_board_cache")
+    if not isinstance(cached, dict):
+        st.info("Market overview has not been fetched yet. Press Refresh Global + Indian Market Data. The main dashboard will continue loading without waiting for this optional board.")
+        global_rows, indian_rows = [], []
+    else:
+        global_rows = cached.get("global", [])
+        indian_rows = cached.get("indian", [])
+        st.caption(f"Last successful board refresh: {cached.get('checked_at', 'N/A')} | Auto refresh checks this board at most once per 60 seconds.")
+
+    if global_rows:
+        _render_market_quote_grid(global_rows, columns_per_row=5)
+        unavailable_global = sum(pd.isna(row.get("Price", np.nan)) for row in global_rows)
+        if unavailable_global:
+            st.warning(f"{unavailable_global} global/macro instruments returned no quote. They remain N/A.")
     st.subheader("🇮🇳 Major Indian Stocks — Banks, IT, Auto and Index Leaders")
-    _render_market_quote_grid(indian_rows, columns_per_row=5)
-    unavailable_indian = sum(pd.isna(row.get("Price", np.nan)) for row in indian_rows)
-    if unavailable_indian:
-        st.warning(f"{unavailable_indian} Indian stocks returned no quote in this Yahoo batch. Check the symbol and provider availability.")
-    st.caption(
-        "Source: Yahoo Finance. Session hours are approximate and exchange holidays/vendor outages can still cause stale quotes. "
-        "GIFT Nifty is shown only when its Yahoo futures symbol resolves; otherwise the card is explicitly labelled as a NIFTY spot proxy."
-    )
+    if indian_rows:
+        _render_market_quote_grid(indian_rows, columns_per_row=5)
+        unavailable_indian = sum(pd.isna(row.get("Price", np.nan)) for row in indian_rows)
+        if unavailable_indian:
+            st.warning(f"{unavailable_indian} Indian stocks returned no quote in this Yahoo batch.")
+    else:
+        st.caption("Indian stock board will appear after the first manual refresh.")
+    st.caption("Source: Yahoo Finance. Yahoo latency varies by instrument. GIFT Nifty proxy is labelled separately and is not represented as a futures quote.")
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -2492,7 +2484,7 @@ def get_news_events(api_key, symbol, provider="Marketaux", lookback_hours=6, art
                 "group_similar": "true",
                 "limit": article_limit,
             }
-            response = requests.get(MARKETAUX_NEWS_URL, params=params, timeout=12)
+            response = requests.get(MARKETAUX_NEWS_URL, params=params, timeout=6)
             if response.status_code != 200:
                 detail = ""
                 try:
@@ -2524,7 +2516,7 @@ def get_news_events(api_key, symbol, provider="Marketaux", lookback_hours=6, art
                 "from": after_utc.strftime("%Y-%m-%dT%H:%M:%S"),
                 "apiKey": str(api_key).strip(),
             }
-            response = requests.get("https://newsapi.org/v2/everything", params=params, timeout=12)
+            response = requests.get("https://newsapi.org/v2/everything", params=params, timeout=6)
             if response.status_code != 200:
                 try:
                     payload = response.json()
@@ -2668,8 +2660,8 @@ def get_option_chain_snapshot(symbol="NIFTY"):
             "Accept-Language": "en-US,en;q=0.9"
         }
         session = requests.Session()
-        session.get("https://www.nseindia.com", headers=headers, timeout=10)
-        resp = session.get(url, headers=headers, timeout=10)
+        session.get("https://www.nseindia.com", headers=headers, timeout=4)
+        resp = session.get(url, headers=headers, timeout=4)
         if resp.status_code != 200:
             return None
         data = resp.json()
@@ -2793,14 +2785,22 @@ def detect_market_regime(df):
         sideways = adx <= SIDEWAYS_ADX_MAX and ema_spread_pct < 0.3
         high_volatility = atr_pct >= HIGH_VOL_ATR_PCT
 
-        if trending and high_volatility:
+        is_breakout = bool(latest.get("Breakout", False)) if pd.notna(latest.get("Breakout", False)) else False
+        is_breakdown = bool(latest.get("Breakdown", False)) if pd.notna(latest.get("Breakdown", False)) else False
+        if is_breakout:
+            regime = "Breakout"
+        elif is_breakdown:
+            regime = "Breakdown"
+        elif trending and high_volatility:
             regime = "Trending High Volatility"
         elif trending:
-            regime = "Trending"
+            regime = "Trending Up" if ema20 >= ema50 else "Trending Down"
         elif sideways:
-            regime = "Sideways"
+            regime = "Range Bound"
         elif high_volatility:
             regime = "High Volatility"
+        elif atr_pct < 0.5:
+            regime = "Low Volatility"
         else:
             regime = "Balanced"
 
@@ -3156,6 +3156,9 @@ def analyze_signal(
     # Avoid double-counting OI bias where it is derived from the same total CE/PE OI as PCR.
 
     regime = detect_market_regime(df)
+    _news_message_for_regime = str((news_info or {}).get("message", ""))
+    if (news_info or {}).get("status") == "ok" and "News risk detected" in _news_message_for_regime:
+        regime["regime"] = "News Driven"
     gap_info = detect_gap_filter(df)
     session_info = session_filter(df, timeframe_label)
     news_info = news_info if isinstance(news_info, dict) else {"allow_trade": True, "message": "News filter unavailable", "events": []}
@@ -3343,6 +3346,259 @@ def analyze_signal(
         "ema200_available": ema200_available, "trend_vote_count": trend_vote_count,
         "buy_trend_votes": int(buy_trend_votes), "sell_trend_votes": int(sell_trend_votes),
     }
+
+
+# =========================================================
+# LOSS INTELLIGENCE / SIMILAR SETUPS / SIGNAL ENGINE V2
+# =========================================================
+LOSS_FEATURE_COLUMNS = [
+    "EMA9", "EMA21", "EMA20", "EMA50", "EMA200", "RSI", "MACD", "ADX",
+    "ATR", "VWAP", "Volume", "RelativeVolume", "VolumeDelta", "TrendSlope",
+    "SupportDistancePct", "ResistanceDistancePct", "DistanceEMA20Pct",
+    "DistanceEMA50Pct", "DistanceVWAPPct", "RiskRewardRatio"
+]
+
+
+def _safe_num(value, default=np.nan):
+    try:
+        value = float(value)
+        return value if np.isfinite(value) else default
+    except Exception:
+        return default
+
+
+def build_trade_feature_snapshot(df, analysis, mtf_bull_count=0, mtf_bear_count=0, mtf_available_count=0):
+    """Capture a point-in-time feature snapshot; missing values stay NaN, never fabricated."""
+    row = df.iloc[-1] if isinstance(df, pd.DataFrame) and not df.empty else pd.Series(dtype=object)
+    close = _safe_num(row.get("Close"))
+    support = _safe_num(analysis.get("support"))
+    resistance = _safe_num(analysis.get("resistance"))
+    vwap = _safe_num(row.get("VWAP", analysis.get("vwap")))
+    def pct_distance(level):
+        return ((close - level) / close * 100.0) if np.isfinite(close) and close > 0 and np.isfinite(level) else np.nan
+    if mtf_available_count <= 0:
+        mtf_status = "Unavailable"
+    elif mtf_bull_count > mtf_bear_count:
+        mtf_status = "Bullish alignment"
+    elif mtf_bear_count > mtf_bull_count:
+        mtf_status = "Bearish alignment"
+    else:
+        mtf_status = "Mixed"
+    snap = {
+        "EMA9": _safe_num(row.get("EMA9")), "EMA21": _safe_num(row.get("EMA21")),
+        "EMA20": _safe_num(row.get("EMA20", analysis.get("ema20"))),
+        "EMA50": _safe_num(row.get("EMA50", analysis.get("ema50"))),
+        "EMA200": _safe_num(row.get("EMA200", analysis.get("ema200"))),
+        "RSI": _safe_num(row.get("RSI", analysis.get("rsi"))),
+        "MACD": _safe_num(row.get("MACD", analysis.get("macd"))),
+        "ADX": _safe_num(row.get("ADX", analysis.get("adx"))),
+        "ATR": _safe_num(row.get("ATR", analysis.get("atr"))),
+        "VWAP": vwap, "Volume": _safe_num(row.get("Volume")),
+        "RelativeVolume": _safe_num(row.get("RelativeVolume")),
+        "VolumeDelta": _safe_num(row.get("VolumeDelta")),
+        "TrendSlope": _safe_num(row.get("TrendSlope")),
+        "SupportDistancePct": pct_distance(support),
+        "ResistanceDistancePct": pct_distance(resistance),
+        "DistanceEMA20Pct": _safe_num(row.get("DistanceEMA20Pct")),
+        "DistanceEMA50Pct": _safe_num(row.get("DistanceEMA50Pct")),
+        "DistanceVWAPPct": _safe_num(row.get("DistanceVWAPPct")),
+        "RiskRewardRatio": _safe_num(analysis.get("rr_ratio")),
+        "MarketRegime": str(analysis.get("market_regime", "Unknown")),
+        "MTFTrendStatus": mtf_status,
+        "ConfidenceAtEntry": _safe_num(analysis.get("confidence")),
+        "HistoricalWinRateAtEntry": _safe_num(analysis.get("historical_win_rate")),
+        "SimilarTradesAtEntry": int(analysis.get("similar_trades_found", 0) or 0),
+        "SignalStage": str(analysis.get("signal_stage", "")),
+    }
+    return snap
+
+
+def classify_trade_loss(snapshot, pnl, side="BUY", exit_price=None, entry_price=None):
+    """Heuristic diagnosis for review; returns a probable cause, not a proven cause."""
+    if _safe_num(pnl, 0.0) >= 0:
+        return ""
+    s = snapshot if isinstance(snapshot, dict) else {}
+    rsi = _safe_num(s.get("RSI")); adx = _safe_num(s.get("ADX")); relvol = _safe_num(s.get("RelativeVolume"))
+    rr = _safe_num(s.get("RiskRewardRatio")); regime = str(s.get("MarketRegime", "")).lower()
+    mtf = str(s.get("MTFTrendStatus", "")).lower()
+    slope = _safe_num(s.get("TrendSlope")); dist20 = _safe_num(s.get("DistanceEMA20Pct"))
+    if "range" in regime or "sideways" in regime or (np.isfinite(adx) and adx < 18): return "Sideways Market / Weak Trend"
+    if np.isfinite(relvol) and relvol < 0.8: return "Low Volume"
+    if "conflict" in mtf or "mixed" in mtf: return "Multi-Timeframe Conflict"
+    if np.isfinite(rr) and rr < 1.5: return "Poor Risk Reward"
+    if str(side).upper() == "BUY" and np.isfinite(rsi) and rsi > 75: return "Overbought Entry / Trend Exhaustion"
+    if str(side).upper() == "SELL" and np.isfinite(rsi) and rsi < 25: return "Oversold Entry / Trend Exhaustion"
+    if np.isfinite(slope) and ((str(side).upper() == "BUY" and slope < 0) or (str(side).upper() == "SELL" and slope > 0)):
+        return "Trend Exhaustion / Late Entry"
+    if np.isfinite(dist20) and abs(dist20) > 1.5: return "Late Entry"
+    if "breakout" in regime or "breakdown" in regime: return "Fake Breakout / Volatility Trap"
+    return "Unclassified Loss - Review News, Entry Timing and Execution"
+
+
+def _similarity_score(current, historical):
+    """Distance over available comparable numeric features; tolerates old/incomplete journal rows."""
+    pairs = []
+    tolerances = {"RSI": 12, "ADX": 12, "RelativeVolume": 0.9, "RiskRewardRatio": 1.5,
+                  "DistanceEMA20Pct": 0.8, "DistanceEMA50Pct": 1.2, "TrendSlope": max(abs(_safe_num(current.get("TrendSlope"), 0))*1.5, 0.05)}
+    for key in ("RSI", "ADX", "RelativeVolume", "RiskRewardRatio", "DistanceEMA20Pct", "DistanceEMA50Pct", "TrendSlope"):
+        a, b = _safe_num(current.get(key)), _safe_num(historical.get(key))
+        if np.isfinite(a) and np.isfinite(b):
+            tol = tolerances.get(key, 1.0)
+            pairs.append(max(0.0, 1.0 - abs(a-b) / max(tol, 1e-6)))
+    if not pairs: return 0.0
+    score = float(np.mean(pairs))
+    if current.get("MarketRegime") and historical.get("MarketRegime") and str(current.get("MarketRegime")) == str(historical.get("MarketRegime")):
+        score = min(1.0, score + 0.08)
+    if current.get("MTFTrendStatus") and historical.get("MTFTrendStatus") and str(current.get("MTFTrendStatus")) == str(historical.get("MTFTrendStatus")):
+        score = min(1.0, score + 0.05)
+    return score
+
+
+def get_similar_trade_intelligence(snapshot, side, min_similarity=0.68):
+    journal = load_journal()
+    result = {"matches": pd.DataFrame(), "count": 0, "win_rate": None, "loss_rate": None,
+              "avg_profit": None, "avg_loss": None, "expected_value": None, "loser_match_rate": None}
+    if journal.empty or not {"Status", "Result"}.issubset(journal.columns): return result
+    closed = journal[journal["Status"].astype(str).str.upper().eq("CLOSED")].copy()
+    if "Side" in closed.columns: closed = closed[closed["Side"].astype(str).str.upper().eq(str(side).upper())]
+    if closed.empty: return result
+    scores = []
+    for _, row in closed.iterrows():
+        hist = {k: row.get(k) for k in LOSS_FEATURE_COLUMNS + ["MarketRegime", "MTFTrendStatus"]}
+        score = _similarity_score(snapshot, hist)
+        if score >= min_similarity:
+            scores.append((row.name, score))
+    if not scores: return result
+    matches = closed.loc[[x[0] for x in scores]].copy()
+    matches["Similarity"] = [x[1] for x in scores]
+    pnl = pd.to_numeric(matches.get("PnL", pd.Series(0, index=matches.index)), errors="coerce").fillna(0)
+    wins = pnl[pnl > 0]; losses = pnl[pnl < 0]
+    count = len(matches)
+    result.update({"matches": matches.sort_values("Similarity", ascending=False), "count": count,
+                   "win_rate": float((pnl > 0).mean() * 100), "loss_rate": float((pnl < 0).mean() * 100),
+                   "avg_profit": float(wins.mean()) if len(wins) else 0.0,
+                   "avg_loss": float(losses.mean()) if len(losses) else 0.0,
+                   "expected_value": float(pnl.mean()), "loser_match_rate": float((pnl < 0).mean() * 100)})
+    return result
+
+
+def apply_adaptive_signal_intelligence(df, analysis, symbol, timeframe, mtf_bull_count=0, mtf_bear_count=0, mtf_available_count=0):
+    """Add similar-trade learning, conservative confidence adjustment and staged signal labels."""
+    side = "BUY" if analysis.get("signal_type") == "buy" else "SELL" if analysis.get("signal_type") == "sell" else "BUY"
+    snapshot = build_trade_feature_snapshot(df, analysis, mtf_bull_count, mtf_bear_count, mtf_available_count)
+    intelligence = get_similar_trade_intelligence(snapshot, side)
+    analysis["similar_trades_found"] = intelligence["count"]
+    analysis["historical_win_rate"] = intelligence["win_rate"]
+    analysis["historical_loss_rate"] = intelligence["loss_rate"]
+    analysis["historical_avg_profit"] = intelligence["avg_profit"]
+    analysis["historical_avg_loss"] = intelligence["avg_loss"]
+    analysis["historical_expected_value"] = intelligence["expected_value"]
+    analysis["historical_loser_match_rate"] = intelligence["loser_match_rate"]
+    analysis["feature_snapshot"] = snapshot
+    ema9 = snapshot.get("EMA9"); ema21 = snapshot.get("EMA21")
+    rsi = _safe_num(snapshot.get("RSI"), 50); slope = _safe_num(snapshot.get("TrendSlope"), 0)
+    hist = _safe_num(df.iloc[-1].get("MACD_Hist")) if isinstance(df, pd.DataFrame) and not df.empty else 0
+    prev_hist = _safe_num(df.iloc[-2].get("MACD_Hist")) if isinstance(df, pd.DataFrame) and len(df) > 1 else 0
+    volume_ok = _safe_num(snapshot.get("RelativeVolume"), 0) >= 1.2
+    mtf_bull = mtf_available_count >= 2 and mtf_bull_count > mtf_bear_count
+    mtf_bear = mtf_available_count >= 2 and mtf_bear_count > mtf_bull_count
+    ema_bull = np.isfinite(_safe_num(ema9)) and np.isfinite(_safe_num(ema21)) and ema9 > ema21
+    ema_bear = np.isfinite(_safe_num(ema9)) and np.isfinite(_safe_num(ema21)) and ema9 < ema21
+    if rsi > 75 and hist < prev_hist: stage = "TREND EXHAUSTION"
+    elif ema_bull and hist > 0 and rsi > 50 and analysis.get("ema20", 0) > analysis.get("ema50", 0) and mtf_bull:
+        stage = "STRONG BUY" if _safe_num(snapshot.get("ADX"), 0) > 20 and volume_ok else "BUY"
+    elif ema_bear and hist < 0 and rsi < 50 and analysis.get("ema20", 0) < analysis.get("ema50", 0) and mtf_bear:
+        stage = "STRONG SELL" if _safe_num(snapshot.get("ADX"), 0) > 20 and volume_ok else "SELL"
+    elif ema_bull and hist > 0 and rsi > 50: stage = "EARLY BUY WATCH"
+    elif ema_bear and hist < 0 and rsi < 50: stage = "EARLY SELL WATCH"
+    elif slope > 0 and hist >= prev_hist and rsi > 48: stage = "TREND FORMING UP"
+    elif slope < 0 and hist <= prev_hist and rsi < 52: stage = "TREND FORMING DOWN"
+    else: stage = "NO CLEAR STAGE"
+    analysis["signal_stage"] = stage
+    # Confidence remains a score, not a calibrated probability. Historical evidence is blended only with 30+ matches.
+    base = _safe_num(analysis.get("confidence"), 50)
+    if intelligence["count"] >= 30 and intelligence["win_rate"] is not None:
+        hist_component = float(intelligence["win_rate"])
+        adjusted = 0.65 * base + 0.35 * hist_component
+    else:
+        adjusted = base
+    risk_penalty = 0
+    if intelligence["count"] >= 10 and intelligence["loser_match_rate"] is not None and intelligence["loser_match_rate"] >= 65:
+        risk_penalty = 12
+        analysis["repeat_loss_warning"] = True
+    else:
+        analysis["repeat_loss_warning"] = False
+    if "RANGE" in str(analysis.get("market_regime", "")).upper() or analysis.get("sideways_market"):
+        risk_penalty += 5
+    if not volume_ok and _safe_num(snapshot.get("Volume"), 0) > 0:
+        risk_penalty += 3
+    rr_value = _safe_num(snapshot.get("RiskRewardRatio"), np.nan)
+    adx_value = _safe_num(snapshot.get("ADX"), np.nan)
+    confidence_bonus = 0
+    if np.isfinite(rr_value):
+        confidence_bonus += 3 if rr_value >= 2.0 else (-5 if rr_value < 1.5 else 0)
+    if np.isfinite(adx_value):
+        confidence_bonus += 2 if adx_value >= 25 else (-4 if adx_value < 18 else 0)
+    if volume_ok:
+        confidence_bonus += 3
+    if analysis.get("trending_market"):
+        confidence_bonus += 2
+    if analysis.get("high_volatility_market"):
+        risk_penalty += 3
+    analysis["confidence"] = int(max(0, min(100, round(adjusted - risk_penalty + confidence_bonus)))) if analysis.get("signal_type") in ("buy", "sell") else None
+    if analysis.get("confidence") is not None:
+        analysis["trade_quality_score"] = int(round(0.65 * _safe_num(analysis.get("validation_score"), 0) + 0.35 * analysis["confidence"]))
+    analysis["adaptive_confidence_label"] = "Historical blend active" if intelligence["count"] >= 30 else "Indicator-led; historical sample insufficient"
+    analysis["repeat_loss_penalty"] = risk_penalty
+    analysis["similar_trade_block_suggested"] = bool(intelligence["count"] >= 10 and (intelligence["loser_match_rate"] or 0) >= 75)
+    return analysis
+
+
+def train_trade_success_model(min_trades=500):
+    """Optional research-only ML fit. No model is trained or used below 500 closed trades."""
+    journal = load_journal()
+    if journal.empty:
+        return {"ok": False, "message": "No completed journal trades yet."}
+    closed = journal[journal.get("Status", pd.Series("", index=journal.index)).astype(str).str.upper().eq("CLOSED")].copy()
+    if len(closed) < int(min_trades):
+        return {"ok": False, "message": f"ML training requires at least {min_trades} completed trades; currently {len(closed)}."}
+    features = [c for c in ["EMA9", "EMA21", "EMA20", "EMA50", "EMA200", "RSI", "MACD", "ADX", "ATR", "VWAP", "Volume", "RelativeVolume", "VolumeDelta", "TrendSlope", "SupportDistancePct", "ResistanceDistancePct", "DistanceEMA20Pct", "DistanceEMA50Pct", "DistanceVWAPPct", "RiskRewardRatio", "TradeQualityScore", "ValidationScore"] if c in closed.columns]
+    if len(features) < 6 or "PnL" not in closed.columns:
+        return {"ok": False, "message": "Not enough captured numeric feature columns to train a model."}
+    X = closed[features].apply(pd.to_numeric, errors="coerce")
+    y = (pd.to_numeric(closed["PnL"], errors="coerce").fillna(0) > 0).astype(int)
+    valid = X.notna().sum(axis=1) >= 6
+    X, y = X.loc[valid], y.loc[valid]
+    if len(X) < min_trades or y.nunique() < 2:
+        return {"ok": False, "message": "Training sample is incomplete or contains only one outcome class."}
+    X = X.replace([np.inf, -np.inf], np.nan).fillna(X.median()).fillna(0)
+    try:
+        from sklearn.model_selection import train_test_split
+        from sklearn.ensemble import RandomForestClassifier
+        from sklearn.metrics import accuracy_score, roc_auc_score
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.25, random_state=42, stratify=y)
+        model_name = "Random Forest"
+        model = RandomForestClassifier(n_estimators=300, max_depth=6, min_samples_leaf=5, class_weight="balanced", random_state=42)
+        try:
+            from xgboost import XGBClassifier
+            model = XGBClassifier(n_estimators=250, max_depth=3, learning_rate=0.04, subsample=0.85, colsample_bytree=0.85, eval_metric="logloss", random_state=42)
+            model_name = "XGBoost"
+        except Exception:
+            try:
+                from lightgbm import LGBMClassifier
+                model = LGBMClassifier(n_estimators=250, max_depth=4, learning_rate=0.04, class_weight="balanced", verbosity=-1, random_state=42)
+                model_name = "LightGBM"
+            except Exception:
+                pass
+        model.fit(X_train, y_train)
+        predictions = model.predict(X_test)
+        probabilities = model.predict_proba(X_test)[:, 1]
+        try: auc = float(roc_auc_score(y_test, probabilities))
+        except Exception: auc = None
+        return {"ok": True, "model": model_name, "trades": int(len(X)), "accuracy": float(accuracy_score(y_test, predictions)), "auc": auc, "features": features,
+                "warning": "Research/backtest use only. Validate out-of-sample and account for fees/slippage before considering any signal integration."}
+    except Exception as exc:
+        return {"ok": False, "message": f"ML dependencies or training unavailable: {type(exc).__name__}: {exc}"}
 
 
 # =========================================================
@@ -3613,8 +3869,10 @@ def add_trade_to_journal(symbol, timeframe, signal, entry_price, quantity, stop_
     journal = load_journal()
     side = "SELL" if "SELL" in str(signal).upper() else "BUY"
     new_row = {
-        "DateTime": now_str(), "Symbol": symbol, "Timeframe": timeframe,
-        "Signal": side, "Side": side, "EntryPrice": float(entry_price), "ExitPrice": np.nan,
+        "DateTime": now_str(), "TradeDate": datetime.now().strftime("%Y-%m-%d"),
+        "TradeTime": datetime.now().strftime("%H:%M:%S"), "Symbol": symbol, "Timeframe": timeframe,
+        "Signal": side, "SignalType": str(analysis.get("signal_text", side)), "Side": side,
+        "EntryPrice": float(entry_price), "ExitPrice": np.nan,
         "Quantity": int(quantity), "RemainingQty": int(quantity), "StopLoss": float(stop_loss),
         "Target1": float(target1), "Target2": float(target2), "Target3": float(target3),
         "TrailingStop": float(trailing_stop), "ATR": float(atr if atr is not None else analysis.get("atr", 0.0)),
@@ -3623,7 +3881,9 @@ def add_trade_to_journal(symbol, timeframe, signal, entry_price, quantity, stop_
         "T3_Hit": False, "LastPrice": float(entry_price), "LastUpdateTime": now_str(),
         "TradeQualityScore": analysis.get("trade_quality_score", 0),
         "ValidationScore": analysis.get("validation_score", 0),
-        "StrategyGrade": analysis.get("strategy_grade", "D")
+        "StrategyGrade": analysis.get("strategy_grade", "D"),
+        **(analysis.get("feature_snapshot", {}) if isinstance(analysis.get("feature_snapshot"), dict) else {}),
+        "LossReason": ""
     }
     journal = pd.concat([journal, pd.DataFrame([new_row])], ignore_index=True)
     save_journal(journal)
@@ -3657,6 +3917,9 @@ def close_trade_in_journal(index_id, exit_price, result=None, t1_hit=None, t2_hi
     for col, value in (("T1_Hit", t1_hit), ("T2_Hit", t2_hit), ("T3_Hit", t3_hit)):
         if value is not None:
             journal.at[index_id, col] = bool(value)
+    if str(journal.at[index_id, "Result"]).upper() == "LOSS":
+        loss_snapshot = {k: journal.at[index_id, k] for k in LOSS_FEATURE_COLUMNS + ["MarketRegime", "MTFTrendStatus"] if k in journal.columns}
+        journal.at[index_id, "LossReason"] = classify_trade_loss(loss_snapshot, total, side, float(exit_price), entry)
     save_journal(journal)
     return True
 
@@ -3750,6 +4013,9 @@ def close_paper_position(index_id, exit_price, reason="Manual Close"):
         journal.at[index_id, "PnLPercent"] = round((total / initial_notional * 100) if initial_notional else 0.0, 2)
         journal.at[index_id, "Result"] = "WIN" if total > 0 else "LOSS" if total < 0 else "BREAKEVEN"
         journal.at[index_id, "Notes"] = (str(row.get("Notes", "")) + f" | {reason}").strip(" |")
+        if total < 0:
+            loss_snapshot = {k: row.get(k) for k in LOSS_FEATURE_COLUMNS + ["MarketRegime", "MTFTrendStatus"]}
+            journal.at[index_id, "LossReason"] = classify_trade_loss(loss_snapshot, total, side, exit_price, entry)
         save_journal(journal)
         return True, f"Paper position closed. Total realized P&L: ₹{total:,.2f}"
     except Exception as exc:
@@ -3788,6 +4054,9 @@ def _paper_partial_exit(index_id, exit_price, quantity, target_flag=None):
         journal.at[index_id, "Result"] = "WIN" if total_realized > 0 else "LOSS" if total_realized < 0 else "BREAKEVEN"
         initial_notional = entry * float(row.get("Quantity", q))
         journal.at[index_id, "PnLPercent"] = round((total_realized / initial_notional * 100) if initial_notional else 0.0, 2)
+        if total_realized < 0:
+            loss_snapshot = {k: row.get(k) for k in LOSS_FEATURE_COLUMNS + ["MarketRegime", "MTFTrendStatus"]}
+            journal.at[index_id, "LossReason"] = classify_trade_loss(loss_snapshot, total_realized, side, float(exit_price), entry)
     save_journal(journal)
     return True
 
@@ -4239,7 +4508,10 @@ def simple_backtest(df, symbol="", timeframe_label="", option_metrics=None, news
     trades = []
     # EMA50 and the signal structure need a meaningful warm-up window.
     for i in range(55, len(work) - 10):
-        mini_df = work.iloc[:i + 1].copy()
+        # analyze_signal only needs the current/prior bar, recent 20-bar levels,
+        # recent HA candles and already-computed indicators. A rolling 250-bar
+        # view avoids repeatedly copying an ever-growing history (O(n^2)).
+        mini_df = work.iloc[max(0, i - 249):i + 1]
         latest = mini_df.iloc[-1]
         # Do not inject the current option chain or synthetic 4/4 MTF alignment
         # into historical observations; those values were not known then.
@@ -4374,11 +4646,14 @@ def walk_forward_validation(df, symbol="", timeframe_label="", option_metrics=No
     try:
         if df.empty or len(df) < 150:
             return {"folds": 0, "validated_folds": 0, "avg_win_rate": None, "avg_profit_factor": None, "avg_expectancy": None, "table": pd.DataFrame()}
+        # Walk-forward is an interactive report, not a full-history batch job.
+        # Bound its workload so long 1m histories cannot freeze the Streamlit run.
+        df = df.tail(1200).copy()
 
         fold_results = []
         total_len = len(df)
-        train_size = int(total_len * 0.5)
-        test_size = int(total_len * 0.1)
+        train_size = int(total_len * 0.6)
+        test_size = int(total_len * 0.2)
         start = 0
         fold_no = 1
         while (start + train_size + test_size) <= total_len:
@@ -4752,7 +5027,7 @@ ANGEL_NAME_ALIASES = {
 }
 
 st.title("Elite Trading Dashboard Final Ultimate")
-st.caption("Polling First | Walk Forward | Auto Exit | News Filter | Dynamic Option Chain")
+st.caption("WebSocket Primary | REST Polling Fallback | Walk Forward | Auto Exit | News Filter | Dynamic Option Chain")
 st.sidebar.caption(f"App build: {APP_BUILD_ID}")
 
 selected = st.selectbox("Select Stock / Index", list(stocks.keys()))
@@ -4915,8 +5190,17 @@ with st.expander("Angel One API Settings"):
         )
         connect_angel = st.form_submit_button("Test Angel Login", use_container_width=True)
 
-    polling_mode = st.checkbox("Use Angel LTP Polling Mode", value=True, key="angel_polling_mode")
-    ws_enable = st.checkbox("Enable Angel WebSocket (Optional)", value=False, key="angel_ws_enable")
+    ws_enable = st.checkbox(
+        "Use Angel WebSocket as Primary Live Feed", value=True,
+        key="angel_ws_primary_enable_v17",
+        help="WebSocket is used first for live LTP. If it is disconnected or stale, REST LTP polling is used as fallback. Historical OHLC candles still come from the broker REST candle API."
+    )
+    polling_mode = st.checkbox(
+        "Enable Angel LTP Polling Fallback", value=True,
+        key="angel_ltp_polling_fallback_v17",
+        help="Automatically use Angel REST LTP if the WebSocket is not connected or its last tick is stale."
+    )
+    st.caption("WebSocket is primary for live LTP. REST polling is the automatic fallback. Historical OHLC candles continue to come from the broker REST Candle API. Turn the dashboard Auto Refresh ON to repaint incoming WebSocket ticks on screen; manual refresh remains available.")
 
     if connect_angel:
         # Use the values submitted by the form directly; do not depend on a
@@ -4956,10 +5240,18 @@ with st.expander("Angel One API Settings"):
                 st.session_state["angel_credentials_login_ok"] = False
                 st.error("Angel login failed. Check API key, Client Code, PIN and TOTP Secret, and review the app error log.")
 
-    if st.button("Stop WebSocket"):
-        stop_angel_websocket()
-        sync_ws_state_to_session()
-        st.warning("WebSocket stop requested.")
+    ws_action_col1, ws_action_col2 = st.columns(2)
+    with ws_action_col1:
+        if st.button("Stop WebSocket"):
+            st.session_state["ws_manual_pause_requested"] = True
+            stop_angel_websocket()
+            sync_ws_state_to_session()
+            st.warning("WebSocket stopped. REST LTP polling fallback will remain available.")
+    with ws_action_col2:
+        if st.button("Reconnect / Resume WebSocket"):
+            st.session_state["ws_manual_pause_requested"] = False
+            ws_set_state(retry_exhausted=False, retries=0)
+            st.success("WebSocket reconnect requested. It will start on this rerun.")
 
 # Resolve credentials from the visible widgets first, then the independent
 # server-session copy saved during Test Angel Login. This avoids losing them
@@ -5025,6 +5317,7 @@ angel_candles_response = None
 angel_candle_diagnostics = {"status": "not_requested"}
 angel_ltp_value = None
 angel_ltp_status = "not_requested"
+angel_ltp_source = "Not requested"
 angel_session_ready = False
 
 if "last_good_candles_by_key" not in st.session_state:
@@ -5062,11 +5355,20 @@ _angel_credentials_ready = bool(
 
 st.info(
     f"Market data request: {data_source} | {selected} | {timeframe}. "
-    "Live market data depends on provider availability, authenticated access and instrument support."
+    "Angel live LTP priority: WebSocket primary with REST polling fallback. Historical OHLC remains REST candle data. "
+    "Network requests use bounded timeouts; optional market-board and walk-forward jobs no longer block initial page load."
 )
+
+if data_source != "Angel":
+    _ws_snapshot = ws_get_state()
+    if _ws_snapshot.get("should_run"):
+        stop_angel_websocket()
 
 if data_source == "Angel":
     if not _angel_credentials_ready:
+        _ws_snapshot = ws_get_state()
+        if _ws_snapshot.get("should_run"):
+            stop_angel_websocket()
         missing_text = ", ".join(_angel_missing_fields) or "authenticated Angel session"
         angel_ltp_status = "not_requested_missing_credentials"
         angel_candle_diagnostics = {
@@ -5078,15 +5380,45 @@ if data_source == "Angel":
             "Re-enter credentials and click Test Angel Login in this deployed app session."
         )
     else:
-        # Poll the LTP independently of historical candles. LTP can be available
-        # even when the candle-history endpoint returns an empty/error response.
-        if polling_mode:
-            with st.spinner(f"Angel One: requesting LTP quote for {selected}…"):
+        # WebSocket is the primary live-LTP source. REST polling is requested
+        # only when the socket is not connected, has no tick yet, or its tick is stale.
+        _ws_manual_paused = bool(st.session_state.get("ws_manual_pause_requested", False))
+        _ws_snapshot = ws_get_state()
+        _ws_retry_blocked_for_same_symbol = bool(
+            _ws_snapshot.get("retry_exhausted", False)
+            and str(_ws_snapshot.get("symbol")) == str(selected)
+        )
+        if ws_enable and not _ws_manual_paused and not _ws_retry_blocked_for_same_symbol:
+            start_angel_websocket(angel_api_key, angel_client_code, angel_pin, angel_totp_secret, selected)
+        elif (not ws_enable or _ws_manual_paused) and _ws_snapshot.get("should_run"):
+            stop_angel_websocket()
+
+        _ws_quote = ws_live_quote(
+            max_age_seconds=max(20, int(refresh_seconds) * 2 if auto_refresh else 20),
+            symbol_name=selected
+        ) if ws_enable else None
+        if _ws_quote is not None:
+            angel_ltp_value = _ws_quote
+            angel_ltp_status = "received_websocket_primary"
+            angel_ltp_source = "Angel WebSocket (Primary)"
+        elif polling_mode:
+            with st.spinner(f"Angel One: WebSocket unavailable/stale; requesting REST LTP fallback for {selected}…"):
                 angel_ltp_value = get_angel_ltp_polling(
                     angel_api_key, angel_client_code, angel_pin,
                     angel_totp_secret, selected
                 )
-            angel_ltp_status = "received" if angel_ltp_value is not None else "no_quote"
+            angel_ltp_status = "received_polling_fallback" if angel_ltp_value is not None else "polling_fallback_no_quote"
+            angel_ltp_source = "Angel REST Polling (Fallback)" if angel_ltp_value is not None else "No live quote"
+        else:
+            if ws_enable and st.session_state.get("ws_manual_pause_requested", False):
+                angel_ltp_status = "websocket_manually_paused"
+                angel_ltp_source = "WebSocket paused; no polling quote"
+            elif ws_enable and ws_get_state().get("retry_exhausted", False):
+                angel_ltp_status = "websocket_retry_limit_reached"
+                angel_ltp_source = "WebSocket reconnect required"
+            else:
+                angel_ltp_status = "websocket_waiting_no_polling_fallback" if ws_enable else "all_live_quote_sources_disabled"
+                angel_ltp_source = "Waiting for WebSocket tick" if ws_enable else "Live quote disabled"
 
         angel_interval = map_angel_interval(timeframe)
         with st.spinner(f"Angel One: requesting {angel_interval} historical candles for {selected}…"):
@@ -5121,9 +5453,6 @@ if data_source == "Angel":
                 active_data_source = "Yahoo"
                 st.warning("Angel One candle history is unavailable. Using Yahoo Finance OHLC as a clearly-labelled fallback; Angel LTP polling remains separate.")
 
-        if ws_enable:
-            start_angel_websocket(angel_api_key, angel_client_code, angel_pin, angel_totp_secret, selected)
-            sync_ws_state_to_session()
 else:
     with st.spinner(f"Yahoo Finance: loading {ticker} ({yf_interval})…"):
         data = fetch_data(ticker, yf_interval, yf_period)
@@ -5145,9 +5474,9 @@ else:
             st.warning("Yahoo Finance returned no OHLC rows. Using connected Angel One candle history as a clearly-labelled fallback.")
 
 if data.empty:
-    if data_source == "Angel" and polling_mode:
+    if data_source == "Angel" and (polling_mode or ws_enable):
         if angel_ltp_value is not None:
-            st.metric("Angel One Latest Traded Price (LTP)", f"{angel_ltp_value:,.2f}")
+            st.metric(f"Angel One Latest Traded Price — {angel_ltp_source}", f"{angel_ltp_value:,.2f}")
         elif angel_ltp_status == "not_requested_missing_credentials":
             st.warning(
                 "Angel LTP polling was skipped because the current app session is not authenticated. "
@@ -5219,7 +5548,10 @@ if not ok:
     st.stop()
 
 data = add_indicators(data).replace([np.inf, -np.inf], np.nan).ffill()
-backtest_data = data.copy()
+# Keep interactive backtests bounded. Indicator columns are already computed on
+# the full chart frame; 1,200 recent bars provide a responsive intraday sample.
+MAX_BACKTEST_BARS = 1200
+backtest_data = data.tail(MAX_BACKTEST_BARS).copy()
 
 if len(data) < 35:
     st.warning(f"Only {len(data)} candles available. Live price / chart can display, but backtest and some long-period indicators need more history.")
@@ -5278,13 +5610,32 @@ historical_news_context = {
     "events": [],
     "status": "historical_not_replayed",
 }
-wins, losses, total_trades, backtest_win_rate, backtest_trades_df = simple_backtest(
-    backtest_data,
-    symbol=selected,
-    timeframe_label=timeframe,
-    option_metrics=option_metrics,
-    news_info=historical_news_context
-)
+# Cache the interactive backtest by the actual recent candle content. Streamlit
+# auto-refresh can rerun the page every few seconds even when no new candle exists;
+# do not recompute the same 1,200-bar simulation on every browser repaint.
+try:
+    _bt_hash = int(pd.util.hash_pandas_object(backtest_data, index=True).sum()) if not backtest_data.empty else 0
+except Exception:
+    _bt_hash = len(backtest_data)
+_backtest_cache_key = f"{selected}|{timeframe}|{len(backtest_data)}|{_bt_hash}"
+_backtest_cache = st.session_state.get("backtest_result_cache")
+if isinstance(_backtest_cache, dict) and _backtest_cache.get("key") == _backtest_cache_key:
+    wins, losses, total_trades, backtest_win_rate, backtest_trades_df = _backtest_cache["result"]
+else:
+    with st.spinner("Calculating recent-history backtest…"):
+        _backtest_result = simple_backtest(
+            backtest_data,
+            symbol=selected,
+            timeframe_label=timeframe,
+            option_metrics=option_metrics,
+            news_info=historical_news_context
+        )
+    wins, losses, total_trades, backtest_win_rate, backtest_trades_df = _backtest_result
+    st.session_state["backtest_result_cache"] = {
+        "key": _backtest_cache_key,
+        "result": _backtest_result,
+        "calculated_at": now_str(),
+    }
 
 backtest_is_comparable = bool(
     total_trades >= 30 and
@@ -5304,17 +5655,52 @@ analysis = analyze_signal(
     backtest_trade_count=total_trades,
     backtest_is_comparable=backtest_is_comparable,
 )
-
-walk_forward_result = walk_forward_validation(
-    backtest_data,
-    symbol=selected,
-    timeframe_label=timeframe,
-    option_metrics=option_metrics,
-    news_info=historical_news_context
+analysis = apply_adaptive_signal_intelligence(
+    data, analysis, selected, timeframe,
+    mtf_bull_count=bull_count, mtf_bear_count=bear_count,
+    mtf_available_count=mtf_available_count
 )
 
 stats = compute_trade_statistics(backtest_trades_df, initial_capital=DEFAULT_INITIAL_BALANCE)
 equity_curve_df, max_drawdown = compute_equity_curve_from_trades(backtest_trades_df, initial_capital=DEFAULT_INITIAL_BALANCE)
+
+with st.expander("🧠 Loss Intelligence & Similar Historical Setups", expanded=True):
+    intel = get_similar_trade_intelligence(analysis.get("feature_snapshot", {}), "BUY" if analysis.get("signal_type") == "buy" else "SELL")
+    i1, i2, i3, i4, i5 = st.columns(5)
+    i1.metric("Signal Stage", analysis.get("signal_stage", "N/A"))
+    i2.metric("Similar Trades", intel.get("count", 0))
+    i3.metric("Historical Win Rate", f"{intel['win_rate']:.1f}%" if intel.get("win_rate") is not None else "N/A")
+    i4.metric("Historical Loss Rate", f"{intel['loss_rate']:.1f}%" if intel.get("loss_rate") is not None else "N/A")
+    i5.metric("Expected PnL / Trade", f"₹{intel['expected_value']:,.2f}" if intel.get("expected_value") is not None else "N/A")
+    st.caption(f"Adaptive confidence: {analysis.get('confidence', 'N/A')} / 100 | {analysis.get('adaptive_confidence_label', '')} | Similarity matching is heuristic and only uses stored, available fields.")
+    block_repeat_losers = st.toggle("Block signals matching repeated historical losing setups", value=False, key="block_repeat_loser_setups")
+    repeat_loss_block_active = bool(block_repeat_losers and analysis.get("similar_trade_block_suggested"))
+    if analysis.get("repeat_loss_warning"):
+        st.warning(f"High-risk repeat-loss pattern detected. Historical loser match rate: {analysis.get('historical_loser_match_rate', 0):.1f}%. Confidence penalty: {analysis.get('repeat_loss_penalty', 0)} points.")
+    if repeat_loss_block_active:
+        analysis["trade_allowed"] = False
+        st.error("Signal blocked by your optional repeat-loss prevention setting. Review the setup before any paper entry.")
+    if intel.get("count", 0) > 0:
+        st.write(f"Average winning trade: ₹{intel['avg_profit']:,.2f} | Average losing trade: ₹{intel['avg_loss']:,.2f} | Expected value: ₹{intel['expected_value']:,.2f}")
+    else:
+        st.info("No sufficiently similar completed trades found yet. Historical learning will improve as your journal collects closed trades.")
+    st.markdown("**Captured live setup metrics**")
+    snap_view = analysis.get("feature_snapshot", {})
+    metric_cols = st.columns(5)
+    for col, key in zip(metric_cols, ["EMA9", "EMA21", "RSI", "ADX", "RelativeVolume"]):
+        value = snap_view.get(key)
+        col.metric(key, f"{value:.2f}" if isinstance(value, (int, float)) and np.isfinite(value) else "N/A")
+    st.caption("Loss labels are probable diagnostic categories, not proof of causation. News reversal and execution/slippage causes require reliable event and fill data.")
+    closed_count_ml = int((load_journal().get("Status", pd.Series(dtype=str)).astype(str).str.upper() == "CLOSED").sum()) if not load_journal().empty else 0
+    st.caption(f"Optional ML layer: {closed_count_ml}/500 completed trades collected. Model training remains disabled until the minimum sample is reached.")
+    if st.button("Train / Evaluate ML Model (500+ trades)", key="train_loss_intelligence_ml", disabled=closed_count_ml < 500):
+        with st.spinner("Training optional historical trade classifier…"):
+            ml_result = train_trade_success_model(500)
+        if ml_result.get("ok"):
+            st.success(f"{ml_result['model']} evaluated on held-out data | Accuracy: {ml_result['accuracy']:.1%} | AUC: {ml_result['auc']:.3f}" if ml_result.get("auc") is not None else f"{ml_result['model']} evaluated | Accuracy: {ml_result['accuracy']:.1%}")
+            st.caption(ml_result.get("warning", ""))
+        else:
+            st.warning(ml_result.get("message", "ML training is not available."))
 
 if backtest_is_comparable:
     health_score, health_label = strategy_health_monitor(
@@ -5327,6 +5713,20 @@ else:
     health_score, health_label = None, "Insufficient comparable sample"
 
 best_hour, worst_hour, hour_perf_df = best_worst_time_of_day(backtest_trades_df)
+# Best/worst setup labels are based on completed journal regimes, not just BUY vs SELL.
+_setup_journal = load_journal()
+if (not _setup_journal.empty and "MarketRegime" in _setup_journal.columns
+        and "PnL" in _setup_journal.columns and "Status" in _setup_journal.columns):
+    _setup_closed = _setup_journal[_setup_journal["Status"].astype(str).str.upper().eq("CLOSED")].copy()
+    _setup_closed["PnL"] = pd.to_numeric(_setup_closed["PnL"], errors="coerce")
+    _setup_closed = _setup_closed.dropna(subset=["PnL"])
+    _setup_perf = _setup_closed.groupby("MarketRegime", dropna=False)["PnL"].agg(["count", "mean", "sum"])
+    _setup_perf = _setup_perf[_setup_perf["count"] >= 2].sort_values("mean", ascending=False)
+    best_setup_label = str(_setup_perf.index[0]) if not _setup_perf.empty else "Insufficient journal sample"
+    worst_setup_label = str(_setup_perf.index[-1]) if not _setup_perf.empty else "Insufficient journal sample"
+else:
+    _setup_perf = pd.DataFrame()
+    best_setup_label = worst_setup_label = "Insufficient journal sample"
 
 if bull_count >= 3:
     mtf_grade = "Strong Bullish Alignment"
@@ -5355,15 +5755,23 @@ elif quality_score >= 55:
 else:
     signal_quality = "Weak"
 
-live_price = angel_ltp_value if data_source == "Angel" and polling_mode else None
-if data_source == "Angel" and polling_mode and live_price is None:
-    # One retry after OHLC is available; no credentials are exposed in UI/logs.
-    live_price = get_angel_ltp_polling(angel_api_key, angel_client_code, angel_pin, angel_totp_secret, selected)
-elif data_source == "Angel" and ws_enable and not polling_mode:
+live_price = None
+live_price_source = "OHLC candle close"
+if data_source == "Angel":
+    _fresh_ws_quote = ws_live_quote(
+        max_age_seconds=max(20, int(refresh_seconds) * 2 if auto_refresh else 20),
+        symbol_name=selected
+    ) if ws_enable else None
+    if _fresh_ws_quote is not None:
+        live_price = _fresh_ws_quote
+        live_price_source = "Angel WebSocket (Primary)"
+        angel_ltp_source = live_price_source
+    elif angel_ltp_value is not None:
+        live_price = float(angel_ltp_value)
+        live_price_source = angel_ltp_source or "Angel REST Polling (Fallback)"
     sync_ws_state_to_session()
-    live_price = st.session_state.get("live_price")
 
-current_display_price = live_price if live_price else analysis["close_price"]
+current_display_price = live_price if live_price is not None and live_price > 0 else analysis["close_price"]
 
 closed_auto = 0
 
@@ -5452,14 +5860,32 @@ st.subheader("Live Signal Analytics")
 
 if data_source == "Angel":
     p1, p2, p3, p4 = st.columns(4)
+    _ws_status_snapshot = ws_get_state()
+    _ws_is_effectively_primary = bool(
+        ws_enable
+        and not st.session_state.get("ws_manual_pause_requested", False)
+        and not (_ws_status_snapshot.get("retry_exhausted") and str(_ws_status_snapshot.get("symbol")) == str(selected))
+    )
     with p1:
-        st.metric("Polling Mode", "Primary" if polling_mode else "Off")
+        st.metric("Live Feed Priority", "WebSocket Primary" if _ws_is_effectively_primary else ("REST Polling Primary" if polling_mode else "Live LTP Disabled"))
     with p2:
-        st.metric("WebSocket Mode", "Optional" if ws_enable else "Off")
+        if _ws_status_snapshot.get("connected"):
+            _ws_status_text = "Connected"
+        elif _ws_status_snapshot.get("retry_exhausted") and str(_ws_status_snapshot.get("symbol")) == str(selected):
+            _ws_status_text = "Retry limit reached"
+        elif st.session_state.get("ws_manual_pause_requested", False):
+            _ws_status_text = "Paused manually"
+        else:
+            _ws_status_text = "Connecting / Offline"
+        st.metric("WebSocket Status", _ws_status_text)
     with p3:
-        st.metric("Live Price", round(live_price, 2) if live_price else "-")
+        st.metric("Live Price Source", live_price_source)
     with p4:
-        st.metric("Exit Mode", "AUTO ENABLED" if st.session_state.get("paper_exit_mode") == "Auto Exit (Enabled)" else "MANUAL")
+        st.metric("Live Price", round(live_price, 2) if live_price is not None else "-")
+    if ws_enable and not _ws_status_snapshot.get("connected"):
+        st.caption("WebSocket is the primary live-LTP source. REST polling is the configured fallback while the socket connects or reconnects.")
+    elif ws_enable:
+        st.caption("WebSocket is connected. Historical candles are still loaded through Angel REST Candle API; WebSocket ticks update the live LTP display.")
 
 if analysis["signal_type"] == "buy":
     st.success(alert_text)
@@ -5733,7 +6159,9 @@ if buy_clicked or sell_clicked:
     order_plan = get_suggested_paper_levels(analysis, order_side, current_display_price)
     order_qty_int = int(order_qty)
     required_margin = float(current_display_price) * order_qty_int
-    if not risk_ok:
+    if repeat_loss_block_active:
+        st.error("Paper order blocked: this setup matches a repeated historical losing pattern. Turn off the optional block only if you have reviewed the risk.")
+    elif not risk_ok:
         st.error(f"Paper order blocked by risk controls: {risk_msg}")
     elif required_margin > paper_balance:
         st.error(f"Insufficient virtual cash. Required margin ₹{required_margin:,.2f}; available ₹{paper_balance:,.2f}.")
@@ -5805,12 +6233,27 @@ st.markdown("**Paper trade history**")
 if paper_journal.empty:
     st.caption("No paper trades have been recorded yet.")
 else:
-    history_cols = [c for c in ["DateTime", "Symbol", "Side", "EntryPrice", "Quantity", "RemainingQty", "ExitPrice", "Status", "RealizedPnL", "PnL", "Result", "Notes"] if c in paper_journal.columns]
+    history_cols = [c for c in ["DateTime", "Symbol", "Side", "EntryPrice", "Quantity", "RemainingQty", "ExitPrice", "Status", "RealizedPnL", "PnL", "Result", "LossReason", "Notes"] if c in paper_journal.columns]
     st.dataframe(paper_journal[history_cols].tail(100), use_container_width=True, hide_index=True)
 
-with st.expander("Why this signal?"):
-    for reason in analysis["reasons"]:
+with st.expander("Why this signal? — Explainable Signal Factors", expanded=False):
+    ex1, ex2, ex3, ex4 = st.columns(4)
+    ex1.metric("Bullish Score", analysis.get("bullish_score", 0))
+    ex2.metric("Bearish Score", analysis.get("bearish_score", 0))
+    ex3.metric("Historical Win %", f"{analysis['historical_win_rate']:.1f}%" if analysis.get("historical_win_rate") is not None else "N/A")
+    ex4.metric("Historical Loss %", f"{analysis['historical_loss_rate']:.1f}%" if analysis.get("historical_loss_rate") is not None else "N/A")
+    st.markdown("**Bullish factors**")
+    for reason in analysis.get("reasons", []):
+        if any(token in str(reason).lower() for token in ["bull", "macd above", "ema", "breakout", "vwap", "volume", "higher timeframe", "trend"]):
+            st.write("-", reason)
+    st.markdown("**Bearish / conflicting factors**")
+    for reason in analysis.get("no_trade_reasons", []):
         st.write("-", reason)
+    st.markdown("**Risk factors**")
+    for risk_text in [analysis.get("news_message", ""), analysis.get("session_message", ""), analysis.get("market_regime", ""), "Repeat-loss warning active" if analysis.get("repeat_loss_warning") else "No repeated-loss warning"]:
+        if risk_text:
+            st.write("-", risk_text)
+    st.caption(f"Adaptive confidence score: {analysis.get('confidence', 'N/A')} / 100. This is a ranking score, not a calibrated probability or guarantee.")
 
 if news_filter_enabled:
     st.subheader("News Filter Events")
@@ -5893,6 +6336,9 @@ with bb5:
     st.metric("Expectancy", stats["expectancy"])
 with bb6:
     st.metric("Sharpe Ratio", stats["sharpe_ratio"])
+setup_cols = st.columns(2)
+setup_cols[0].metric("Best Performing Setup", best_setup_label)
+setup_cols[1].metric("Worst Performing Setup", worst_setup_label)
 
 bc1, bc2, bc3, bc4 = st.columns(4)
 with bc1:
@@ -5905,6 +6351,94 @@ with bc4:
     st.metric("Profitability Score", stats["profitability_score"])
 
 st.subheader("Walk Forward Validation")
+wf_ctrl1, wf_ctrl2, wf_ctrl3 = st.columns([1.35, 1.0, 1.0])
+with wf_ctrl1:
+    wf_manual_refresh = st.button(
+        "Run / Refresh Walk Forward Now", key="walk_forward_manual_refresh_v17",
+        type="primary", use_container_width=True,
+        help="Run the chronological walk-forward validation immediately using the current selected symbol, timeframe and available candle history."
+    )
+with wf_ctrl2:
+    wf_auto_refresh = st.toggle(
+        "Auto Refresh Walk Forward", value=False,
+        key="walk_forward_auto_refresh_enabled_v17",
+        help="Re-run the walk-forward report at the selected interval. This is independent from market-data auto refresh."
+    )
+with wf_ctrl3:
+    wf_refresh_seconds = st.selectbox(
+        "Walk-forward interval", [60, 180, 300, 600, 900], index=2,
+        format_func=lambda x: f"{x // 60} min",
+        key="walk_forward_auto_refresh_interval_v17",
+        disabled=not wf_auto_refresh
+    )
+
+wf_auto_tick = None
+if wf_auto_refresh and AUTO_REFRESH_AVAILABLE:
+    wf_auto_tick = st_autorefresh(
+        interval=int(wf_refresh_seconds) * 1000,
+        key="walk_forward_independent_auto_refresh_v17"
+    )
+elif wf_auto_refresh and not AUTO_REFRESH_AVAILABLE:
+    st.warning("Walk-forward auto refresh needs streamlit-autorefresh. Manual Run / Refresh remains available.")
+
+# Store the latest report in session state. Global market auto-refresh does not
+# repeatedly recompute this expensive report unless its own auto-refresh is ON.
+try:
+    _wf_tail = backtest_data.tail(500)
+    _wf_content_hash = int(pd.util.hash_pandas_object(_wf_tail, index=True).sum()) if not _wf_tail.empty else 0
+    _wf_data_key = f"{selected}|{timeframe}|{len(backtest_data)}|{_wf_content_hash}"
+except Exception:
+    _wf_data_key = f"{selected}|{timeframe}|{len(backtest_data)}"
+
+_wf_cached = st.session_state.get("walk_forward_cached_result")
+_wf_cached_key = st.session_state.get("walk_forward_cached_data_key")
+_wf_previous_auto = bool(st.session_state.get("walk_forward_auto_was_enabled", False))
+_wf_previous_tick = st.session_state.get("walk_forward_last_auto_tick")
+_wf_auto_tick_changed = bool(
+    wf_auto_refresh and wf_auto_tick is not None
+    and (_wf_previous_tick is None or wf_auto_tick != _wf_previous_tick)
+)
+_wf_auto_just_enabled = bool(wf_auto_refresh and not _wf_previous_auto)
+_wf_should_run = bool(
+    wf_manual_refresh
+    or (wf_auto_refresh and (_wf_auto_tick_changed or _wf_auto_just_enabled))
+)
+
+if _wf_should_run:
+    with st.spinner("Running chronological walk-forward validation…"):
+        walk_forward_result = walk_forward_validation(
+            backtest_data, symbol=selected, timeframe_label=timeframe,
+            option_metrics=None, news_info=historical_news_context
+        )
+    st.session_state["walk_forward_cached_result"] = walk_forward_result
+    st.session_state["walk_forward_cached_data_key"] = _wf_data_key
+    st.session_state["walk_forward_last_run_at"] = now_str()
+    st.session_state["walk_forward_last_auto_tick"] = wf_auto_tick
+    st.session_state["walk_forward_auto_was_enabled"] = wf_auto_refresh
+else:
+    st.session_state["walk_forward_auto_was_enabled"] = wf_auto_refresh
+    if wf_auto_tick is not None:
+        st.session_state["walk_forward_last_auto_tick"] = wf_auto_tick
+    if _wf_cached_key == _wf_data_key and _wf_cached is not None:
+        walk_forward_result = _wf_cached
+    else:
+        walk_forward_result = {
+            "folds": 0, "validated_folds": 0, "avg_win_rate": None,
+            "avg_profit_factor": None, "avg_expectancy": None,
+            "table": pd.DataFrame()
+        }
+        if _wf_cached is None:
+            st.info("Walk-forward has not run yet. Press Run / Refresh Walk Forward Now, or enable its independent Auto Refresh. It will not run automatically during initial page load.")
+        if _wf_cached is not None:
+            st.info("Market history has changed since the last walk-forward run. Press Run / Refresh Walk Forward Now, or enable its Auto Refresh option. The displayed metrics are not silently carried over from the previous dataset.")
+
+if st.session_state.get("walk_forward_last_run_at"):
+    st.caption("Last walk-forward calculation: " + str(st.session_state["walk_forward_last_run_at"]))
+if wf_auto_refresh and AUTO_REFRESH_AVAILABLE:
+    st.caption(f"Walk-forward auto refresh is ON — every {wf_refresh_seconds // 60} minute(s).")
+else:
+    st.caption("Walk-forward auto refresh is OFF. Use Run / Refresh Walk Forward Now whenever you want to recalculate.")
+
 wf1, wf2, wf3, wf4 = st.columns(4)
 with wf1:
     st.metric("Folds", walk_forward_result["folds"])
