@@ -3309,7 +3309,7 @@ def analyze_signal(
         # Order Blocks
     
         order_blocks = inst.detect_order_blocks(df)
-        st.write("DEBUG OB:", order_blocks)
+        
         if order_blocks.get("bias") == "Bullish":
     
             bullish += 10
