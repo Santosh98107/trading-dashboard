@@ -3252,7 +3252,7 @@ def analyze_signal(
     try:
     
         market_structure = inst.detect_market_structure(df)
-    
+        st.write("DEBUG MS:", market_structure)
         if market_structure.get("bias") == "Bullish":
     
             bullish += 15
@@ -3271,7 +3271,7 @@ def analyze_signal(
         # Liquidity Sweep
     
         liquidity = inst.detect_liquidity_sweep(df)
-    
+        st.write("DEBUG LS:", liquidity)
         if liquidity.get("signal") == "Bullish":
     
             bullish += 15
@@ -3296,7 +3296,7 @@ def analyze_signal(
         # Order Blocks
     
         order_blocks = inst.detect_order_blocks(df)
-    
+        st.write("DEBUG OB:", order_blocks)
         if order_blocks.get("bias") == "Bullish":
     
             bullish += 10
