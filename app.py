@@ -6678,3 +6678,303 @@ else:
 
 if auto_refresh and not AUTO_REFRESH_AVAILABLE:
     st.caption("Auto-refresh helper is not installed; use the manual browser refresh or install streamlit-autorefresh.")
+
+# =========================================================
+# EDUCATIONAL MARKET LEARNING LAB (isolated; descriptive only)
+# =========================================================
+
+
+# =========================================================
+# EDUCATIONAL MARKET LEARNING LAB (isolated; descriptive only)
+# =========================================================
+# This section is intentionally read-only. It does not write to the existing
+# signal engine, paper-trading state, journal, broker APIs, alerts, or orders.
+
+def _edu_ohlcv_frame(frame):
+    """Return a clean OHLCV copy without mutating the app's market dataframe."""
+    if not isinstance(frame, pd.DataFrame) or frame.empty:
+        return pd.DataFrame()
+    out = frame.copy()
+    out.columns = [str(c).strip().title() for c in out.columns]
+    aliases = {"Adj Close": "Close", "Datetime": "Date", "Timestamp": "Date"}
+    out = out.rename(columns=aliases)
+    required = ["Open", "High", "Low", "Close"]
+    if not all(c in out.columns for c in required):
+        return pd.DataFrame()
+    for c in required + (["Volume"] if "Volume" in out.columns else []):
+        out[c] = pd.to_numeric(out[c], errors="coerce")
+    out = out.dropna(subset=required)
+    out = out[(out["High"] >= out[["Open", "Close", "Low"]].max(axis=1)) &
+              (out["Low"] <= out[["Open", "Close", "High"]].min(axis=1))]
+    return out.tail(1500)
+
+
+def _edu_pivots(frame, left=3, right=3):
+    """Find simple local swing points for classroom market-structure study."""
+    if len(frame) < left + right + 3:
+        return []
+    highs = frame["High"].to_numpy(dtype=float)
+    lows = frame["Low"].to_numpy(dtype=float)
+    pivots = []
+    for i in range(left, len(frame) - right):
+        if highs[i] == max(highs[i-left:i+right+1]):
+            pivots.append((i, "H", float(highs[i])))
+        if lows[i] == min(lows[i-left:i+right+1]):
+            pivots.append((i, "L", float(lows[i])))
+    return sorted(pivots)
+
+
+def _edu_structure(frame):
+    pivots = _edu_pivots(frame)
+    prior = {"H": None, "L": None}
+    rows = []
+    for idx, kind, price in pivots:
+        label = "Swing High" if kind == "H" else "Swing Low"
+        previous = prior[kind]
+        if previous is not None:
+            if kind == "H":
+                label = "Higher High (HH)" if price > previous[1] else "Lower High (LH)" if price < previous[1] else "Equal High"
+            else:
+                label = "Higher Low (HL)" if price > previous[1] else "Lower Low (LL)" if price < previous[1] else "Equal Low"
+        rows.append({"Row": idx, "Date": str(frame.index[idx]), "Type": kind, "Price": price, "Observation": label})
+        prior[kind] = (idx, price)
+    # Mark close-cross events against the most recent confirmed swing levels.
+    # BOS/CHOCH are educational labels only; no direction/action is emitted.
+    swing_highs = [(i, p) for i, k, p in pivots if k == "H"]
+    swing_lows = [(i, p) for i, k, p in pivots if k == "L"]
+    prior_break_direction = 0
+    closes = frame["Close"].to_numpy(dtype=float)
+    for i in range(1, len(frame)):
+        hlevels = [(j, p) for j, p in swing_highs if j < i]
+        llevels = [(j, p) for j, p in swing_lows if j < i]
+        if hlevels and closes[i-1] <= hlevels[-1][1] < closes[i]:
+            direction = 1
+            event = "CHOCH observation" if prior_break_direction == -1 else "BOS observation"
+            rows.append({"Row": i, "Date": str(frame.index[i]), "Type": "Close break", "Price": float(closes[i]), "Observation": event + " — above prior swing high"})
+            prior_break_direction = direction
+        elif llevels and closes[i-1] >= llevels[-1][1] > closes[i]:
+            direction = -1
+            event = "CHOCH observation" if prior_break_direction == 1 else "BOS observation"
+            rows.append({"Row": i, "Date": str(frame.index[i]), "Type": "Close break", "Price": float(closes[i]), "Observation": event + " — below prior swing low"})
+            prior_break_direction = direction
+    return pd.DataFrame(rows).sort_values("Row").reset_index(drop=True) if rows else pd.DataFrame()
+
+
+def _edu_volume_profile(frame, bins=30):
+    if frame.empty or "Volume" not in frame.columns:
+        return pd.DataFrame(), None
+    lo, hi = float(frame["Low"].min()), float(frame["High"].max())
+    if not np.isfinite(lo + hi) or hi <= lo:
+        return pd.DataFrame(), None
+    edges = np.linspace(lo, hi, bins + 1)
+    typical = (frame["High"] + frame["Low"] + frame["Close"]) / 3
+    vol, _ = np.histogram(typical, bins=edges, weights=frame["Volume"].fillna(0).clip(lower=0))
+    centers = (edges[:-1] + edges[1:]) / 2
+    result = pd.DataFrame({"Price Band Midpoint": centers, "Observed Volume": vol})
+    poc = float(centers[int(np.argmax(vol))]) if len(vol) and vol.sum() > 0 else None
+    return result, poc
+
+
+def _edu_oi_classification(frame):
+    needed = {"Change in Price", "Change in OI"}
+    if not needed.issubset(frame.columns):
+        return pd.DataFrame()
+    out = frame.copy()
+    out["Change in Price"] = pd.to_numeric(out["Change in Price"], errors="coerce")
+    out["Change in OI"] = pd.to_numeric(out["Change in OI"], errors="coerce")
+    def classify(r):
+        p, o = r["Change in Price"], r["Change in OI"]
+        if pd.isna(p) or pd.isna(o): return "Insufficient data"
+        if p > 0 and o > 0: return "Long buildup pattern"
+        if p < 0 and o > 0: return "Short buildup pattern"
+        if p > 0 and o < 0: return "Short covering pattern"
+        if p < 0 and o < 0: return "Long unwinding pattern"
+        return "Mixed / unchanged"
+    out["Descriptive OI Category"] = out.apply(classify, axis=1)
+    return out
+
+
+with st.expander("📚 Educational Market Learning Lab — descriptive analysis only", expanded=False):
+    st.caption("Read-only learning tools. Outputs are historical observations, not trade instructions, forecasts, or order controls. This section is isolated from the existing signal and paper-trading logic.")
+    edu_tabs = st.tabs(["Market Structure", "Liquidity & Sweeps", "Sector / Relative Strength", "OI Patterns", "Order Blocks & FVG", "Volume Profile", "AI Trainer"])
+    edu_frame = _edu_ohlcv_frame(data if "data" in globals() else pd.DataFrame())
+
+    with edu_tabs[0]:
+        st.markdown("**Swing structure: HH / HL / LH / LL, BOS and CHOCH study**")
+        if edu_frame.empty:
+            st.info("Valid OHLC history is not available for this symbol/timeframe.")
+        else:
+            structure = _edu_structure(edu_frame)
+            st.dataframe(structure.tail(100), use_container_width=True, hide_index=True)
+            if len(structure) >= 4:
+                st.caption("BOS/CHOCH are context-dependent concepts. Review swing sequence and prior structure manually; this lab does not label directional trade signals.")
+            else:
+                st.info("More historical candles are needed to identify a useful swing sequence.")
+
+    with edu_tabs[1]:
+        st.markdown("**Liquidity areas and possible sweep observations**")
+        if edu_frame.empty:
+            st.info("Valid OHLC history is not available.")
+        else:
+            piv = _edu_pivots(edu_frame)
+            levels = [x[2] for x in piv]
+            observations = []
+            for i in range(1, len(edu_frame)):
+                row = edu_frame.iloc[i]
+                prior_levels = [x[2] for x in piv if x[0] < i]
+                if prior_levels:
+                    nearby_high = max((v for v in prior_levels if v >= row["Close"]), default=None)
+                    nearby_low = min((v for v in prior_levels if v <= row["Close"]), default=None)
+                    if nearby_high is not None and row["High"] > nearby_high and row["Close"] < nearby_high:
+                        observations.append({"Date": str(edu_frame.index[i]), "Observation": "Upper-level probe and close back below", "Reference level": nearby_high})
+                    if nearby_low is not None and row["Low"] < nearby_low and row["Close"] > nearby_low:
+                        observations.append({"Date": str(edu_frame.index[i]), "Observation": "Lower-level probe and close back above", "Reference level": nearby_low})
+            st.dataframe(pd.DataFrame(observations).tail(100), use_container_width=True, hide_index=True)
+            st.caption("A wick or level breach alone cannot establish intent, stop hunting, or a confirmed false breakout.")
+
+    with edu_tabs[2]:
+        st.markdown("**Sector comparison and relative-strength worksheet**")
+        st.caption("Upload a CSV with columns: Symbol, Sector, Close. Optional: BenchmarkClose. Values are compared descriptively over the uploaded rows.")
+        sector_file = st.file_uploader("Upload sector comparison CSV", type=["csv"], key="edu_sector_csv")
+        if sector_file is not None:
+            try:
+                sf = pd.read_csv(sector_file)
+                required = {"Symbol", "Sector", "Close"}
+                if required.issubset(sf.columns):
+                    sf["Close"] = pd.to_numeric(sf["Close"], errors="coerce")
+                    if "BenchmarkClose" in sf.columns:
+                        sf["BenchmarkClose"] = pd.to_numeric(sf["BenchmarkClose"], errors="coerce")
+                        sf["Relative Ratio"] = sf["Close"] / sf["BenchmarkClose"].replace(0, np.nan)
+                    st.dataframe(sf, use_container_width=True, hide_index=True)
+                    sector_summary = sf.groupby("Sector", dropna=True).agg(Constituents=("Symbol", "count"), Mean_Close=("Close", "mean")).reset_index()
+                    st.markdown("**Uploaded sector coverage**")
+                    st.dataframe(sector_summary, use_container_width=True, hide_index=True)
+                else:
+                    st.warning("CSV must contain Symbol, Sector and Close columns.")
+            except Exception as e:
+                st.error(f"Could not read sector CSV: {e}")
+        else:
+            st.info("Upload a historical sector CSV to view sector coverage and relative-value columns. No sector ranking or trade recommendation is generated.")
+
+    with edu_tabs[3]:
+        st.markdown("**Open-interest buildup categories**")
+        st.caption("Upload rows with Change in Price and Change in OI; add Symbol/Expiry/Strike columns if available.")
+        oi_file = st.file_uploader("Upload option-chain OI CSV", type=["csv"], key="edu_oi_csv")
+        if oi_file is not None:
+            try:
+                oi_raw = pd.read_csv(oi_file)
+                oi_result = _edu_oi_classification(oi_raw)
+                if oi_result.empty:
+                    st.warning("CSV needs Change in Price and Change in OI columns.")
+                else:
+                    st.dataframe(oi_result, use_container_width=True, hide_index=True)
+                    st.caption("These four labels are conventional descriptive interpretations; they do not establish participant intent or predict price direction.")
+            except Exception as e:
+                st.error(f"Could not read OI CSV: {e}")
+        else:
+            st.info("No OI file uploaded.")
+
+    with edu_tabs[4]:
+        st.markdown("**Order Block and Fair Value Gap (FVG) visual annotations**")
+        if len(edu_frame) < 3:
+            st.info("At least three valid OHLC rows are required.")
+        else:
+            zones = []
+            for i in range(1, len(edu_frame)):
+                prev, cur = edu_frame.iloc[i-1], edu_frame.iloc[i]
+                if prev["Close"] < prev["Open"] and cur["Close"] > cur["Open"] and cur["Close"] > prev["High"]:
+                    zones.append({"Date": str(edu_frame.index[i-1]), "Annotation": "Bullish-candle displacement context", "Zone Low": float(prev["Low"]), "Zone High": float(prev["Open"])})
+                elif prev["Close"] > prev["Open"] and cur["Close"] < cur["Open"] and cur["Close"] < prev["Low"]:
+                    zones.append({"Date": str(edu_frame.index[i-1]), "Annotation": "Bearish-candle displacement context", "Zone Low": float(prev["Open"]), "Zone High": float(prev["High"])})
+            gaps = []
+            for i in range(2, len(edu_frame)):
+                a, c = edu_frame.iloc[i-2], edu_frame.iloc[i]
+                if c["Low"] > a["High"]:
+                    gaps.append({"Date": str(edu_frame.index[i]), "Annotation": "Upward three-candle gap", "Zone Low": float(a["High"]), "Zone High": float(c["Low"])})
+                elif c["High"] < a["Low"]:
+                    gaps.append({"Date": str(edu_frame.index[i]), "Annotation": "Downward three-candle gap", "Zone Low": float(c["High"]), "Zone High": float(a["Low"])})
+            left, right = st.columns(2)
+            with left:
+                st.markdown("**Candidate candle zones**")
+                st.dataframe(pd.DataFrame(zones).tail(75), use_container_width=True, hide_index=True)
+            with right:
+                st.markdown("**Three-candle gaps**")
+                st.dataframe(pd.DataFrame(gaps).tail(75), use_container_width=True, hide_index=True)
+            st.caption("These are mechanical chart annotations, not institutionally verified order blocks or actionable retest levels.")
+
+    with edu_tabs[5]:
+        st.markdown("**Volume Profile: POC / value-area approximation / HVN-LVN**")
+        profile, poc = _edu_volume_profile(edu_frame)
+        if profile.empty:
+            st.info("Volume data is unavailable; profile cannot be calculated.")
+        else:
+            total_volume = float(profile["Observed Volume"].sum())
+            profile["Volume Share %"] = (profile["Observed Volume"] / total_volume * 100) if total_volume else 0.0
+            profile["Node"] = "Normal"
+            if len(profile) >= 3:
+                q75, q25 = profile["Observed Volume"].quantile([0.75, 0.25])
+                profile.loc[profile["Observed Volume"] >= q75, "Node"] = "High-volume node (HVN)"
+                profile.loc[profile["Observed Volume"] <= q25, "Node"] = "Low-volume node (LVN)"
+            # Approximate 70% value area by expanding from the POC bin.
+            if total_volume > 0:
+                vol_values = profile["Observed Volume"].to_numpy(dtype=float)
+                center = int(np.argmax(vol_values)); lo_i = hi_i = center; accumulated = vol_values[center]
+                while accumulated < total_volume * 0.70 and (lo_i > 0 or hi_i < len(vol_values)-1):
+                    left_v = vol_values[lo_i-1] if lo_i > 0 else -1
+                    right_v = vol_values[hi_i+1] if hi_i < len(vol_values)-1 else -1
+                    if right_v > left_v and hi_i < len(vol_values)-1:
+                        hi_i += 1; accumulated += vol_values[hi_i]
+                    elif lo_i > 0:
+                        lo_i -= 1; accumulated += vol_values[lo_i]
+                    else:
+                        break
+                val_approx = float(np.linspace(float(edu_frame["Low"].min()), float(edu_frame["High"].max()), 31)[lo_i])
+                vah_approx = float(np.linspace(float(edu_frame["Low"].min()), float(edu_frame["High"].max()), 31)[hi_i+1])
+            else:
+                val_approx = vah_approx = None
+            p1, p2, p3 = st.columns(3)
+            p1.metric("POC (approx.)", f"{poc:,.2f}" if poc is not None else "N/A")
+            p2.metric("VAL (approx.)", f"{val_approx:,.2f}" if val_approx is not None else "N/A")
+            p3.metric("VAH (approx.)", f"{vah_approx:,.2f}" if vah_approx is not None else "N/A")
+            st.dataframe(profile.sort_values("Price Band Midpoint"), use_container_width=True, hide_index=True)
+            st.caption("POC/VAH/VAL are histogram approximations. HVN/LVN labels use relative volume quartiles; binning choices affect all values.")
+
+    with edu_tabs[6]:
+        st.markdown("**AI Trainer — unsupervised historical candle-pattern grouping**")
+        st.caption("The trainer groups historical candle/volume feature shapes for learning. It does not train outcome labels, predict returns, estimate win probability, or generate trading decisions.")
+        if len(edu_frame) < 40:
+            st.info("At least 40 valid OHLC rows are needed for a useful demonstration.")
+        else:
+            try:
+                from sklearn.cluster import KMeans
+                from sklearn.preprocessing import StandardScaler
+                feature_frame = pd.DataFrame(index=edu_frame.index)
+                candle_range = (edu_frame["High"] - edu_frame["Low"]).replace(0, np.nan)
+                feature_frame["Body / Range"] = (edu_frame["Close"] - edu_frame["Open"]) / candle_range
+                feature_frame["Upper Wick / Range"] = (edu_frame["High"] - edu_frame[["Open", "Close"]].max(axis=1)) / candle_range
+                feature_frame["Lower Wick / Range"] = (edu_frame[["Open", "Close"]].min(axis=1) - edu_frame["Low"]) / candle_range
+                feature_frame["Range %"] = candle_range / edu_frame["Close"].replace(0, np.nan) * 100
+                if "Volume" in edu_frame.columns:
+                    vol_mean = edu_frame["Volume"].rolling(20, min_periods=5).mean()
+                    feature_frame["Volume / 20-bar mean"] = edu_frame["Volume"] / vol_mean.replace(0, np.nan)
+                feature_frame = feature_frame.replace([np.inf, -np.inf], np.nan).dropna()
+                max_clusters = min(6, max(2, len(feature_frame) // 15))
+                cluster_count = st.slider("Pattern groups", 2, max_clusters, min(3, max_clusters), key="edu_ai_clusters")
+                if len(feature_frame) >= cluster_count * 5:
+                    scaler = StandardScaler()
+                    scaled = scaler.fit_transform(feature_frame)
+                    model = KMeans(n_clusters=cluster_count, random_state=42, n_init=10)
+                    labels = model.fit_predict(scaled)
+                    result = feature_frame.copy()
+                    result["Pattern Group"] = labels.astype(int)
+                    st.metric("Historical rows grouped", f"{len(result):,}")
+                    st.dataframe(result.tail(100), use_container_width=True)
+                    st.markdown("**Group feature averages**")
+                    st.dataframe(result.groupby("Pattern Group").mean(numeric_only=True).round(4), use_container_width=True)
+                    st.caption("Groups are descriptive clusters, not good/bad labels. Re-running on different history or settings can change group assignments.")
+                else:
+                    st.info("Not enough clean feature rows for the selected number of groups.")
+            except ImportError:
+                st.warning("Install scikit-learn to enable the educational AI Trainer: pip install scikit-learn")
+            except Exception as e:
+                st.error(f"AI Trainer could not complete: {e}")
