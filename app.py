@@ -3331,6 +3331,25 @@ def analyze_signal(
             reasons.append(
                 "Bearish FVG (+10)"
             )
+        # Volume Profile
+    
+        volume_profile = inst.calculate_volume_profile(df)
+    
+        if volume_profile.get("bias") == "Bullish":
+    
+            bullish += 10
+    
+            reasons.append(
+                "Above POC (+10)"
+            )
+    
+        elif volume_profile.get("bias") == "Bearish":
+    
+            bearish += 10
+    
+            reasons.append(
+                "Below POC (+10)"
+            )
     except Exception as e:
     
         print(e)
