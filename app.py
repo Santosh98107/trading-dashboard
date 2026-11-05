@@ -3253,41 +3253,48 @@ def analyze_signal(
     
         market_structure = inst.detect_market_structure(df)
         st.write("DEBUG MS:", market_structure)
-        if market_structure.get("bias") == "Bullish":
+    if market_structure.get("score", 0) > 0:
     
-            bullish += 15
+        bullish += abs(
+            market_structure.get("score", 0)
+        )
     
-            reasons.append(
-                "Bullish BOS/CHOCH (+15)"
-            )
+        reasons.append(
+            "Bullish BOS/CHOCH"
+        )
     
-        elif market_structure.get("bias") == "Bearish":
+    elif market_structure.get("score", 0) < 0:
     
-            bearish += 15
+        bearish += abs(
+            market_structure.get("score", 0)
+        )
     
-            reasons.append(
-                "Bearish BOS/CHOCH (+15)"
-            )
+        reasons.append(
+            "Bearish BOS/CHOCH"
+        )        
         # Liquidity Sweep
     
-        liquidity = inst.detect_liquidity_sweep(df)
-        st.write("DEBUG LS:", liquidity)
-        if liquidity.get("signal") == "Bullish":
+    liquidity = inst.detect_liquidity_sweep(df)
     
-            bullish += 15
+    if liquidity.get("score", 0) > 0:
     
-            reasons.append(
-                "Bullish Liquidity Sweep (+15)"
-            )
+        bullish += abs(
+            liquidity.get("score", 0)
+        )
     
-        elif liquidity.get("signal") == "Bearish":
+        reasons.append(
+            "Bullish Liquidity Sweep"
+        )
     
-            bearish += 15
+    elif liquidity.get("score", 0) < 0:
     
-            reasons.append(
-                "Bearish Liquidity Sweep (+15)"
-            )
+        bearish += abs(
+            liquidity.get("score", 0)
+        )
     
+        reasons.append(
+            "Bearish Liquidity Sweep"
+        )    
         if liquidity.get("block_entry"):
     
             selected_blockers.append(
