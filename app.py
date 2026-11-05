@@ -6982,3 +6982,10 @@ with st.expander("📚 Educational Market Learning Lab — descriptive analysis 
 
             # Aapki existing script jahan stream render karti hai:
             inst.render_institutional_dashboard(data, selected, fetch_data("^NSEI", "1d", "30d"), load_journal())
+            # Institutional Upgrades Dashboard Integration
+            st.divider()
+            st.header("Institutional Upgrades & Advanced Analytics Suite")
+            
+            # Benchmark data fetch karke dashboard render karein
+            nifty_bm = fetch_data("^NSEI", "1d", "30d")
+            inst.render_institutional_dashboard(data, selected, nifty_bm, load_journal())
