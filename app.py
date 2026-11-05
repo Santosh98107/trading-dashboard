@@ -3248,7 +3248,7 @@ def analyze_signal(
     # ==========================================
     # INSTITUTIONAL CONFLUENCE SCORING
     # ==========================================
-        
+            
     try:
     
         market_structure = inst.detect_market_structure(df)
