@@ -3310,21 +3310,22 @@ def analyze_signal(
     
         order_blocks = inst.detect_order_blocks(df)
         st.write("DEBUG OB:", order_blocks)
-        if order_blocks.get("bias") == "Bullish":
-    
-            bullish += 10
-    
+        if order_blocks.get("bullish_ob"):
+        
+            bullish += 5
+        
             reasons.append(
-                "Bullish Order Block (+10)"
+                "Bullish Order Block"
             )
-    
-        elif order_blocks.get("bias") == "Bearish":
-    
-            bearish += 10
-    
+        
+        if order_blocks.get("bearish_ob"):
+        
+            bearish += 5
+        
             reasons.append(
-                "Bearish Order Block (+10)"
+                "Bearish Order Block"
             )
+            
         # Fair Value Gap
     
         fvg = inst.detect_fvg(df)
