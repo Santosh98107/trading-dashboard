@@ -3330,21 +3330,21 @@ def analyze_signal(
         fvg = inst.detect_fvg(df)
         st.write("DEBUG FVG:", fvg)
 
-        if fvg.get("bias") == "Bullish":
-    
-            bullish += 10
-    
+        if fvg.get("bullish_fvg"):
+        
+            bullish += 5
+        
             reasons.append(
-                "Bullish FVG (+10)"
+                "Bullish FVG"
             )
-    
-        elif fvg.get("bias") == "Bearish":
-    
-            bearish += 10
-    
+        
+        if fvg.get("bearish_fvg"):
+        
+            bearish += 5
+        
             reasons.append(
-                "Bearish FVG (+10)"
-            )
+                "Bearish FVG"
+            )            
         # Volume Profile
     
         volume_profile = inst.calculate_volume_profile(df)
