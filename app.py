@@ -3293,6 +3293,25 @@ def analyze_signal(
             selected_blockers.append(
                 f"Liquidity Sweep Active: {liquidity.get('type','Unknown')}"
             )
+        # Order Blocks
+    
+        order_blocks = inst.detect_order_blocks(df)
+    
+        if order_blocks.get("bias") == "Bullish":
+    
+            bullish += 10
+    
+            reasons.append(
+                "Bullish Order Block (+10)"
+            )
+    
+        elif order_blocks.get("bias") == "Bearish":
+    
+            bearish += 10
+    
+            reasons.append(
+                "Bearish Order Block (+10)"
+            )
     except Exception as e:
     
         print(e)
