@@ -3248,31 +3248,37 @@ def analyze_signal(
     # ==========================================
     # INSTITUTIONAL CONFLUENCE SCORING
     # ==========================================
-    
+        
     try:
     
         market_structure = inst.detect_market_structure(df)
-        st.write("DEBUG MS:", market_structure)
-    if market_structure.get("score", 0) > 0:
     
-        bullish += abs(
-            market_structure.get("score", 0)
+        if market_structure.get("score", 0) > 0:
+    
+            bullish += abs(
+                market_structure.get("score", 0)
+            )
+    
+            reasons.append(
+                "Bullish BOS/CHOCH"
+            )
+    
+        elif market_structure.get("score", 0) < 0:
+    
+            bearish += abs(
+                market_structure.get("score", 0)
+            )
+    
+            reasons.append(
+                "Bearish BOS/CHOCH"
+            )
+    
+    except Exception as e:
+    
+        st.error(
+            f"INSTITUTIONAL ERROR: {e}"
         )
-    
-        reasons.append(
-            "Bullish BOS/CHOCH"
-        )
-    
-    elif market_structure.get("score", 0) < 0:
-    
-        bearish += abs(
-            market_structure.get("score", 0)
-        )
-    
-        reasons.append(
-            "Bearish BOS/CHOCH"
-        )        
-        # Liquidity Sweep
+    # Liquidity Sweep
     
     liquidity = inst.detect_liquidity_sweep(df)
     
