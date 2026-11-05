@@ -3268,7 +3268,31 @@ def analyze_signal(
             reasons.append(
                 "Bearish BOS/CHOCH (+15)"
             )
-    
+    # Liquidity Sweep
+
+    liquidity = inst.detect_liquidity_sweep(df)
+
+    if liquidity.get("signal") == "Bullish":
+
+        bullish += 15
+
+        reasons.append(
+            "Bullish Liquidity Sweep (+15)"
+        )
+
+    elif liquidity.get("signal") == "Bearish":
+
+        bearish += 15
+
+        reasons.append(
+            "Bearish Liquidity Sweep (+15)"
+        )
+
+    if liquidity.get("block_entry"):
+
+        selected_blockers.append(
+            f"Liquidity Sweep Active: {liquidity.get('type','Unknown')}"
+        )
     except Exception as e:
     
         print(e)
