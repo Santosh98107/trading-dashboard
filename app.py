@@ -3309,7 +3309,7 @@ def analyze_signal(
         # Order Blocks
     
         order_blocks = inst.detect_order_blocks(df)
-        
+        st.write("DEBUG OB:", order_blocks)
         if order_blocks.get("bias") == "Bullish":
     
             bullish += 10
@@ -3328,7 +3328,8 @@ def analyze_signal(
         # Fair Value Gap
     
         fvg = inst.detect_fvg(df)
-    
+        st.write("DEBUG FVG:", fvg)
+
         if fvg.get("bias") == "Bullish":
     
             bullish += 10
@@ -3347,7 +3348,7 @@ def analyze_signal(
         # Volume Profile
     
         volume_profile = inst.calculate_volume_profile(df)
-    
+        st.write("DEBUG VP:", volume_profile)
         if volume_profile.get("bias") == "Bullish":
     
             bullish += 10
