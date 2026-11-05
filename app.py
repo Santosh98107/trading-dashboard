@@ -6978,3 +6978,7 @@ with st.expander("📚 Educational Market Learning Lab — descriptive analysis 
                 st.warning("Install scikit-learn to enable the educational AI Trainer: pip install scikit-learn")
             except Exception as e:
                 st.error(f"AI Trainer could not complete: {e}")
+            import institutional_upgrades as inst
+
+            # Aapki existing script jahan stream render karti hai:
+            inst.render_institutional_dashboard(data, selected, fetch_data("^NSEI", "1d", "30d"), load_journal())
