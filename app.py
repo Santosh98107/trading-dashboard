@@ -3312,6 +3312,25 @@ def analyze_signal(
             reasons.append(
                 "Bearish Order Block (+10)"
             )
+        # Fair Value Gap
+    
+        fvg = inst.detect_fvg(df)
+    
+        if fvg.get("bias") == "Bullish":
+    
+            bullish += 10
+    
+            reasons.append(
+                "Bullish FVG (+10)"
+            )
+    
+        elif fvg.get("bias") == "Bearish":
+    
+            bearish += 10
+    
+            reasons.append(
+                "Bearish FVG (+10)"
+            )
     except Exception as e:
     
         print(e)
