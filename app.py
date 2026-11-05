@@ -3349,7 +3349,41 @@ def analyze_signal(
     
             reasons.append(
                 "Below POC (+10)"
+                )
+        # Relative Strength
+    
+        try:
+    
+            benchmark_df = fetch_data(
+                "^NSEI",
+                interval="1d",
+                period="1mo"
             )
+    
+            rs_score = inst.calculate_relative_strength(
+                df,
+                benchmark_df
+            )
+    
+            if rs_score > 1.5:
+    
+                bullish += 10
+    
+                reasons.append(
+                    "Strong Relative Strength (+10)"
+                )
+    
+            elif rs_score < -1.5:
+    
+                bearish += 10
+    
+                reasons.append(
+                    "Weak Relative Strength (+10)"
+                )
+    
+        except Exception:
+    
+            pass
     except Exception as e:
     
         print(e)
