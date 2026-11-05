@@ -3397,8 +3397,7 @@ def analyze_signal(
         
     
                 
-    except Exception as e:
-        st.write(f"INSTITUTIONAL ERROR: {e}")  
+      
     
     
     
