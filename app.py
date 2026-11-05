@@ -3365,7 +3365,7 @@ def analyze_signal(
                 )
         # Relative Strength
     
-        try:
+        
     
             benchmark_df = fetch_data(
                 "^NSEI",
