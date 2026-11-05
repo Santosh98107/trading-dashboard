@@ -3349,21 +3349,26 @@ def analyze_signal(
     
         volume_profile = inst.calculate_volume_profile(df)
         st.write("DEBUG VP:", volume_profile)
-        if volume_profile.get("bias") == "Bullish":
-    
-            bullish += 10
-    
-            reasons.append(
-                "Above POC (+10)"
+        if volume_profile.get("score", 0) > 0:
+        
+            bullish += abs(
+                volume_profile.get("score", 0)
             )
-    
-        elif volume_profile.get("bias") == "Bearish":
-    
-            bearish += 10
-    
+        
             reasons.append(
-                "Below POC (+10)"
-                )
+                "Bullish Volume Profile"
+            )
+        
+        elif volume_profile.get("score", 0) < 0:
+        
+            bearish += abs(
+                volume_profile.get("score", 0)
+            )
+        
+            reasons.append(
+                "Bearish Volume Profile"
+            )
+            
         # Relative Strength
     
         
