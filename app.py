@@ -3241,7 +3241,41 @@ def analyze_signal(
     strength = "Low"
     stop_loss = target1 = target2 = target3 = partial_exit = trailing_stop = rr_ratio = None
     selected_blockers = []
+    
     selected_side = None
+    
+    
+    # ==========================================
+    # INSTITUTIONAL CONFLUENCE SCORING
+    # ==========================================
+    
+    try:
+    
+        market_structure = inst.detect_market_structure(df)
+    
+        if market_structure.get("bias") == "Bullish":
+    
+            bullish += 15
+    
+            reasons.append(
+                "Bullish BOS/CHOCH (+15)"
+            )
+    
+        elif market_structure.get("bias") == "Bearish":
+    
+            bearish += 15
+    
+            reasons.append(
+                "Bearish BOS/CHOCH (+15)"
+            )
+    
+    except Exception as e:
+    
+        print(e)
+    
+    
+    
+    
     if buy_allowed and (not sell_allowed or bullish - bearish >= bearish - bullish):
         selected_side = "BUY"
     elif sell_allowed:
