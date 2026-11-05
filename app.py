@@ -14,7 +14,7 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 import yfinance as yf
-
+import institutional_upgrades as inst
 # Visible deployment marker: confirms which source file Streamlit Cloud is running.
 APP_BUILD_ID = "2026-11-04-LOSS-INTELLIGENCE-SIGNAL-V2-01"
 # Optional integrations: Yahoo mode must still start if Angel SDK/TOTP or
@@ -7129,7 +7129,7 @@ with st.expander("📚 Educational Market Learning Lab — descriptive analysis 
                 st.warning("Install scikit-learn to enable the educational AI Trainer: pip install scikit-learn")
             except Exception as e:
                 st.error(f"AI Trainer could not complete: {e}")
-            import institutional_upgrades as inst
+            
 
             # Aapki existing script jahan stream render karti hai:
             inst.render_institutional_dashboard(data, selected, fetch_data("^NSEI", "1d", "30d"), load_journal())
