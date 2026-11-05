@@ -3394,9 +3394,9 @@ def analyze_signal(
                     "Weak Relative Strength (+10)"
                 )
     
-        except Exception:
+        
     
-            pass
+            
     except Exception as e:
     
         st.write(
