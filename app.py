@@ -3403,7 +3403,7 @@ def analyze_signal(
             stop_loss = close_price - risk
             target1, target2, target3 = close_price + 2*risk, close_price + 3*risk, close_price + 4*risk
             trailing_stop = close_price - 0.75*risk
-            strong = bullish >= 12 and (bullish - bearish) >= 6 and buy_trend_votes >= 3 and adx >= 20 and (htf_bias == "bullish" or mtf_bull_count > mtf_bear_count or breakout or volume_spike)
+            strong = bullish >= 25 and (bullish - bearish) >= 6 and buy_trend_votes >= 3 and adx >= 20 and (htf_bias == "bullish" or mtf_bull_count > mtf_bear_count or breakout or volume_spike)
             signal_text = "STRONG BUY" if strong else "BUY"
             strength = "High" if strong else "Medium"
             selected_blockers = []
@@ -3412,7 +3412,7 @@ def analyze_signal(
             stop_loss = close_price + risk
             target1, target2, target3 = close_price - 2*risk, close_price - 3*risk, close_price - 4*risk
             trailing_stop = close_price + 0.75*risk
-            strong = bearish >= 12 and (bearish - bullish) >= 6 and sell_trend_votes >= 3 and adx >= 20 and (htf_bias == "bearish" or mtf_bear_count > mtf_bull_count or breakdown or volume_spike)
+            strong = bearish >= 25 and (bearish - bullish) >= 6 and sell_trend_votes >= 3 and adx >= 20 and (htf_bias == "bearish" or mtf_bear_count > mtf_bull_count or breakdown or volume_spike)
             signal_text = "STRONG SELL" if strong else "SELL"
             strength = "High" if strong else "Medium"
         partial_exit = target1
