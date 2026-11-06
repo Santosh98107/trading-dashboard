@@ -3643,6 +3643,50 @@ def apply_adaptive_signal_intelligence(df, analysis, symbol, timeframe, mtf_bull
     analysis["adaptive_confidence_label"] = "Historical blend active" if intelligence["count"] >= 30 else "Indicator-led; historical sample insufficient"
     analysis["repeat_loss_penalty"] = risk_penalty
     analysis["similar_trade_block_suggested"] = bool(intelligence["count"] >= 10 and (intelligence["loser_match_rate"] or 0) >= 75)
+    # =====================================================
+    # AI SIGNAL OVERRIDE ENGINE
+    # =====================================================
+    
+    historical_win_rate = analysis.get("historical_win_rate")
+    historical_loss_rate = analysis.get("historical_loss_rate")
+    similar_trades = analysis.get("similar_trades_found", 0)
+    repeat_loss_warning = analysis.get("repeat_loss_warning", False)
+    
+    if (
+        similar_trades >= 20
+        and historical_loss_rate is not None
+    ):
+    
+        if historical_loss_rate >= 80:
+    
+            analysis["signal_text"] = "NO TRADE"
+            analysis["signal_type"] = "neutral"
+    
+            analysis["no_trade_reasons"].append(
+                f"AI Block: {historical_loss_rate:.1f}% similar setups were losing trades"
+            )
+    
+        elif historical_loss_rate >= 65:
+    
+            if analysis["signal_text"] == "STRONG BUY":
+                analysis["signal_text"] = "BUY"
+    
+            elif analysis["signal_text"] == "STRONG SELL":
+                analysis["signal_text"] = "SELL"
+    
+            analysis["confidence"] = max(
+                0,
+                int(analysis["confidence"] - 15)
+            )
+    
+    if repeat_loss_warning:
+    
+        analysis["confidence"] = max(
+            0,
+            int(analysis["confidence"] - 10)
+        )
+    
+    analysis["ai_override_applied"] = True
     return analysis
 
 
