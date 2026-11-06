@@ -6216,20 +6216,44 @@ top1, top2, top3, top4 = st.columns(4)
 with top1:
     st.metric("Current Price", round(current_display_price, 2))
 with top2:
+
     st.metric("Signal", analysis["signal_text"])
 
-    if analysis.get("ai_override_applied"):
-        st.info(
+    similar_trades = analysis.get("similar_trades_found", 0)
+
+    if similar_trades == 0:
+
+        st.info("""
+🧠 AI Learning Engine
+
+Similar Trades: 0
+
+Status: Learning Mode
+
+No matching completed trades found yet.
+""")
+
+    else:
+
+        confidence_label = (
+            "Low" if similar_trades < 5
+            else "Medium" if similar_trades < 20
+            else "High"
+        )
+
+        st.success(
             f"""
 🧠 AI Learning Engine
 
-Similar Trades: {analysis.get('similar_trades_found',0)}
+Similar Trades: {similar_trades}
 
-Historical Win Rate: {analysis.get('historical_win_rate','N/A')}%
+Historical Win Rate: {analysis.get('historical_win_rate',0)}%
 
-Historical Loss Rate: {analysis.get('historical_loss_rate','N/A')}%
+Historical Loss Rate: {analysis.get('historical_loss_rate',0)}%
+
+Data Confidence: {confidence_label}
 """
-        )    
+        )   
 with top3:
     st.metric("Backtest Win Rate", f"{analysis['win_chance']:.1f}%" if analysis.get("win_chance") is not None else "N/A")
 with top4:
