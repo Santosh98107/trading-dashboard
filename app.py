@@ -3303,7 +3303,7 @@ def analyze_signal(
         if isinstance(rs, (int, float)):
             institutional_score += (rs - 5) * 2
     
-        institutional_score = max(min(institutional_score, 20), -20)
+        institutional_score = max(min(institutional_score, 8), -8)
 
         if institutional_score > 0:
             bullish += institutional_score
