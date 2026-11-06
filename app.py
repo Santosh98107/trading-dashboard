@@ -3378,7 +3378,16 @@ def analyze_signal(
             f"Validation Score Too Low ({validation_score}/100)"
         )
     trade_quality_score = int(round(0.65 * validation_score + 0.35 * (confidence or 0))) if signal_type != "neutral" else 0
-
+    # =====================================================
+    # TRADE QUALITY FILTER
+    # =====================================================
+    
+    if signal_type != "neutral" and trade_quality_score < 70:
+        signal_text = "NO TRADE"
+        signal_type = "neutral"
+        selected_blockers.append(
+            f"Trade Quality Too Low ({trade_quality_score}/100)"
+        )
     no_trade_zone = candidate_no_trade_zone
     no_trade_reason = "; ".join(selected_blockers) if selected_blockers else None
     reasons.extend(selected_blockers if signal_type == "neutral" else [f"Entry approved: {signal_text}"])
