@@ -1,4 +1,3 @@
-import institutional_upgrades as inst
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -281,15 +280,66 @@ def ai_loss_analysis(journal_df):
     return pd.DataFrame(results)
 
 # =========================================================
+# AUTOMATIC IN-APP DIAGNOSTICS (NO CSV / MANUAL UPLOAD REQUIRED)
+# =========================================================
+def collect_institutional_diagnostics(df, benchmark_df=None):
+    """Calculate institutional diagnostics from the app's existing OHLCV frames.
+
+    This function is intentionally display/diagnostics-only. It does not alter
+    the main app's BUY/SELL decision variables or score aggregation.
+    """
+    required = {"Open", "High", "Low", "Close", "Volume"}
+    if df is None or getattr(df, "empty", True) or not required.issubset(set(df.columns)):
+        return {
+            "available": False,
+            "message": "Market OHLCV data unavailable or incomplete",
+            "market_structure": None,
+            "liquidity": None,
+            "relative_strength": None,
+            "order_blocks": None,
+            "fvg": None,
+            "volume_profile": None,
+        }
+
+    try:
+        return {
+            "available": True,
+            "message": "Using market data already loaded by the app",
+            "market_structure": detect_market_structure(df),
+            "liquidity": detect_liquidity_sweep(df),
+            "relative_strength": calculate_relative_strength(df, benchmark_df),
+            "order_blocks": detect_order_blocks(df),
+            "fvg": detect_fvg(df),
+            "volume_profile": calculate_volume_profile(df),
+        }
+    except Exception as exc:
+        return {
+            "available": False,
+            "message": f"Institutional diagnostics unavailable: {type(exc).__name__}: {exc}",
+            "market_structure": None,
+            "liquidity": None,
+            "relative_strength": None,
+            "order_blocks": None,
+            "fvg": None,
+            "volume_profile": None,
+        }
+
+# =========================================================
 # COMBINED UI RENDERER FOR STREAMLIT TABS
 # =========================================================
 def render_institutional_dashboard(df, symbol, benchmark_df, journal_df=None):
-    ms = detect_market_structure(df)
-    ls = detect_liquidity_sweep(df)
-    rs_score = calculate_relative_strength(df, benchmark_df)
-    ob = detect_order_blocks(df)
-    fvg = detect_fvg(df)
-    vp = calculate_volume_profile(df)
+    # Reuse the DataFrames already fetched by the main app. No file upload needed.
+    diagnostics = collect_institutional_diagnostics(df, benchmark_df)
+    if not diagnostics.get("available"):
+        st.warning(diagnostics.get("message", "Institutional diagnostics unavailable"))
+        return
+
+    ms = diagnostics["market_structure"]
+    ls = diagnostics["liquidity"]
+    rs_score = diagnostics["relative_strength"]
+    ob = diagnostics["order_blocks"]
+    fvg = diagnostics["fvg"]
+    vp = diagnostics["volume_profile"]
     ml = predict_trade_probability(df)
     
     if ls["block_entry"]:
@@ -304,10 +354,12 @@ def render_institutional_dashboard(df, symbol, benchmark_df, journal_df=None):
     with tabs[0]:
         st.subheader("Market Structure")
         st.write(f"Structure: **{ms['structure']}**")
+        st.metric("Diagnostic structure score", ms.get("score", 0))
         st.write(f"HH: {ms['last_hh']} | HL: {ms['last_hl']} | LH: {ms['last_lh']} | LL: {ms['last_ll']}")
     with tabs[1]:
         st.subheader("Liquidity Sweep")
         st.write(f"Risk Level: **{ls['risk']}** | Block Status: **{ls['block_entry']}**")
+        st.metric("Diagnostic liquidity score", ls.get("score", 0))
     with tabs[2]:
         st.subheader("Sector Performance")
         sec_df, n_perf = get_sector_performance()
@@ -316,6 +368,7 @@ def render_institutional_dashboard(df, symbol, benchmark_df, journal_df=None):
     with tabs[3]:
         st.subheader("Relative Strength Score")
         st.metric(f"RS Score vs Nifty ({symbol})", rs_score)
+        st.caption("Relative-strength diagnostic scale: 0–10; neutral reference = 5. This display does not alter the main app's live decision score.")
     with tabs[4]:
         st.subheader("OI Analysis")
         p_chg = df["Close"].iloc[-1] - df["Close"].iloc[-2]
@@ -324,13 +377,16 @@ def render_institutional_dashboard(df, symbol, benchmark_df, journal_df=None):
     with tabs[5]:
         st.subheader("Order Blocks Zone")
         st.write(f"Retest: {ob['retest']} | Bullish OB: {ob['bullish_ob']} | Bearish OB: {ob['bearish_ob']}")
+        st.metric("Diagnostic Order Block score", ob.get("score", 0))
     with tabs[6]:
         st.subheader("Fair Value Gap (FVG)")
         st.write(f"Retest: {fvg['retest']} | Bullish FVG: {fvg['bullish_fvg']} | Bearish FVG: {fvg['bearish_fvg']}")
+        st.metric("Diagnostic FVG score", fvg.get("score", 0))
     with tabs[7]:
         st.subheader("Volume Profile")
         st.metric("Point of Control (POC)", vp["poc"])
         st.write(f"VAH: {vp['vah']} | VAL: {vp['val']}")
+        st.metric("Diagnostic Volume Profile score", vp.get("score", 0))
     with tabs[8]:
         st.subheader("ML Signal Prediction")
         st.write(f"Predicted Signal: **{ml['signal']}** | Win Probability: **{ml['probability']}%**")
