@@ -110,7 +110,7 @@ def detect_liquidity_sweep(df):
             "type": "BUY_SIDE_SWEEP" if buy_side_sweep else "SELL_SIDE_SWEEP" if sell_side_sweep else "STOP_HUNT",
             "risk": risk, "block_entry": True, "score": -5
         }
-    return {"sweep_detected": False, "type": "NONE", "risk": "LOW", "block_entry": False, "score": 15}
+    return {"sweep_detected": False, "type": "NONE", "risk": "LOW", "block_entry": False, "score": 0}
 
 # =========================================================
 # 3. SECTOR STRENGTH TRACKER
