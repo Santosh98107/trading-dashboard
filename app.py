@@ -6212,7 +6212,10 @@ with mac3:
     st.metric("MACD Histogram", round(float(analysis["macd_hist"]), 4))
 with mac4:
     st.metric("Candle Pattern Score", analysis["candle_pattern_score"])
-
+# DEBUG
+st.write("Institutional Score =", analysis.get("institutional_score", "N/A"))
+st.write("Bullish =", analysis["bullish_score"])
+st.write("Bearish =", analysis["bearish_score"])
 score1, score2, score3, score4 = st.columns(4)
 with score1:
     st.metric("Bullish Score", analysis["bullish_score"])
