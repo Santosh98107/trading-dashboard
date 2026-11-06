@@ -3293,7 +3293,12 @@ def analyze_signal(
             institutional_score += (rs - 5) * 2
     
         institutional_score = max(min(institutional_score, 25), -25)
-    
+        st.write("MS =", ms)
+        st.write("LS =", ls)
+        st.write("OB =", ob)
+        st.write("FVG =", fvg)
+        st.write("VP =", vp)
+        st.write("RS =", rs)
         if institutional_score > 0:
             bullish += institutional_score
             reasons.append(
