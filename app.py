@@ -3245,169 +3245,20 @@ def analyze_signal(
     selected_side = None
     
     
-    # ==========================================
-    # INSTITUTIONAL CONFLUENCE SCORING
-    # ==========================================
-            
+    # Institutional analytics are diagnostics-only. They are deliberately
+    # excluded from bullish/bearish totals, candidate eligibility and blockers.
+    # This keeps these annotations from changing the existing signal outcome.
+    institutional_diagnostics = {}
     try:
-    
-        market_structure = inst.detect_market_structure(df)
-    
-        if market_structure.get("score", 0) > 0:
-    
-            bullish += abs(
-                market_structure.get("score", 0)
-            )
-    
-            reasons.append(
-                "Bullish BOS/CHOCH"
-            )
-    
-        elif market_structure.get("score", 0) < 0:
-    
-            bearish += abs(
-                market_structure.get("score", 0)
-            )
-    
-            reasons.append(
-                "Bearish BOS/CHOCH"
-            )
-    
-    except Exception as e:
-    
-        st.error(
-            f"INSTITUTIONAL ERROR: {e}"
+        institutional_diagnostics = inst.build_institutional_diagnostics(
+            df, benchmark_df=None
         )
-    # Liquidity Sweep
-    
-    liquidity = inst.detect_liquidity_sweep(df)
-    
-    if liquidity.get("score", 0) > 0:
-    
-        bullish += abs(
-            liquidity.get("score", 0)
-        )
-    
-        reasons.append(
-            "Bullish Liquidity Sweep"
-        )
-    
-    elif liquidity.get("score", 0) < 0:
-    
-        bearish += abs(
-            liquidity.get("score", 0)
-        )
-    
-        reasons.append(
-            "Bearish Liquidity Sweep"
-        )    
-        if liquidity.get("block_entry"):
-    
-            selected_blockers.append(
-                f"Liquidity Sweep Active: {liquidity.get('type','Unknown')}"
-            )
-        # Order Blocks
-    
-        order_blocks = inst.detect_order_blocks(df)
-        
-        if order_blocks.get("bullish_ob"):
-        
-            bullish += 5
-        
-            reasons.append(
-                "Bullish Order Block"
-            )
-        
-        if order_blocks.get("bearish_ob"):
-        
-            bearish += 5
-        
-            reasons.append(
-                "Bearish Order Block"
-            )
-            
-        # Fair Value Gap
-    
-        fvg = inst.detect_fvg(df)
-        
+    except Exception as institutional_error:
+        institutional_diagnostics = {
+            "error": str(institutional_error),
+            "status": "UNAVAILABLE",
+        }
 
-        if fvg.get("bullish_fvg"):
-        
-            bullish += 5
-        
-            reasons.append(
-                "Bullish FVG"
-            )
-        
-        if fvg.get("bearish_fvg"):
-        
-            bearish += 5
-        
-            reasons.append(
-                "Bearish FVG"
-            )            
-        # Volume Profile
-    
-        volume_profile = inst.calculate_volume_profile(df)
-        
-        if volume_profile.get("score", 0) > 0:
-        
-            bullish += abs(
-                volume_profile.get("score", 0)
-            )
-        
-            reasons.append(
-                "Bullish Volume Profile"
-            )
-        
-        elif volume_profile.get("score", 0) < 0:
-        
-            bearish += abs(
-                volume_profile.get("score", 0)
-            )
-        
-            reasons.append(
-                "Bearish Volume Profile"
-            )
-            
-        # Relative Strength
-    
-        
-    
-            benchmark_df = fetch_data(
-                "^NSEI",
-                interval="1d",
-                period="1mo"
-            )
-    
-            rs_score = inst.calculate_relative_strength(
-                df,
-                benchmark_df
-            )
-    
-            if rs_score > 1.5:
-    
-                bullish += 10
-    
-                reasons.append(
-                    "Strong Relative Strength (+10)"
-                )
-    
-            elif rs_score < -1.5:
-    
-                bearish += 10
-    
-                reasons.append(
-                    "Weak Relative Strength (+10)"
-                )
-    
-        
-    
-                
-      
-    
-    
-    
     if buy_allowed and (not sell_allowed or bullish - bearish >= bearish - bullish):
         selected_side = "BUY"
     elif sell_allowed:
@@ -7146,10 +6997,12 @@ with st.expander("📚 Educational Market Learning Lab — descriptive analysis 
                 st.error(f"AI Trainer could not complete: {e}")
             
 
+            # Aapki existing script jahan stream render karti hai:
+            inst.render_institutional_dashboard(data, selected, fetch_data("^NSEI", "1d", "30d"), load_journal())
             # Institutional Upgrades Dashboard Integration
-            # Render once only; reuse the single benchmark fetch to avoid duplicate
-            # network requests and duplicate Streamlit output on every rerun.
             st.divider()
             st.header("Institutional Upgrades & Advanced Analytics Suite")
+            
+            # Benchmark data fetch karke dashboard render karein
             nifty_bm = fetch_data("^NSEI", "1d", "30d")
             inst.render_institutional_dashboard(data, selected, nifty_bm, load_journal())
