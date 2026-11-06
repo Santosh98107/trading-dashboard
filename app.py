@@ -6217,6 +6217,19 @@ with top1:
     st.metric("Current Price", round(current_display_price, 2))
 with top2:
     st.metric("Signal", analysis["signal_text"])
+
+    if analysis.get("ai_override_applied"):
+        st.info(
+            f"""
+🧠 AI Learning Engine
+
+Similar Trades: {analysis.get('similar_trades_found',0)}
+
+Historical Win Rate: {analysis.get('historical_win_rate','N/A')}%
+
+Historical Loss Rate: {analysis.get('historical_loss_rate','N/A')}%
+"""
+        )    
 with top3:
     st.metric("Backtest Win Rate", f"{analysis['win_chance']:.1f}%" if analysis.get("win_chance") is not None else "N/A")
 with top4:
