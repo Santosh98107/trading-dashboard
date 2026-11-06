@@ -3097,10 +3097,21 @@ def analyze_signal(
         candle_pattern_score = int(num(latest, "CandlePatternScore", 0))
     except Exception:
         candle_pattern_score = 0
-    if candle_pattern_score > 0 or candle_bias == "Bullish":
-        bullish += 1; reasons.append(f"Bullish candle pattern: {candle_pattern} (+1)")
-    elif candle_pattern_score < 0 or candle_bias == "Bearish":
-        bearish += 1; reasons.append(f"Bearish candle pattern: {candle_pattern} (+1)")
+    if candle_pattern_score > 0:
+        pattern_weight = min(abs(candle_pattern_score), 3)
+    
+        bullish += pattern_weight
+        reasons.append(
+            f"Bullish candle pattern: {candle_pattern} (+{pattern_weight})"
+        )
+    
+    elif candle_pattern_score < 0:
+        pattern_weight = min(abs(candle_pattern_score), 3)
+    
+        bearish += pattern_weight
+        reasons.append(
+            f"Bearish candle pattern: {candle_pattern} (+{pattern_weight})"
+        )
     if ha_trend_up:
         bullish += 1; reasons.append("Two-candle Heikin-Ashi bullish trend (+1)")
     elif ha_trend_down:
