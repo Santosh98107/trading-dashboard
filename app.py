@@ -7146,12 +7146,10 @@ with st.expander("📚 Educational Market Learning Lab — descriptive analysis 
                 st.error(f"AI Trainer could not complete: {e}")
             
 
-            # Aapki existing script jahan stream render karti hai:
-            inst.render_institutional_dashboard(data, selected, fetch_data("^NSEI", "1d", "30d"), load_journal())
             # Institutional Upgrades Dashboard Integration
+            # Render once only; reuse the single benchmark fetch to avoid duplicate
+            # network requests and duplicate Streamlit output on every rerun.
             st.divider()
             st.header("Institutional Upgrades & Advanced Analytics Suite")
-            
-            # Benchmark data fetch karke dashboard render karein
             nifty_bm = fetch_data("^NSEI", "1d", "30d")
             inst.render_institutional_dashboard(data, selected, nifty_bm, load_journal())
