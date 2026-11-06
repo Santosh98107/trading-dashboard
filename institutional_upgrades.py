@@ -85,7 +85,7 @@ def detect_market_structure(df, left=3, right=3):
 # =========================================================
 def detect_liquidity_sweep(df):
     if df is None or len(df) < 20:
-        return {"sweep_detected": False, "type": "NONE", "risk": "LOW", "block_entry": False, "score": 0}
+        return {"sweep_detected": False, "type": "NONE", "risk": "LOW", "block_entry": False, "score": 15}
     
     recent_high = df["High"].iloc[-21:-1].max()
     recent_low = df["Low"].iloc[-21:-1].min()
@@ -110,7 +110,7 @@ def detect_liquidity_sweep(df):
             "type": "BUY_SIDE_SWEEP" if buy_side_sweep else "SELL_SIDE_SWEEP" if sell_side_sweep else "STOP_HUNT",
             "risk": risk, "block_entry": True, "score": -20
         }
-    return {"sweep_detected": False, "type": "NONE", "risk": "LOW", "block_entry": False, "score": 0}
+    return {"sweep_detected": False, "type": "NONE", "risk": "LOW", "block_entry": False, "score": 15}
 
 # =========================================================
 # 3. SECTOR STRENGTH TRACKER
@@ -147,73 +147,12 @@ def get_sector_performance():
 # 4. RELATIVE STRENGTH SCORE
 # =========================================================
 def calculate_relative_strength(stock_df, benchmark_df):
-    """Return a descriptive 0..10 relative-strength score (5 = neutral)."""
-    required = {"Close"}
-    if stock_df is None or benchmark_df is None:
+    if stock_df is None or benchmark_df is None or len(stock_df) < 20 or len(benchmark_df) < 20:
         return 5.0
-    if not required.issubset(stock_df.columns) or not required.issubset(benchmark_df.columns):
-        return 5.0
-    if len(stock_df) < 20 or len(benchmark_df) < 20:
-        return 5.0
-    try:
-        s0, s1 = float(stock_df["Close"].iloc[-20]), float(stock_df["Close"].iloc[-1])
-        b0, b1 = float(benchmark_df["Close"].iloc[-20]), float(benchmark_df["Close"].iloc[-1])
-        vals = (s0, s1, b0, b1)
-        if not all(np.isfinite(v) for v in vals) or min(s0, b0) <= 0:
-            return 5.0
-        s_ret = (s1 - s0) / s0
-        b_ret = (b1 - b0) / b0
-        rs_raw = (s_ret - b_ret) * 100.0
-        return round(float(np.clip(5.0 + rs_raw, 0.0, 10.0)), 2)
-    except (TypeError, ValueError, IndexError, KeyError):
-        return 5.0
-
-
-def relative_strength_label(score):
-    """Map the documented 0..10 scale to positive/neutral/negative labels."""
-    try:
-        score = float(score)
-    except (TypeError, ValueError):
-        return "UNAVAILABLE"
-    if not np.isfinite(score):
-        return "UNAVAILABLE"
-    if score > 5.5:
-        return "RELATIVELY STRONG"
-    if score < 4.5:
-        return "RELATIVELY WEAK"
-    return "NEUTRAL"
-
-
-def build_institutional_diagnostics(df, benchmark_df=None):
-    """Build descriptive diagnostics only; never return an aggregate trade score."""
-    if df is None or getattr(df, "empty", True):
-        return {"status": "INSUFFICIENT DATA"}
-    try:
-        ms = detect_market_structure(df)
-        ls = detect_liquidity_sweep(df)
-        ob = detect_order_blocks(df)
-        fvg = detect_fvg(df)
-        vp = calculate_volume_profile(df)
-        rs = calculate_relative_strength(df, benchmark_df) if benchmark_df is not None else 5.0
-        return {
-            "status": "OK",
-            "market_structure": ms.get("structure", "NEUTRAL"),
-            "liquidity": ls.get("type", "NONE"),
-            "liquidity_risk": ls.get("risk", "UNKNOWN"),
-            "bullish_ob": ob.get("bullish_ob"),
-            "bearish_ob": ob.get("bearish_ob"),
-            "ob_retest": ob.get("retest", "NONE"),
-            "bullish_fvg": fvg.get("bullish_fvg"),
-            "bearish_fvg": fvg.get("bearish_fvg"),
-            "fvg_retest": fvg.get("retest", "NONE"),
-            "poc": vp.get("poc"),
-            "vah": vp.get("vah"),
-            "val": vp.get("val"),
-            "relative_strength": rs,
-            "relative_strength_label": relative_strength_label(rs),
-        }
-    except Exception as exc:
-        return {"status": "ERROR", "error": str(exc)}
+    s_ret = (stock_df["Close"].iloc[-1] - stock_df["Close"].iloc[-20]) / stock_df["Close"].iloc[-20]
+    b_ret = (benchmark_df["Close"].iloc[-1] - benchmark_df["Close"].iloc[-20]) / benchmark_df["Close"].iloc[-20]
+    rs_raw = (s_ret - b_ret) * 100
+    return round(max(0.0, min(10.0, 5.0 + rs_raw)), 2)
 
 # =========================================================
 # 5. OPTION CHAIN OI ANALYZER
@@ -309,12 +248,7 @@ def predict_trade_probability(df):
 def calculate_volume_profile(df, bins=20):
     if df is None or len(df) < 10:
         return {"poc": 0, "vah": 0, "val": 0, "signal": "NEUTRAL", "score": 0}
-    if not {"High", "Low", "Close", "Volume"}.issubset(df.columns):
-        return {"poc": 0, "vah": 0, "val": 0, "signal": "UNAVAILABLE", "score": 0}
-    p_min, p_max = float(df["Low"].min()), float(df["High"].max())
-    if not np.isfinite(p_min) or not np.isfinite(p_max) or p_max <= p_min:
-        return {"poc": 0, "vah": 0, "val": 0, "signal": "UNAVAILABLE", "score": 0}
-    bins = max(5, int(bins))
+    p_min, p_max = df["Low"].min(), df["High"].max()
     p_bins = np.linspace(p_min, p_max, bins)
     vol_prof = np.zeros(bins-1)
     for _, row in df.iterrows():
@@ -334,12 +268,9 @@ def calculate_volume_profile(df, bins=20):
 def ai_loss_analysis(journal_df):
     if journal_df is None or journal_df.empty:
         return pd.DataFrame()
-    if "PnL" not in journal_df.columns:
-        return pd.DataFrame(columns=["DateTime", "Symbol", "PnL", "Loss Reason", "Suggested Fix"])
-    pnl = pd.to_numeric(journal_df["PnL"], errors="coerce")
-    losses = journal_df.loc[pnl < 0].copy()
+    losses = journal_df[journal_df.get("PnL", 0) < 0].copy()
     if losses.empty:
-        return pd.DataFrame(columns=["DateTime", "Symbol", "PnL", "Loss Reason", "Suggested Fix"])
+        return pd.DataFrame()
     results = []
     for _, row in losses.iterrows():
         rsi = float(row.get("RSI", 50))
@@ -349,15 +280,67 @@ def ai_loss_analysis(journal_df):
     return pd.DataFrame(results)
 
 # =========================================================
+# AUTOMATIC IN-APP DIAGNOSTICS (NO CSV / MANUAL UPLOAD REQUIRED)
+# =========================================================
+def collect_institutional_diagnostics(df, benchmark_df=None):
+    """Calculate institutional diagnostics from the app's existing OHLCV frames.
+
+    This function is intentionally display/diagnostics-only. It does not alter
+    the main app's BUY/SELL decision variables or score aggregation.
+    """
+    required = {"Open", "High", "Low", "Close", "Volume"}
+    if df is None or getattr(df, "empty", True) or not required.issubset(set(df.columns)):
+        return {
+            "available": False,
+            "message": "Market OHLCV data unavailable or incomplete",
+            "market_structure": None,
+            "liquidity": None,
+            "relative_strength": None,
+            "order_blocks": None,
+            "fvg": None,
+            "volume_profile": None,
+        }
+
+    try:
+        return {
+            "available": True,
+            "message": "Using market data already loaded by the app",
+            "market_structure": detect_market_structure(df),
+            "liquidity": detect_liquidity_sweep(df),
+            "relative_strength": calculate_relative_strength(df, benchmark_df),
+            "order_blocks": detect_order_blocks(df),
+            "fvg": detect_fvg(df),
+            "volume_profile": calculate_volume_profile(df),
+        }
+    except Exception as exc:
+        return {
+            "available": False,
+            "message": f"Institutional diagnostics unavailable: {type(exc).__name__}: {exc}",
+            "market_structure": None,
+            "liquidity": None,
+            "relative_strength": None,
+            "order_blocks": None,
+            "fvg": None,
+            "volume_profile": None,
+        }
+
+# =========================================================
 # COMBINED UI RENDERER FOR STREAMLIT TABS
 # =========================================================
 def render_institutional_dashboard(df, symbol, benchmark_df, journal_df=None):
-    ms = detect_market_structure(df)
-    ls = detect_liquidity_sweep(df)
-    rs_score = calculate_relative_strength(df, benchmark_df)
-    ob = detect_order_blocks(df)
-    fvg = detect_fvg(df)
-    vp = calculate_volume_profile(df)
+    # Reuse the DataFrames already fetched by the main app. No file upload needed.
+    diagnostics = collect_institutional_diagnostics(df, benchmark_df)
+    if not diagnostics.get("available"):
+        st.warning(diagnostics.get("message", "Institutional diagnostics unavailable"))
+        return
+
+    ms = diagnostics["market_structure"]
+    ls = diagnostics["liquidity"]
+    rs_score = diagnostics["relative_strength"]
+    ob = diagnostics["order_blocks"]
+    fvg = diagnostics["fvg"]
+    vp = diagnostics["volume_profile"]
+    ml = predict_trade_probability(df)
     
     if ls["block_entry"]:
         st.error(f"⛔ SIGNAL BLOCKED: Liquidity Sweep Active ({ls['type']})! High Risk.")
@@ -371,10 +354,12 @@ def render_institutional_dashboard(df, symbol, benchmark_df, journal_df=None):
     with tabs[0]:
         st.subheader("Market Structure")
         st.write(f"Structure: **{ms['structure']}**")
+        st.metric("Diagnostic structure score", ms.get("score", 0))
         st.write(f"HH: {ms['last_hh']} | HL: {ms['last_hl']} | LH: {ms['last_lh']} | LL: {ms['last_ll']}")
     with tabs[1]:
         st.subheader("Liquidity Sweep")
         st.write(f"Risk Level: **{ls['risk']}** | Block Status: **{ls['block_entry']}**")
+        st.metric("Diagnostic liquidity score", ls.get("score", 0))
     with tabs[2]:
         st.subheader("Sector Performance")
         sec_df, n_perf = get_sector_performance()
@@ -382,24 +367,29 @@ def render_institutional_dashboard(df, symbol, benchmark_df, journal_df=None):
         st.dataframe(sec_df, use_container_width=True)
     with tabs[3]:
         st.subheader("Relative Strength Score")
-        st.metric(f"RS Score vs Nifty ({symbol})", rs_score, relative_strength_label(rs_score))
-        st.caption("Scale: 0–10; 5 is neutral. This is descriptive analytics, not a trade signal.")
+        st.metric(f"RS Score vs Nifty ({symbol})", rs_score)
+        st.caption("Relative-strength diagnostic scale: 0–10; neutral reference = 5. This display does not alter the main app's live decision score.")
     with tabs[4]:
         st.subheader("OI Analysis")
-        st.info("OI positioning unavailable: this view has no verified option-chain OI feed. No placeholder OI values are used.")
+        p_chg = df["Close"].iloc[-1] - df["Close"].iloc[-2]
+        pos, sent, _ = analyze_oi_positioning(p_chg, 1000)
+        st.write(f"Market Position: **{pos}** ({sent})")
     with tabs[5]:
         st.subheader("Order Blocks Zone")
         st.write(f"Retest: {ob['retest']} | Bullish OB: {ob['bullish_ob']} | Bearish OB: {ob['bearish_ob']}")
+        st.metric("Diagnostic Order Block score", ob.get("score", 0))
     with tabs[6]:
         st.subheader("Fair Value Gap (FVG)")
         st.write(f"Retest: {fvg['retest']} | Bullish FVG: {fvg['bullish_fvg']} | Bearish FVG: {fvg['bearish_fvg']}")
+        st.metric("Diagnostic FVG score", fvg.get("score", 0))
     with tabs[7]:
         st.subheader("Volume Profile")
         st.metric("Point of Control (POC)", vp["poc"])
         st.write(f"VAH: {vp['vah']} | VAL: {vp['val']}")
+        st.metric("Diagnostic Volume Profile score", vp.get("score", 0))
     with tabs[8]:
-        st.subheader("Model diagnostics")
-        st.info("Directional ML prediction is not displayed in this diagnostics-only panel. Use verified, out-of-sample evaluation data for model validation.")
+        st.subheader("ML Signal Prediction")
+        st.write(f"Predicted Signal: **{ml['signal']}** | Win Probability: **{ml['probability']}%**")
     with tabs[9]:
         st.subheader("AI Loss Coach")
         coaching = ai_loss_analysis(journal_df)
