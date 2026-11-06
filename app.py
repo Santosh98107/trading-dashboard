@@ -3269,7 +3269,7 @@ def analyze_signal(
     
     try:
         inst_diag = institutional_diagnostics
-    
+        st.write("Institutional Diagnostics =", institutional_diagnostics)
         institutional_score = 0
     
         ms = inst_diag.get("market_structure", {})
