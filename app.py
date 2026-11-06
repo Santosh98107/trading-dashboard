@@ -3250,7 +3250,7 @@ def analyze_signal(
     # This keeps these annotations from changing the existing signal outcome.
     institutional_diagnostics = {}
     try:
-        institutional_diagnostics = inst.build_institutional_diagnostics(
+        institutional_diagnostics = inst.collect_institutional_diagnostics(
             df, benchmark_df=None
         )
     except Exception as institutional_error:
