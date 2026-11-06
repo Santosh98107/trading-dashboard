@@ -56,17 +56,17 @@ def detect_market_structure(df, left=3, right=3):
     if last_h and current_close > last_h:
         bos = True
         structure = "HH-HL Bullish (BOS)"
-        score = 20
+        score = 5
     elif last_l and current_close < last_l:
         bos = True
         structure = "LH-LL Bearish (BOS)"
-        score = -20
+        score = -5
     elif hh and hl:
         structure = "HH-HL Bullish"
-        score = 15
+        score = 3
     elif lh and ll:
         structure = "LH-LL Bearish"
-        score = -15
+        score = -3
 
     ema9 = df["EMA9"].iloc[-1] if "EMA9" in df.columns else current_close
     ema21 = df["EMA21"].iloc[-1] if "EMA21" in df.columns else current_close
@@ -85,7 +85,7 @@ def detect_market_structure(df, left=3, right=3):
 # =========================================================
 def detect_liquidity_sweep(df):
     if df is None or len(df) < 20:
-        return {"sweep_detected": False, "type": "NONE", "risk": "LOW", "block_entry": False, "score": 15}
+        return {"sweep_detected": False, "type": "NONE", "risk": "LOW", "block_entry": False, "score": 0}
     
     recent_high = df["High"].iloc[-21:-1].max()
     recent_low = df["Low"].iloc[-21:-1].min()
@@ -108,7 +108,7 @@ def detect_liquidity_sweep(df):
         return {
             "sweep_detected": True,
             "type": "BUY_SIDE_SWEEP" if buy_side_sweep else "SELL_SIDE_SWEEP" if sell_side_sweep else "STOP_HUNT",
-            "risk": risk, "block_entry": True, "score": -20
+            "risk": risk, "block_entry": True, "score": -5
         }
     return {"sweep_detected": False, "type": "NONE", "risk": "LOW", "block_entry": False, "score": 15}
 
