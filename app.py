@@ -3263,7 +3263,51 @@ def analyze_signal(
         selected_side = "BUY"
     elif sell_allowed:
         selected_side = "SELL"
-
+    # ==========================================
+    # INSTITUTIONAL MASTER AGGREGATOR
+    # ==========================================
+    
+    try:
+        inst_diag = institutional_diagnostics
+    
+        institutional_score = 0
+    
+        ms = inst_diag.get("market_structure", {})
+        institutional_score += float(ms.get("score", 0))
+    
+        ls = inst_diag.get("liquidity", {})
+        institutional_score += float(ls.get("score", 0))
+    
+        ob = inst_diag.get("order_blocks", {})
+        institutional_score += float(ob.get("score", 0))
+    
+        fvg = inst_diag.get("fvg", {})
+        institutional_score += float(fvg.get("score", 0))
+    
+        vp = inst_diag.get("volume_profile", {})
+        institutional_score += float(vp.get("score", 0))
+    
+        rs = inst_diag.get("relative_strength", 5)
+    
+        if isinstance(rs, (int, float)):
+            institutional_score += (rs - 5) * 2
+    
+        institutional_score = max(min(institutional_score, 25), -25)
+    
+        if institutional_score > 0:
+            bullish += institutional_score
+            reasons.append(
+                f"Institutional Confirmation (+{round(institutional_score,2)})"
+            )
+    
+        elif institutional_score < 0:
+            bearish += abs(institutional_score)
+            reasons.append(
+                f"Institutional Bearish Confirmation ({round(institutional_score,2)})"
+            )
+    
+    except Exception:
+        pass
     if selected_side:
         risk = max(atr, close_price * 0.001, 0.01)
         if selected_side == "BUY":
