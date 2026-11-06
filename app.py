@@ -3366,6 +3366,17 @@ def analyze_signal(
     validation_score += 5 if atr > 0 else 0
     validation_score = int(max(0, min(100, validation_score)))
     strategy_grade = classify_strategy_grade(validation_score) if signal_type != "neutral" else "NO SETUP"
+    # =====================================================
+    # HARD VALIDATION FILTER
+    # =====================================================
+    
+    if signal_type != "neutral" and validation_score < 60:
+        signal_text = "NO TRADE"
+        signal_type = "neutral"
+        strategy_grade = "FAILED VALIDATION"
+        selected_blockers.append(
+            f"Validation Score Too Low ({validation_score}/100)"
+        )
     trade_quality_score = int(round(0.65 * validation_score + 0.35 * (confidence or 0))) if signal_type != "neutral" else 0
 
     no_trade_zone = candidate_no_trade_zone
