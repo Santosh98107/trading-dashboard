@@ -3409,7 +3409,7 @@ def analyze_signal(
         "target2": target2, "target3": target3, "trailing_stop": trailing_stop,
         "rr_ratio": rr_ratio, "reasons": reasons, "no_trade_reason": no_trade_reason,
         "no_trade_reasons": selected_blockers, "bullish_score": round(bullish, 1),
-        "bearish_score": round(bearish, 1), "directional_bias": directional_bias,
+        "bearish_score": round(bearish, 1),"institutional_score": round(institutional_score, 1), "directional_bias": directional_bias,
         "directional_edge": round(directional_edge, 1), "session_message": session_info["message"],
         "supertrend_direction": supertrend_dir, "ha_bullish": ha_bullish, "ha_bearish": ha_bearish,
         "ha_trend_up": ha_trend_up, "ha_trend_down": ha_trend_down,
