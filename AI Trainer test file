@@ -1,0 +1,59 @@
+"""Focused tests for the explainable AI Backtest Trainer helpers in app.py."""
+import ast
+from pathlib import Path
+import numpy as np
+import pandas as pd
+
+APP = Path(__file__).with_name("app.py")
+TREE = ast.parse(APP.read_text(encoding="utf-8"))
+TARGETS = {"_trainer_metrics", "analyze_backtest_for_training", "trainer_filter_allows"}
+MODULE = ast.Module(body=[node for node in TREE.body if isinstance(node, ast.FunctionDef) and node.name in TARGETS], type_ignores=[])
+NAMESPACE = {
+    "pd": pd,
+    "np": np,
+    "_safe_num": lambda value, default=np.nan: float(value) if value is not None and pd.notna(value) else default,
+}
+exec(compile(MODULE, str(APP), "exec"), NAMESPACE)
+
+
+def make_trades(count=60):
+    rows = []
+    for i in range(count):
+        adx = 25 if i % 2 == 0 else 10
+        pnl = (2.0 if adx >= 20 else -1.0) if i < int(count * .7) else (1.5 if adx >= 20 else -.8)
+        rows.append({"PnL": pnl, "Result": "WIN" if pnl > 0 else "LOSS",
+                     "Signal": "BUY" if i % 2 == 0 else "SELL", "ADX": adx,
+                     "RSI": 58 if i % 2 == 0 else 42})
+    return pd.DataFrame(rows)
+
+
+def test_trainer_sample_and_holdout():
+    result = NAMESPACE["analyze_backtest_for_training"](make_trades())
+    assert result["ready"] is True
+    assert result["baseline"]["trades"] == 60
+    assert result["holdout"]["split_train"] == 42
+    assert result["holdout"]["split_holdout"] == 18
+    assert not result["candidates"].empty
+
+
+def test_minimum_sample_gate():
+    result = NAMESPACE["analyze_backtest_for_training"](make_trades(20))
+    assert result["ready"] is False
+    assert result["best_candidate"] is None
+
+
+def test_approved_filter_only_gates_paper_eligibility():
+    fn = NAMESPACE["trainer_filter_allows"]
+    allowed, reason = fn({"signal_type": "buy", "adx": 12, "rsi": 58},
+                         {"approved": True, "rule": "ADX minimum", "threshold": 20})
+    assert allowed is False and "ADX" in reason
+    allowed, reason = fn({"signal_type": "buy", "adx": 25, "rsi": 58},
+                         {"approved": True, "rule": "ADX minimum", "threshold": 20})
+    assert allowed is True
+
+
+if __name__ == "__main__":
+    test_trainer_sample_and_holdout()
+    test_minimum_sample_gate()
+    test_approved_filter_only_gates_paper_eligibility()
+    print("PASS: AI trainer sample gate, chronological holdout, candidate search, and paper-only approval filter")
