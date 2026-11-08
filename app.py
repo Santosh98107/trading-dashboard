@@ -4,6 +4,8 @@ import math
 import shutil
 import hashlib
 import hmac
+import gzip
+from urllib.parse import quote, urlencode
 from datetime import datetime, timedelta, time, timezone
 import threading
 import time as pytime
@@ -16,7 +18,7 @@ import streamlit as st
 import yfinance as yf
 import institutional_upgrades as inst
 # Visible deployment marker: confirms which source file Streamlit Cloud is running.
-APP_BUILD_ID = "2026-11-04-LOSS-INTELLIGENCE-SIGNAL-V2-01"
+APP_BUILD_ID = "2026-11-08-UPSTOX-INSTITUTIONAL-INTEGRATION-01"
 # Optional integrations: Yahoo mode must still start if Angel SDK/TOTP or
 # the auto-refresh helper is not installed.
 try:
@@ -3182,6 +3184,33 @@ def analyze_signal(
     session_allowed = bool(session_info.get("valid", True))
     news_allowed = bool(news_info.get("allow_trade", True))
 
+    # INSTITUTIONAL CONFIRMATION IS PART OF THE MAIN DIRECTIONAL SCORE.
+    # Each component is computed from the same validated OHLCV frame. Missing
+    # diagnostics contribute zero; they never create synthetic bullish/bearish evidence.
+    institutional_diagnostics = {}
+    institutional_score = 0.0
+    try:
+        institutional_diagnostics = inst.collect_institutional_diagnostics(df, benchmark_df=None)
+        if isinstance(institutional_diagnostics, dict) and institutional_diagnostics.get("available", True):
+            for component in ("market_structure", "liquidity", "order_blocks", "fvg", "volume_profile"):
+                item = institutional_diagnostics.get(component, {})
+                if isinstance(item, dict):
+                    institutional_score += float(item.get("score", 0) or 0)
+            relative_strength = institutional_diagnostics.get("relative_strength", 5)
+            if isinstance(relative_strength, (int, float)) and np.isfinite(relative_strength):
+                institutional_score += (float(relative_strength) - 5.0) * 2.0
+            institutional_score = float(max(-8.0, min(8.0, institutional_score)))
+            if institutional_score > 0:
+                bullish += institutional_score
+                reasons.append(f"Institutional Confirmation (+{institutional_score:.1f})")
+            elif institutional_score < 0:
+                bearish += abs(institutional_score)
+                reasons.append(f"Institutional Bearish Confirmation ({abs(institutional_score):.1f})")
+    except Exception as institutional_error:
+        institutional_diagnostics = {"error": str(institutional_error), "status": "UNAVAILABLE"}
+        institutional_score = 0.0
+        reasons.append("Institutional diagnostics unavailable; no score applied")
+
     # Candidate direction requires both score advantage and price/trend structure.
     directional_edge = abs(bullish - bearish)
     directional_bias = "Bullish" if bullish > bearish else "Bearish" if bearish > bullish else "Neutral"
@@ -3254,71 +3283,11 @@ def analyze_signal(
     selected_blockers = []
     
     selected_side = None
-    
-    
-    # Institutional analytics are diagnostics-only. They are deliberately
-    # excluded from bullish/bearish totals, candidate eligibility and blockers.
-    # This keeps these annotations from changing the existing signal outcome.
-    institutional_diagnostics = {}
-    try:
-        institutional_diagnostics = inst.collect_institutional_diagnostics(
-            df, benchmark_df=None
-        )
-    except Exception as institutional_error:
-        institutional_diagnostics = {
-            "error": str(institutional_error),
-            "status": "UNAVAILABLE",
-        }
-
     if buy_allowed and (not sell_allowed or bullish - bearish >= bearish - bullish):
         selected_side = "BUY"
     elif sell_allowed:
         selected_side = "SELL"
-    # ==========================================
-    # INSTITUTIONAL MASTER AGGREGATOR
-    # ==========================================
-    
-    try:
-        inst_diag = institutional_diagnostics
-        
-        institutional_score = 0
-    
-        ms = inst_diag.get("market_structure", {})
-        institutional_score += float(ms.get("score", 0))
-    
-        ls = inst_diag.get("liquidity", {})
-        institutional_score += float(ls.get("score", 0))
-    
-        ob = inst_diag.get("order_blocks", {})
-        institutional_score += float(ob.get("score", 0))
-    
-        fvg = inst_diag.get("fvg", {})
-        institutional_score += float(fvg.get("score", 0))
-    
-        vp = inst_diag.get("volume_profile", {})
-        institutional_score += float(vp.get("score", 0))
-    
-        rs = inst_diag.get("relative_strength", 5)
-    
-        if isinstance(rs, (int, float)):
-            institutional_score += (rs - 5) * 2
-    
-        institutional_score = max(min(institutional_score, 8), -8)
 
-        if institutional_score > 0:
-            bullish += institutional_score
-            reasons.append(
-                f"Institutional Confirmation (+{round(institutional_score,2)})"
-            )
-    
-        elif institutional_score < 0:
-            bearish += abs(institutional_score)
-            reasons.append(
-                f"Institutional Bearish Confirmation ({round(institutional_score,2)})"
-            )
-    
-    except Exception:
-        pass
     if selected_side:
         risk = max(atr, close_price * 0.001, 0.01)
         if selected_side == "BUY":
@@ -5023,6 +4992,184 @@ def best_worst_time_of_day(backtest_trades_df):
 
 
 # =========================================================
+# UPSTOX MARKET-DATA PROVIDER (OAuth + V3 REST; no order placement)
+# =========================================================
+UPSTOX_API_BASE = "https://api.upstox.com"
+UPSTOX_INSTRUMENT_MASTER_URL = "https://assets.upstox.com/market-quote/instruments/exchange/complete.json.gz"
+
+
+def upstox_exchange_authorization_code(client_id, client_secret, redirect_uri, auth_code):
+    """Exchange a single-use Upstox OAuth authorization code for a session token."""
+    payload = {
+        "code": str(auth_code or "").strip(),
+        "client_id": str(client_id or "").strip(),
+        "client_secret": str(client_secret or "").strip(),
+        "redirect_uri": str(redirect_uri or "").strip(),
+        "grant_type": "authorization_code",
+    }
+    if not all(payload.values()):
+        return None, "Client ID, Client Secret, Redirect URI and authorization code are required."
+    try:
+        response = requests.post(
+            f"{UPSTOX_API_BASE}/v2/login/authorization/token",
+            headers={"accept": "application/json", "Content-Type": "application/x-www-form-urlencoded"},
+            data=payload, timeout=15,
+        )
+        body = response.json() if response.content else {}
+        if response.status_code != 200 or not body.get("access_token"):
+            message = body.get("errors") or body.get("message") or f"HTTP {response.status_code}"
+            return None, f"Upstox token exchange failed: {message}"
+        return str(body["access_token"]), "Upstox authorization successful. Token is held in this app session only."
+    except Exception as exc:
+        return None, f"Upstox authorization request failed: {type(exc).__name__}: {exc}"
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_upstox_instrument_master():
+    """Load Upstox's official daily BOD JSON instrument master; no manual upload."""
+    response = requests.get(UPSTOX_INSTRUMENT_MASTER_URL, timeout=25)
+    response.raise_for_status()
+    raw = response.content
+    if raw[:2] == bytes((0x1f, 0x8b)):
+        raw = gzip.decompress(raw)
+    rows = json.loads(raw.decode("utf-8"))
+    if not isinstance(rows, list) or not rows:
+        raise ValueError("Upstox instrument master was empty or had an unexpected format")
+    return rows
+
+
+def resolve_upstox_instrument_key(symbol_name):
+    """Resolve selected dashboard symbol against Upstox instrument_key master."""
+    symbol = str(symbol_name or "").strip().upper()
+    index_aliases = {
+        "NIFTY": ("NSE_INDEX", {"NIFTY 50", "NIFTY"}),
+        "BANKNIFTY": ("NSE_INDEX", {"NIFTY BANK", "BANK NIFTY"}),
+        "SENSEX": ("BSE_INDEX", {"SENSEX", "S&P BSE SENSEX"}),
+    }
+    try:
+        rows = fetch_upstox_instrument_master()
+        if symbol in index_aliases:
+            segment, aliases = index_aliases[symbol]
+            for row in rows:
+                if str(row.get("segment", "")).upper() == segment and str(row.get("instrument_type", "")).upper() == "INDEX":
+                    candidates = {str(row.get(k, "")).strip().upper() for k in ("trading_symbol", "short_name", "name")}
+                    if candidates & aliases:
+                        return str(row.get("instrument_key") or "") or None
+        else:
+            for row in rows:
+                if (str(row.get("segment", "")).upper() == "NSE_EQ"
+                        and str(row.get("instrument_type", "")).upper() == "EQ"
+                        and str(row.get("trading_symbol", "")).strip().upper() == symbol):
+                    return str(row.get("instrument_key") or "") or None
+    except Exception as exc:
+        log_app_error("upstox_instrument_master", f"{type(exc).__name__}: {exc}")
+    return None
+
+
+def upstox_headers(access_token):
+    return {"Accept": "application/json", "Content-Type": "application/json",
+            "Authorization": f"Bearer {str(access_token or '').strip()}"}
+
+
+def _upstox_candles_to_frame(candles):
+    """Normalize Upstox V3 candle arrays into the dashboard's OHLCV schema."""
+    if not candles:
+        return pd.DataFrame()
+    frame = pd.DataFrame(candles)
+    if frame.shape[1] < 6:
+        return pd.DataFrame()
+    frame = frame.iloc[:, :7]
+    frame.columns = ["Datetime", "Open", "High", "Low", "Close", "Volume", "OpenInterest"][:frame.shape[1]]
+    frame["Datetime"] = pd.to_datetime(frame["Datetime"], errors="coerce")
+    if getattr(frame["Datetime"].dt, "tz", None) is not None:
+        frame["Datetime"] = frame["Datetime"].dt.tz_convert("Asia/Kolkata").dt.tz_localize(None)
+    frame = frame.dropna(subset=["Datetime"]).set_index("Datetime").sort_index()
+    for col in ("Open", "High", "Low", "Close", "Volume"):
+        frame[col] = pd.to_numeric(frame[col], errors="coerce")
+    frame = frame.dropna(subset=["Open", "High", "Low", "Close"])
+    frame["Volume"] = frame["Volume"].fillna(0)
+    if "OpenInterest" in frame.columns:
+        frame["OpenInterest"] = pd.to_numeric(frame["OpenInterest"], errors="coerce")
+    return frame[~frame.index.duplicated(keep="last")]
+
+
+def fetch_upstox_candles(access_token, instrument_key, timeframe):
+    """Fetch prior history plus today's candles using Upstox Historical/Intraday V3."""
+    if not str(access_token or "").strip() or not str(instrument_key or "").strip():
+        return pd.DataFrame()
+    tf = str(timeframe).lower()
+    if tf in ("1m", "3m", "5m", "10m", "15m", "30m"):
+        unit, interval = "minutes", {"1m": 1, "3m": 3, "5m": 5, "10m": 10, "15m": 15, "30m": 30}[tf]
+        days = 28 if interval <= 15 else 85
+    elif tf == "1h":
+        unit, interval, days = "hours", 1, 85
+    else:
+        unit, interval, days = "days", 1, 365
+    today = pd.Timestamp.now(tz="Asia/Kolkata").date()
+    yesterday = today - pd.Timedelta(days=1)
+    from_date = today - pd.Timedelta(days=days)
+    encoded_key = quote(str(instrument_key), safe="")
+    headers = upstox_headers(access_token)
+    frames = []
+    # Historical endpoint supplies completed prior sessions. The V3 docs specify
+    # the separate intraday endpoint for the current trading day.
+    historical_url = (f"{UPSTOX_API_BASE}/v3/historical-candle/{encoded_key}/"
+                      f"{unit}/{interval}/{yesterday.isoformat()}/{from_date.isoformat()}")
+    try:
+        hist_response = requests.get(historical_url, headers=headers, timeout=18)
+        if hist_response.status_code == 200:
+            hist_candles = (hist_response.json().get("data") or {}).get("candles") or []
+            hist_frame = _upstox_candles_to_frame(hist_candles)
+            if not hist_frame.empty:
+                frames.append(hist_frame)
+        else:
+            log_app_error("upstox_historical_candles", f"HTTP {hist_response.status_code}: {hist_response.text[:300]}")
+    except Exception as exc:
+        log_app_error("upstox_historical_candles", f"{type(exc).__name__}: {exc}")
+
+    intraday_url = (f"{UPSTOX_API_BASE}/v3/historical-candle/intraday/{encoded_key}/"
+                    f"{unit}/{interval}")
+    try:
+        live_response = requests.get(intraday_url, headers=headers, timeout=12)
+        if live_response.status_code == 200:
+            live_candles = (live_response.json().get("data") or {}).get("candles") or []
+            live_frame = _upstox_candles_to_frame(live_candles)
+            if not live_frame.empty:
+                frames.append(live_frame)
+        else:
+            log_app_error("upstox_intraday_candles", f"HTTP {live_response.status_code}: {live_response.text[:300]}")
+    except Exception as exc:
+        log_app_error("upstox_intraday_candles", f"{type(exc).__name__}: {exc}")
+
+    if not frames:
+        return pd.DataFrame()
+    combined = pd.concat(frames).sort_index()
+    return combined[~combined.index.duplicated(keep="last")]
+
+
+def fetch_upstox_ltp(access_token, instrument_key):
+    """Fetch current LTP snapshot from Upstox Market Quote V3."""
+    if not str(access_token or "").strip() or not str(instrument_key or "").strip():
+        return None
+    try:
+        response = requests.get(
+            f"{UPSTOX_API_BASE}/v3/market-quote/ltp",
+            headers=upstox_headers(access_token), params={"instrument_key": instrument_key}, timeout=8,
+        )
+        if response.status_code != 200:
+            log_app_error("upstox_ltp", f"HTTP {response.status_code}: {response.text[:250]}")
+            return None
+        data = (response.json().get("data") or {})
+        for item in data.values():
+            value = item.get("last_price") if isinstance(item, dict) else None
+            if value is not None and float(value) > 0:
+                return float(value)
+    except Exception as exc:
+        log_app_error("upstox_ltp", f"{type(exc).__name__}: {exc}")
+    return None
+
+
+# =========================================================
 # TELEGRAM
 # =========================================================
 def send_telegram_alert(token, chat_id, message):
@@ -5040,6 +5187,12 @@ def send_telegram_alert(token, chat_id, message):
 # MTF HELPERS
 # =========================================================
 def get_data_for_timeframe(data_source, selected, ticker, tf, angel_creds):
+    if data_source == "Upstox":
+        token = st.session_state.get("upstox_access_token", "")
+        instrument_key = resolve_upstox_instrument_key(selected)
+        if not instrument_key:
+            return pd.DataFrame()
+        return fetch_upstox_candles(token, instrument_key, tf)
     if data_source == "Yahoo":
         if tf == "1m":
             data = fetch_data(ticker, "1m", "7d")
@@ -5255,12 +5408,39 @@ ANGEL_NAME_ALIASES = {
 }
 
 st.title("Elite Trading Dashboard Final Ultimate")
-st.caption("WebSocket Primary | REST Polling Fallback | Walk Forward | Auto Exit | News Filter | Dynamic Option Chain")
+st.caption("WebSocket Primary | Upstox V3 | REST Fallback | Walk Forward | Auto Exit | News Filter | Dynamic Option Chain")
 st.sidebar.caption(f"App build: {APP_BUILD_ID}")
 
 selected = st.selectbox("Select Stock / Index", list(stocks.keys()))
-data_source = st.radio("Data Source", ["Yahoo", "Angel"], horizontal=True)
+data_source = st.radio("Data Source", ["Yahoo", "Angel", "Upstox"], horizontal=True)
 timeframe = st.selectbox("Select Time Frame", ["1m", "3m", "5m", "10m", "15m", "30m", "1h", "1d"])
+
+with st.expander("Upstox API Settings — market data only", expanded=(data_source == "Upstox")):
+    st.caption("OAuth 2.0 connection for Upstox market-data APIs. Access token stays in this Streamlit session; this application does not place broker orders.")
+    upstox_client_id = st.text_input("Upstox API Key / Client ID", key="upstox_client_id_input")
+    upstox_client_secret = st.text_input("Upstox API Secret", type="password", key="upstox_client_secret_input")
+    upstox_redirect_uri = st.text_input("Registered Redirect URI", key="upstox_redirect_uri_input")
+    if upstox_client_id.strip() and upstox_redirect_uri.strip():
+        _upstox_auth_params = urlencode({"response_type": "code", "client_id": upstox_client_id.strip(), "redirect_uri": upstox_redirect_uri.strip()})
+        st.markdown(f"[Open Upstox secure login](https://api.upstox.com/v2/login/authorization/dialog?{_upstox_auth_params})")
+    upstox_auth_code = st.text_input("Authorization code returned by Upstox", type="password", key="upstox_auth_code_input")
+    if st.button("Connect / Exchange Upstox Authorization Code", key="connect_upstox_button"):
+        _token, _message = upstox_exchange_authorization_code(
+            upstox_client_id, upstox_client_secret, upstox_redirect_uri, upstox_auth_code
+        )
+        if _token:
+            st.session_state["upstox_access_token"] = _token
+            st.session_state["upstox_connected_at"] = now_str()
+            st.success(_message)
+        else:
+            st.error(_message)
+    if st.session_state.get("upstox_access_token"):
+        st.success("Upstox market-data session token is present in this app session.")
+        st.caption("Upstox access tokens expire daily (typically at 3:30 AM IST); reconnect when expired.")
+        if st.button("Disconnect Upstox", key="disconnect_upstox_button"):
+            st.session_state.pop("upstox_access_token", None)
+            st.session_state.pop("upstox_connected_at", None)
+            st.rerun()
 
 st.subheader("Market Data Refresh Controls")
 refresh_col1, refresh_col2, refresh_col3 = st.columns([1.25, 1.0, 1.0])
@@ -5563,6 +5743,8 @@ angel_candle_diagnostics = {"status": "not_requested"}
 angel_ltp_value = None
 angel_ltp_status = "not_requested"
 angel_ltp_source = "Not requested"
+upstox_ltp_value = None
+upstox_instrument_key = None
 angel_session_ready = False
 
 if "last_good_candles_by_key" not in st.session_state:
@@ -5600,7 +5782,7 @@ _angel_credentials_ready = bool(
 
 st.info(
     f"Market data request: {data_source} | {selected} | {timeframe}. "
-    "Angel live LTP priority: WebSocket primary with REST polling fallback. Historical OHLC remains REST candle data. "
+    "Angel live LTP priority: WebSocket primary with REST polling fallback. Upstox uses V3 LTP and Historical Candle REST APIs. "
     "Network requests use bounded timeouts; optional market-board and walk-forward jobs no longer block initial page load."
 )
 
@@ -5609,7 +5791,31 @@ if data_source != "Angel":
     if _ws_snapshot.get("should_run"):
         stop_angel_websocket()
 
-if data_source == "Angel":
+if data_source == "Upstox":
+    _upstox_token = str(st.session_state.get("upstox_access_token", "")).strip()
+    if not _upstox_token:
+        st.error("Upstox is selected, but no authenticated session token is present. Connect in Upstox API Settings first.")
+        data = pd.DataFrame()
+    else:
+        with st.spinner(f"Upstox: resolving {selected} and loading {timeframe} candles…"):
+            upstox_instrument_key = resolve_upstox_instrument_key(selected)
+            if upstox_instrument_key:
+                data = fetch_upstox_candles(_upstox_token, upstox_instrument_key, timeframe)
+                upstox_ltp_value = fetch_upstox_ltp(_upstox_token, upstox_instrument_key)
+            else:
+                data = pd.DataFrame()
+                st.error(f"Upstox instrument master could not resolve {selected}. No candles or quote were fabricated.")
+        if data.empty:
+            with st.spinner(f"Upstox candles unavailable; trying Yahoo Finance fallback for {selected}…"):
+                _upstox_yahoo_fallback = fetch_data(ticker, yf_interval, yf_period)
+            if not _upstox_yahoo_fallback.empty:
+                data = _upstox_yahoo_fallback
+                active_data_source = "Yahoo"
+                st.warning("Upstox historical candles unavailable. Using clearly-labelled Yahoo Finance OHLC fallback; Upstox LTP remains separate if available.")
+        else:
+            st.caption(f"Upstox instrument: {upstox_instrument_key} | Historical candles: Upstox V3")
+
+elif data_source == "Angel":
     if not _angel_credentials_ready:
         _ws_snapshot = ws_get_state()
         if _ws_snapshot.get("should_run"):
@@ -6027,7 +6233,10 @@ else:
 
 live_price = None
 live_price_source = "OHLC candle close"
-if data_source == "Angel":
+if data_source == "Upstox" and upstox_ltp_value is not None and upstox_ltp_value > 0:
+    live_price = float(upstox_ltp_value)
+    live_price_source = "Upstox Market Quote V3 (REST snapshot)"
+elif data_source == "Angel":
     _fresh_ws_quote = ws_live_quote(
         max_age_seconds=max(20, int(refresh_seconds) * 2 if auto_refresh else 20),
         symbol_name=selected
