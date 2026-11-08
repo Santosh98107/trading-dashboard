@@ -285,8 +285,8 @@ def ai_loss_analysis(journal_df):
 def collect_institutional_diagnostics(df, benchmark_df=None):
     """Calculate institutional diagnostics from the app's existing OHLCV frames.
 
-    This function is intentionally display/diagnostics-only. It does not alter
-    the main app's BUY/SELL decision variables or score aggregation.
+    The main app consumes the returned component scores in its directional
+    score aggregator. Missing components remain unavailable and contribute zero.
     """
     required = {"Open", "High", "Low", "Close", "Volume"}
     if df is None or getattr(df, "empty", True) or not required.issubset(set(df.columns)):
@@ -368,7 +368,7 @@ def render_institutional_dashboard(df, symbol, benchmark_df, journal_df=None):
     with tabs[3]:
         st.subheader("Relative Strength Score")
         st.metric(f"RS Score vs Nifty ({symbol})", rs_score)
-        st.caption("Relative-strength diagnostic scale: 0–10; neutral reference = 5. This display does not alter the main app's live decision score.")
+        st.caption("Relative-strength diagnostic scale: 0–10; neutral reference = 5. Its normalized contribution is included in the main institutional score.")
     with tabs[4]:
         st.subheader("OI Analysis")
         p_chg = df["Close"].iloc[-1] - df["Close"].iloc[-2]
