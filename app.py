@@ -18,7 +18,7 @@ import streamlit as st
 import yfinance as yf
 import institutional_upgrades as inst
 # Visible deployment marker: confirms which source file Streamlit Cloud is running.
-APP_BUILD_ID = "2026-11-08-UPSTOX-INSTITUTIONAL-INTEGRATION-01"
+APP_BUILD_ID = "2026-11-08-UPSTOX-INSTITUTIONAL-AI-TRAINER-02"
 # Optional integrations: Yahoo mode must still start if Angel SDK/TOTP or
 # the auto-refresh helper is not installed.
 try:
@@ -4295,6 +4295,138 @@ def auto_paper_trade_exit(current_price, symbol=None, atr=None):
 
 
 # =========================================================
+# AI BACKTEST TRAINER: explainable alerts + train/holdout parameter search
+
+def _trainer_metrics(frame):
+    if frame is None or frame.empty or "PnL" not in frame:
+        return {"trades": 0, "win_rate": None, "profit_factor": None, "expectancy": None}
+    pnl = pd.to_numeric(frame["PnL"], errors="coerce").dropna()
+    if pnl.empty:
+        return {"trades": 0, "win_rate": None, "profit_factor": None, "expectancy": None}
+    gp = float(pnl[pnl > 0].sum())
+    gl = float(abs(pnl[pnl < 0].sum()))
+    pf = gp / gl if gl > 0 else (999.0 if gp > 0 else 0.0)
+    return {"trades": int(len(pnl)), "win_rate": round(float((pnl > 0).mean() * 100), 2),
+            "profit_factor": round(float(pf), 2), "expectancy": round(float(pnl.mean()), 4)}
+
+
+def analyze_backtest_for_training(trades_df):
+    """Create evidence-based alerts and test one simple filter on chronological holdout.
+
+    The optimizer chooses a single candidate using only the first 70% of trades;
+    the last 30% is untouched holdout. It never changes the strategy automatically.
+    """
+    empty = {"ready": False, "message": "No completed backtest trades available.", "baseline": _trainer_metrics(pd.DataFrame()),
+             "alerts": [], "candidates": pd.DataFrame(), "best_candidate": None, "holdout": None}
+    if trades_df is None or trades_df.empty or "PnL" not in trades_df:
+        return empty
+    df = trades_df.copy().reset_index(drop=True)
+    df["PnL"] = pd.to_numeric(df["PnL"], errors="coerce")
+    df = df.dropna(subset=["PnL"]).reset_index(drop=True)
+    if "Result" not in df:
+        df["Result"] = np.where(df["PnL"] > 0, "WIN", np.where(df["PnL"] < 0, "LOSS", "BREAKEVEN"))
+    baseline = _trainer_metrics(df)
+    alerts = []
+    # Descriptive buckets are alerts, not causal claims or guaranteed filters.
+    if "Signal" in df:
+        for side in ("BUY", "SELL"):
+            part = df[df["Signal"].astype(str).str.upper() == side]
+            m = _trainer_metrics(part)
+            if m["trades"] >= 8 and baseline["win_rate"] is not None and m["win_rate"] <= baseline["win_rate"] - 5:
+                alerts.append({"Priority": "Review", "Finding": f"{side} side underperforms overall", "Evidence": f"{m['trades']} trades; {m['win_rate']:.1f}% win rate", "Suggestion": f"Audit {side} entry conditions separately; do not disable it without holdout validation."})
+    for col, label in (("ADX", "ADX"), ("RSI", "RSI")):
+        if col in df:
+            vals = pd.to_numeric(df[col], errors="coerce")
+            valid = df[vals.notna()].copy()
+            valid[col] = vals[vals.notna()]
+            if len(valid) >= 20:
+                try:
+                    valid["_bucket"] = pd.qcut(valid[col], q=3, duplicates="drop")
+                    bucket_rows = []
+                    for bucket, part in valid.groupby("_bucket", observed=False):
+                        m = _trainer_metrics(part)
+                        if m["trades"] >= 6:
+                            bucket_rows.append((str(bucket), m))
+                    if len(bucket_rows) >= 2:
+                        weakest = min(bucket_rows, key=lambda x: (x[1]["expectancy"] if x[1]["expectancy"] is not None else -1e9))
+                        strongest = max(bucket_rows, key=lambda x: (x[1]["expectancy"] if x[1]["expectancy"] is not None else -1e9))
+                        if weakest[1]["expectancy"] is not None and strongest[1]["expectancy"] is not None and weakest[1]["expectancy"] < 0 < strongest[1]["expectancy"]:
+                            alerts.append({"Priority": "Investigate", "Finding": f"{label} ranges show different expectancy", "Evidence": f"Weakest {weakest[0]}: {weakest[1]['expectancy']:.3f}; strongest {strongest[0]}: {strongest[1]['expectancy']:.3f}", "Suggestion": f"Test a {label}-based filter on unseen data before changing the entry rules."})
+                except Exception:
+                    pass
+    if baseline["trades"] < 30:
+        return {"ready": False, "message": f"Only {baseline['trades']} completed trades. Need at least 30 for a cautious trainer review; no optimization proposal generated.",
+                "baseline": baseline, "alerts": alerts, "candidates": pd.DataFrame(), "best_candidate": None, "holdout": None}
+    split = max(1, min(len(df)-1, int(len(df) * 0.70)))
+    train, holdout = df.iloc[:split].copy(), df.iloc[split:].copy()
+    if len(train) < 15 or len(holdout) < 8:
+        return {"ready": False, "message": "Not enough chronological train/holdout trades for optimization.", "baseline": baseline,
+                "alerts": alerts, "candidates": pd.DataFrame(), "best_candidate": None, "holdout": None}
+    base_test = _trainer_metrics(holdout)
+    candidates = []
+    # Each candidate is selected using TRAIN only. Test metrics are reported once on holdout.
+    candidate_specs = []
+    if "ADX" in df:
+        candidate_specs += [("ADX minimum", "ADX", threshold, ">=") for threshold in (15, 20, 25)]
+    if "RSI" in df:
+        candidate_specs += [("BUY RSI minimum", "RSI_BUY", threshold, "side-aware") for threshold in (50, 55, 60)]
+        candidate_specs += [("SELL RSI maximum", "RSI_SELL", threshold, "side-aware") for threshold in (50, 45, 40)]
+    for name, feature, threshold, rule in candidate_specs:
+        def apply_rule(frame):
+            if feature == "ADX":
+                v = pd.to_numeric(frame.get("ADX"), errors="coerce")
+                return frame[v >= threshold]
+            side = frame.get("Signal", pd.Series("", index=frame.index)).astype(str).str.upper()
+            rsi = pd.to_numeric(frame.get("RSI"), errors="coerce")
+            mask = ((side == "BUY") & (rsi >= threshold)) if feature == "RSI_BUY" else ((side == "SELL") & (rsi <= threshold))
+            # Keep opposite-side trades unchanged; candidate is a selective gate for one side.
+            return frame[mask | (~side.isin(["BUY"] if feature == "RSI_BUY" else ["SELL"]))]
+        tr = apply_rule(train)
+        hm = apply_rule(holdout)
+        tm, testm = _trainer_metrics(tr), _trainer_metrics(hm)
+        if tm["trades"] >= 15 and hm.shape[0] >= 8 and tm["expectancy"] is not None:
+            candidates.append({"Rule": name, "Threshold": threshold, "Train Trades": tm["trades"],
+                               "Train Win Rate %": tm["win_rate"], "Train Expectancy": tm["expectancy"],
+                               "Holdout Trades": testm["trades"], "Holdout Win Rate %": testm["win_rate"],
+                               "Holdout Expectancy": testm["expectancy"], "Holdout Profit Factor": testm["profit_factor"]})
+    cand_df = pd.DataFrame(candidates)
+    best = None
+    if not cand_df.empty:
+        # Rank using training expectancy only, never holdout performance.
+        ranked = cand_df.sort_values(["Train Expectancy", "Train Win Rate %"], ascending=False)
+        best_row = ranked.iloc[0].to_dict()
+        best = {"rule": str(best_row["Rule"]), "threshold": float(best_row["Threshold"]),
+                "holdout": {"trades": int(best_row["Holdout Trades"]), "win_rate": float(best_row["Holdout Win Rate %"]),
+                            "expectancy": float(best_row["Holdout Expectancy"]), "profit_factor": float(best_row["Holdout Profit Factor"])},
+                "baseline_holdout": base_test}
+        if best["holdout"]["expectancy"] is not None and base_test["expectancy"] is not None and best["holdout"]["expectancy"] > base_test["expectancy"]:
+            alerts.append({"Priority": "Candidate", "Finding": f"{best['rule']} = {best['threshold']:g} improved holdout expectancy", "Evidence": f"Baseline {base_test['expectancy']:.3f}; filtered {best['holdout']['expectancy']:.3f} over {best['holdout']['trades']} trades", "Suggestion": "Review and approve for paper-only testing. This is not proof of future performance."})
+        else:
+            alerts.append({"Priority": "No improvement", "Finding": "No tested filter improved holdout expectancy", "Evidence": f"Baseline holdout expectancy {base_test['expectancy']}", "Suggestion": "Keep the existing scoring and entry rules unchanged."})
+    else:
+        alerts.append({"Priority": "Insufficient data", "Finding": "No candidate met minimum sample requirements", "Evidence": "Need at least 15 training and 8 holdout trades per candidate", "Suggestion": "Collect more completed backtest trades; do not optimize from a small sample."})
+    return {"ready": True, "message": "Chronological trainer review complete. Candidate selection used training trades only; holdout was kept separate.",
+            "baseline": baseline, "alerts": alerts, "candidates": cand_df, "best_candidate": best,
+            "holdout": {"baseline": base_test, "split_train": len(train), "split_holdout": len(holdout)}}
+
+
+def trainer_filter_allows(analysis, profile):
+    """Apply an explicitly approved trainer filter to paper eligibility only; never edits scores."""
+    if not isinstance(profile, dict) or not profile.get("approved"):
+        return True, ""
+    rule, threshold = profile.get("rule"), float(profile.get("threshold", 0))
+    side = str(analysis.get("signal_type", "")).lower()
+    rsi = _safe_num(analysis.get("rsi"), np.nan)
+    adx = _safe_num(analysis.get("adx"), np.nan)
+    if rule == "ADX minimum" and (not np.isfinite(adx) or adx < threshold):
+        return False, f"Approved AI Trainer paper filter: ADX {adx if np.isfinite(adx) else 'N/A'} is below {threshold:g}."
+    if rule == "BUY RSI minimum" and side == "buy" and (not np.isfinite(rsi) or rsi < threshold):
+        return False, f"Approved AI Trainer paper filter: BUY RSI {rsi if np.isfinite(rsi) else 'N/A'} is below {threshold:g}."
+    if rule == "SELL RSI maximum" and side == "sell" and (not np.isfinite(rsi) or rsi > threshold):
+        return False, f"Approved AI Trainer paper filter: SELL RSI {rsi if np.isfinite(rsi) else 'N/A'} is above {threshold:g}."
+    return True, ""
+
+
 # BACKTEST / WALK FORWARD / SHARPE
 # =========================================================
 
@@ -4602,7 +4734,10 @@ def fallback_ema_backtest(df, symbol="", timeframe_label="", cost_bps=5.0):
             "T1": round(tp, 2), "T2": np.nan, "T3": np.nan,
             "Exit": round(exit_price, 2), "Result": result, "PnL": pnl,
             "T1_Hit": result == "WIN", "T2_Hit": False, "T3_Hit": False,
-            "Method": "EMA trend/pullback fallback"
+            "Method": "EMA trend/pullback fallback",
+            "RSI": round(float(cur.get("RSI", np.nan)), 2),
+            "ADX": round(float(cur.get("ADX", np.nan)), 2) if pd.notna(cur.get("ADX", np.nan)) else np.nan,
+            "EMA_Aligned": bool((cur.get("EMA20", 0) > cur.get("EMA50", 0)) if side == "BUY" else (cur.get("EMA20", 0) < cur.get("EMA50", 0)))
         })
         i = max(i + 1, exit_i + 1)
     return pd.DataFrame(trades)
@@ -4759,7 +4894,14 @@ def simple_backtest(df, symbol="", timeframe_label="", option_metrics=None, news
             "Exit": round(float(final_exit_price), 2),
             "Result": result, "PnL": round(realized_points, 2),
             "T1_Hit": t1_hit, "T2_Hit": t2_hit, "T3_Hit": t3_hit,
-            "ExitReason": exit_reason, "ExitModel": "Next-open fill; 34/33/remainder scale-out; conservative stop-first OHLC"
+            "ExitReason": exit_reason, "ExitModel": "Next-open fill; 34/33/remainder scale-out; conservative stop-first OHLC",
+            # Entry-bar diagnostics are retained for the AI trainer. These are
+            # historical features known at signal time, not post-entry values.
+            "RSI": round(float(latest.get("RSI", np.nan)), 2),
+            "ADX": round(float(latest.get("ADX", np.nan)), 2),
+            "EMA_Aligned": bool((latest.get("EMA20", 0) > latest.get("EMA50", 0)) if side == "BUY" else (latest.get("EMA20", 0) < latest.get("EMA50", 0))),
+            "MACD_Hist": round(float(latest.get("MACD", 0) - latest.get("SignalLine", 0)), 5),
+            "Volume_Spike": bool(latest.get("Volume_Spike", False))
         })
 
     trades_df = pd.DataFrame(trades)
@@ -6117,11 +6259,22 @@ analysis = apply_adaptive_signal_intelligence(
     mtf_available_count=mtf_available_count
 )
 analysis = apply_tiered_early_alerts(analysis, tiered_tf_metrics)
+# An approved trainer profile can gate paper eligibility only. Original score values
+# and BUY/SELL scoring weights remain untouched.
+_trainer_profile = st.session_state.get("approved_ai_trainer_profile")
+_trainer_allowed, _trainer_block_reason = trainer_filter_allows(analysis, _trainer_profile)
+if not _trainer_allowed:
+    analysis["trade_allowed"] = False
+    analysis["ai_trainer_paper_block_reason"] = _trainer_block_reason
 
 stats = compute_trade_statistics(backtest_trades_df, initial_capital=DEFAULT_INITIAL_BALANCE)
 equity_curve_df, max_drawdown = compute_equity_curve_from_trades(backtest_trades_df, initial_capital=DEFAULT_INITIAL_BALANCE)
 
 with st.expander("🧠 Loss Intelligence & Similar Historical Setups", expanded=True):
+    if _trainer_profile and _trainer_profile.get("approved"):
+        st.info(f"AI Trainer approved paper filter active: {_trainer_profile.get('rule')} = {_trainer_profile.get('threshold')}. Signal scores are unchanged; only paper eligibility is gated.")
+    if analysis.get("ai_trainer_paper_block_reason"):
+        st.warning(analysis["ai_trainer_paper_block_reason"])
     intel = get_similar_trade_intelligence(analysis.get("feature_snapshot", {}), "BUY" if analysis.get("signal_type") == "buy" else "SELL")
     i1, i2, i3, i4, i5 = st.columns(5)
     i1.metric("Signal Stage", analysis.get("signal_stage", "N/A"))
@@ -6874,6 +7027,64 @@ with bb6:
 setup_cols = st.columns(2)
 setup_cols[0].metric("Best Performing Setup", best_setup_label)
 setup_cols[1].metric("Worst Performing Setup", worst_setup_label)
+
+st.subheader("🧠 AI Backtest Trainer & Strategy Optimizer")
+st.caption("Evidence-based diagnostics and chronological parameter testing. It does not rewrite your scoring formula; approved filters can only gate paper-trade eligibility.")
+trainer_col1, trainer_col2 = st.columns([1, 2])
+with trainer_col1:
+    trainer_run = st.button("Run AI Trainer Analysis", type="primary", use_container_width=True, key="run_ai_backtest_trainer_v1")
+with trainer_col2:
+    active_profile = st.session_state.get("approved_ai_trainer_profile")
+    if active_profile and active_profile.get("approved"):
+        st.caption(f"Approved paper filter: {active_profile.get('rule')} = {active_profile.get('threshold')}")
+        if st.button("Disable approved AI filter", key="disable_ai_trainer_filter_v1"):
+            st.session_state.pop("approved_ai_trainer_profile", None)
+            st.rerun()
+    else:
+        st.caption("No AI Trainer filter is active. Existing signal scoring and paper eligibility remain unchanged.")
+if trainer_run:
+    with st.spinner("Analysing completed backtest trades and testing candidate filters…"):
+        st.session_state["ai_backtest_trainer_result"] = analyze_backtest_for_training(backtest_trades_df)
+        st.session_state["ai_backtest_trainer_key"] = _backtest_cache_key
+        st.session_state["ai_backtest_trainer_run_at"] = now_str()
+trainer_result = st.session_state.get("ai_backtest_trainer_result")
+if trainer_result and st.session_state.get("ai_backtest_trainer_key") == _backtest_cache_key:
+    base_m = trainer_result.get("baseline", {})
+    t1, t2, t3, t4 = st.columns(4)
+    t1.metric("Trainer Sample", base_m.get("trades", 0))
+    t2.metric("Baseline Win Rate", f"{base_m['win_rate']:.1f}%" if base_m.get("win_rate") is not None else "N/A")
+    t3.metric("Baseline Profit Factor", base_m.get("profit_factor", "N/A"))
+    t4.metric("Baseline Expectancy", base_m.get("expectancy", "N/A"))
+    st.caption(trainer_result.get("message", ""))
+    if trainer_result.get("alerts"):
+        st.markdown("**AI improvement alerts**")
+        st.dataframe(pd.DataFrame(trainer_result["alerts"]), use_container_width=True, hide_index=True)
+    if not trainer_result.get("ready"):
+        st.warning(trainer_result.get("message", "More completed trades are required."))
+    else:
+        if not trainer_result.get("candidates", pd.DataFrame()).empty:
+            st.markdown("**Candidate filter comparison (train-selected; chronological holdout shown separately)**")
+            st.dataframe(trainer_result["candidates"], use_container_width=True, hide_index=True)
+        best = trainer_result.get("best_candidate")
+        if best:
+            hold = best["holdout"]
+            base_hold = best["baseline_holdout"]
+            st.markdown("**Recommended candidate for review**")
+            st.write(f"{best['rule']} = {best['threshold']:g}")
+            st.write(f"Holdout baseline: {base_hold['trades']} trades | Win rate {base_hold['win_rate']}% | Expectancy {base_hold['expectancy']} | PF {base_hold['profit_factor']}")
+            st.write(f"Candidate holdout: {hold['trades']} trades | Win rate {hold['win_rate']}% | Expectancy {hold['expectancy']} | PF {hold['profit_factor']}")
+            st.warning("Approval activates this filter for paper-trade eligibility only. It does not alter bullish/bearish scores, weights, backtest history, or broker orders. Re-run walk-forward and paper-test before relying on it.")
+            if st.button("Approve candidate for PAPER mode only", key="approve_ai_trainer_candidate_v1", disabled=hold["trades"] < 8):
+                st.session_state["approved_ai_trainer_profile"] = {"approved": True, "rule": best["rule"], "threshold": best["threshold"], "approved_at": now_str(), "symbol": selected, "timeframe": timeframe}
+                st.success("Approved. The filter is now applied to paper eligibility only; existing signal scores remain unchanged.")
+        else:
+            st.info("No safe candidate to approve. Existing scoring remains unchanged.")
+    if st.session_state.get("ai_backtest_trainer_run_at"):
+        st.caption("Last trainer run: " + str(st.session_state["ai_backtest_trainer_run_at"]))
+elif trainer_result:
+    st.info("Backtest data changed since the previous trainer run. Run AI Trainer Analysis again for the current symbol/timeframe.")
+else:
+    st.info("Press Run AI Trainer Analysis. At least 30 completed trades are required before optimization candidates are generated.")
 
 bc1, bc2, bc3, bc4 = st.columns(4)
 with bc1:
