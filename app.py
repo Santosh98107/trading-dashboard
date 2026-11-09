@@ -350,7 +350,10 @@ def load_journal():
         "DistanceEMA20Pct": np.nan, "DistanceEMA50Pct": np.nan, "DistanceVWAPPct": np.nan,
         "RiskRewardRatio": np.nan, "ConfidenceAtEntry": np.nan,
         "HistoricalWinRateAtEntry": np.nan, "SimilarTradesAtEntry": 0,
-        "LossReason": "", "SignalStage": ""
+        "LossReason": "", "SignalStage": "", "MACD": np.nan, "ATR": np.nan,
+        "VolumeDelta": np.nan, "TrendSlope": np.nan, "SupportDistancePct": np.nan,
+        "ResistanceDistancePct": np.nan, "DistanceEMA20Pct": np.nan,
+        "DistanceEMA50Pct": np.nan, "DistanceVWAPPct": np.nan, "RiskRewardRatio": np.nan
     }
     for col, default in defaults.items():
         if col not in journal.columns:
@@ -3013,6 +3016,7 @@ def analyze_signal(
     news_info=None,
     backtest_trade_count=0,
     backtest_is_comparable=False,
+    benchmark_df=None,
 ):
     """Explainable multi-factor signal engine.
 
@@ -3271,22 +3275,43 @@ def analyze_signal(
     institutional_diagnostics = {}
     institutional_score = 0.0
     try:
-        institutional_diagnostics = inst.collect_institutional_diagnostics(df, benchmark_df=None)
+        institutional_diagnostics = inst.collect_institutional_diagnostics(df, benchmark_df=benchmark_df)
+        institutional_participation = {}
+        raw_institutional_score = 0.0
         if isinstance(institutional_diagnostics, dict) and institutional_diagnostics.get("available", True):
             for component in ("market_structure", "liquidity", "order_blocks", "fvg", "volume_profile"):
-                item = institutional_diagnostics.get(component, {})
+                item = institutional_diagnostics.get(component)
                 if isinstance(item, dict):
-                    institutional_score += float(item.get("score", 0) or 0)
-            relative_strength = institutional_diagnostics.get("relative_strength", 5)
-            if isinstance(relative_strength, (int, float)) and np.isfinite(relative_strength):
-                institutional_score += (float(relative_strength) - 5.0) * 2.0
-            institutional_score = float(max(-8.0, min(8.0, institutional_score)))
+                    component_score = _safe_num(item.get("score"), 0.0)
+                    raw_institutional_score += component_score
+                    institutional_participation[component] = {"status": "ACTIVE", "score": component_score, "reason": str(item.get("structure", item.get("type", item.get("retest", item.get("signal", "Calculated")))))}
+                else:
+                    institutional_participation[component] = {"status": "UNAVAILABLE", "score": 0.0, "reason": "Insufficient source data"}
+            relative_strength = institutional_diagnostics.get("relative_strength")
+            if benchmark_df is not None and isinstance(relative_strength, (int, float)) and np.isfinite(relative_strength):
+                rs_component = (float(relative_strength) - 5.0) * 2.0
+                raw_institutional_score += rs_component
+                institutional_participation["relative_strength"] = {"status": "ACTIVE", "score": rs_component, "reason": f"Benchmark-relative score {relative_strength:.2f}/10"}
+            else:
+                institutional_participation["relative_strength"] = {"status": "UNAVAILABLE / NEUTRAL", "score": 0.0, "reason": "Real aligned benchmark candles not supplied; no synthetic RS score"}
+            institutional_participation["sector_strength"] = {"status": "UNAVAILABLE / NEUTRAL", "score": 0.0, "reason": "No verified symbol-to-sector OHLCV mapping supplied"}
+            institutional_participation["oi_positioning"] = {"status": "UNAVAILABLE / NEUTRAL", "score": 0.0, "reason": "Independent price/OI change series not supplied; PCR is not double-counted"}
+            institutional_score = float(max(-8.0, min(8.0, raw_institutional_score)))
+            institutional_participation["aggregate"] = {"status": "APPLIED", "raw_score": raw_institutional_score, "score": institutional_score, "cap": 8.0, "cap_applied": not np.isclose(raw_institutional_score, institutional_score), "reason": "Existing institutional aggregate cap preserved at +/-8"}
             if institutional_score > 0:
                 bullish += institutional_score
-                reasons.append(f"Institutional Confirmation (+{institutional_score:.1f})")
+                reasons.append(f"Institutional Confirmation (+{institutional_score:.1f}; raw {raw_institutional_score:.1f})")
             elif institutional_score < 0:
                 bearish += abs(institutional_score)
-                reasons.append(f"Institutional Bearish Confirmation ({abs(institutional_score):.1f})")
+                reasons.append(f"Institutional Bearish Confirmation ({abs(institutional_score):.1f}; raw {raw_institutional_score:.1f})")
+        else:
+            institutional_participation = {k: {"status": "UNAVAILABLE", "score": 0.0, "reason": institutional_diagnostics.get("message", "Diagnostics unavailable")} for k in ("market_structure", "liquidity", "order_blocks", "fvg", "volume_profile", "relative_strength", "sector_strength", "oi_positioning")}
+            institutional_participation["aggregate"] = {"status": "NOT APPLIED", "raw_score": 0.0, "score": 0.0, "cap": 8.0, "cap_applied": False, "reason": "No valid OHLCV diagnostics"}
+        institutional_diagnostics["participation_audit"] = institutional_participation
+        liquidity_item = institutional_diagnostics.get("liquidity") if isinstance(institutional_diagnostics, dict) else None
+        liquidity_block_entry = bool(isinstance(liquidity_item, dict) and liquidity_item.get("block_entry", False))
+        if liquidity_block_entry:
+            reasons.append(f"Liquidity sweep entry blocker active ({liquidity_item.get('type', 'sweep')}); review before entry")
     except Exception as institutional_error:
         institutional_diagnostics = {"error": str(institutional_error), "status": "UNAVAILABLE"}
         institutional_score = 0.0
@@ -3330,6 +3355,8 @@ def analyze_signal(
             momentum_ok = sell_momentum_ok
             conflict = mtf_sell_conflict or htf_sell_conflict
             near_level = sell_near_support
+        if liquidity_block_entry:
+            out.append(f"Liquidity sweep risk blocks {side} entry ({liquidity_item.get('type', 'sweep')}); wait for a fresh confirmed setup")
         if not score_ok:
             out.append("Directional score is not sufficiently separated (need score >= 7 and edge >= 3)")
         if votes < 2:
@@ -3470,7 +3497,10 @@ def analyze_signal(
         "target2": target2, "target3": target3, "trailing_stop": trailing_stop,
         "rr_ratio": rr_ratio, "reasons": reasons, "no_trade_reason": no_trade_reason,
         "no_trade_reasons": selected_blockers, "bullish_score": round(bullish, 1),
-        "bearish_score": round(bearish, 1),"institutional_score": round(institutional_score, 1), "directional_bias": directional_bias,
+        "bearish_score": round(bearish, 1), "institutional_score": round(institutional_score, 1),
+        "institutional_diagnostics": institutional_diagnostics,
+        "institutional_participation_audit": institutional_diagnostics.get("participation_audit", {}) if isinstance(institutional_diagnostics, dict) else {},
+        "liquidity_block_entry": bool(liquidity_block_entry), "directional_bias": directional_bias,
         "directional_edge": round(directional_edge, 1), "session_message": session_info["message"],
         "supertrend_direction": supertrend_dir, "ha_bullish": ha_bullish, "ha_bearish": ha_bearish,
         "ha_trend_up": ha_trend_up, "ha_trend_down": ha_trend_down,
@@ -3779,10 +3809,8 @@ def apply_adaptive_signal_intelligence(df, analysis, symbol, timeframe, mtf_bull
             elif analysis["signal_text"] == "STRONG SELL":
                 analysis["signal_text"] = "SELL"
     
-            analysis["confidence"] = max(
-                0,
-                int(analysis["confidence"] - 15)
-            )
+            _old_confidence = _safe_num(analysis.get("confidence"), 0.0)
+            analysis["confidence"] = max(0, int(_old_confidence - 15))
     
     # The repeat-loss penalty was already included above; do not subtract it twice.
     # Confidence can be None after a neutral override, so never perform arithmetic on None.
@@ -6410,6 +6438,18 @@ if not _trainer_allowed:
 stats = compute_trade_statistics(backtest_trades_df, initial_capital=DEFAULT_INITIAL_BALANCE)
 equity_curve_df, max_drawdown = compute_equity_curve_from_trades(backtest_trades_df, initial_capital=DEFAULT_INITIAL_BALANCE)
 
+with st.expander("🏛️ Institutional Signal Participation Audit", expanded=False):
+    _inst_audit = analysis.get("institutional_participation_audit", {})
+    if _inst_audit:
+        _audit_rows = []
+        for _feature, _details in _inst_audit.items():
+            _details = _details if isinstance(_details, dict) else {}
+            _audit_rows.append({"Feature": _feature.replace("_", " ").title(), "Status": _details.get("status", "N/A"), "Score": _details.get("score", _details.get("raw_score", 0)), "Reason": _details.get("reason", "")})
+        st.dataframe(pd.DataFrame(_audit_rows), use_container_width=True, hide_index=True)
+        st.caption("Existing aggregate cap +/-8 is retained. Raw score and cap-applied status are shown in the aggregate row. Missing benchmark, sector or independent OI inputs remain neutral.")
+    else:
+        st.info("Institutional audit unavailable for this analysis run.")
+
 with st.expander("🧠 Loss Intelligence & Similar Historical Setups", expanded=True):
     if _trainer_profile and _trainer_profile.get("approved"):
         st.info(f"AI Trainer approved paper filter active: {_trainer_profile.get('rule')} = {_trainer_profile.get('threshold')}. Signal scores are unchanged; only paper eligibility is gated.")
@@ -6455,6 +6495,14 @@ with st.expander("🧠 Loss Intelligence & Similar Historical Setups", expanded=
         col.metric(key, f"{value:.2f}" if isinstance(value, (int, float)) and np.isfinite(value) else "N/A")
     st.caption("Loss labels are probable diagnostic categories, not proof of causation. News reversal and execution/slippage causes require reliable event and fill data.")
     _ml_journal = load_journal()
+    if not _ml_journal.empty and "Status" in _ml_journal.columns:
+        _closed_review = _ml_journal[_ml_journal["Status"].astype(str).str.upper().eq("CLOSED")].copy()
+        _closed_review["PnL"] = pd.to_numeric(_closed_review.get("PnL", 0), errors="coerce")
+        _loss_review = _closed_review[_closed_review["PnL"] < 0].copy()
+        st.caption(f"Journal integrity: {_closed_review.shape[0]} closed trades | {_loss_review.shape[0]} losses | {int(_loss_review.get('LossReason', pd.Series('', index=_loss_review.index)).astype(str).str.strip().ne('').sum())} classified losses")
+        if not _loss_review.empty:
+            _loss_cols = [c for c in ["DateTime", "Symbol", "Side", "PnL", "LossReason"] if c in _loss_review.columns]
+            st.dataframe(_loss_review[_loss_cols].tail(20), use_container_width=True, hide_index=True)
     closed_count_ml = int((_ml_journal.get("Status", pd.Series(dtype=str)).astype(str).str.upper() == "CLOSED").sum()) if not _ml_journal.empty else 0
     st.caption(f"Optional ML layer: {closed_count_ml}/30 completed trades collected. Dataset evaluation is available now; model fitting unlocks after 30 usable trades with at least 5 wins and 5 losses.")
     if st.button("Evaluate Dataset / Train ML Model", key="train_loss_intelligence_ml"):
