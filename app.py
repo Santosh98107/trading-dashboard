@@ -166,18 +166,57 @@ def needs_password_upgrade(stored: str) -> bool:
     return not str(stored or "").strip().startswith("pbkdf2$")
 
 
+DEFAULT_ADMIN_USERNAME = "admin"
+DEFAULT_ADMIN_PASSWORD = "admin123"
+
+
 def _initial_admin_password():
-    """ADMIN_PASSWORD from st.secrets / environment, else a random one-time password."""
+    """Default admin password is admin123 (change it after first login).
+    ADMIN_PASSWORD in st.secrets / environment overrides the default if you prefer."""
     configured = ""
     try:
         configured = str(st.secrets.get("ADMIN_PASSWORD", "") or "")
     except Exception:
         configured = ""
     configured = configured or os.environ.get("ADMIN_PASSWORD", "")
-    if configured:
-        return configured, False
-    import secrets as _secrets
-    return _secrets.token_urlsafe(9), True
+    return (configured or DEFAULT_ADMIN_PASSWORD), False
+
+
+def _reset_key():
+    """Optional RESET_KEY (st.secrets / environment) that authorises resetting a forgotten password."""
+    try:
+        key = str(st.secrets.get("RESET_KEY", "") or "")
+    except Exception:
+        key = ""
+    return key or os.environ.get("RESET_KEY", "")
+
+
+def reset_password_with_key(username, reset_key, new_password, confirm_password):
+    """Reset a (forgotten) password from the login screen. Requires the configured RESET_KEY."""
+    username = str(username or "").strip()
+    configured = _reset_key()
+    if not configured:
+        return False, ("Reset key is not configured. Set RESET_KEY in secrets/environment, or delete "
+                       f"'{USERS_FILE}' to restore {DEFAULT_ADMIN_USERNAME} / {DEFAULT_ADMIN_PASSWORD}.")
+    if not hmac.compare_digest(str(reset_key or ""), configured):
+        return False, "Reset key is incorrect."
+    if not username:
+        return False, "Enter the username to reset."
+    if len(str(new_password or "")) < 6:
+        return False, "New password must contain at least 6 characters."
+    if new_password != confirm_password:
+        return False, "New password and confirmation do not match."
+    users = safe_read_csv(USERS_FILE, pd.DataFrame(columns=["username", "password"]))
+    if users.empty or not {"username", "password"}.issubset(users.columns):
+        users = pd.DataFrame(columns=["username", "password"])
+    mask = users["username"].astype(str).str.strip() == username
+    if mask.any():
+        users.loc[mask, "password"] = hash_password(new_password)
+    elif username == DEFAULT_ADMIN_USERNAME:
+        users = pd.concat([users, pd.DataFrame([{"username": username, "password": hash_password(new_password)}])], ignore_index=True)
+    else:
+        return False, "User not found."
+    return (True, "Password reset. You can log in now.") if safe_write_csv(users, USERS_FILE) else (False, "Could not save the new password.")
 
 
 _BACKUP_MIN_INTERVAL_SEC = 600
@@ -272,24 +311,25 @@ def data_integrity_check(df, required_cols=None, min_rows=1):
 # =========================================================
 # INIT FILES
 # =========================================================
+FIRST_RUN_PASSWORD_FILE = os.path.join(DATA_DIR, "FIRST_RUN_ADMIN_PASSWORD.txt")
+
+
+def _create_admin_user():
+    password, _ = _initial_admin_password()
+    safe_write_csv(pd.DataFrame([{"username": DEFAULT_ADMIN_USERNAME, "password": hash_password(password)}]), USERS_FILE)
+
+
 def init_users():
     if not os.path.exists(USERS_FILE):
-        df = pd.DataFrame([{
-            "username": "admin",
-            "password": hash_password("admin123")
-        }])
-        safe_write_csv(df, USERS_FILE)
+        _create_admin_user()
         return
     try:
         users = pd.read_csv(USERS_FILE)
         if "username" not in users.columns or "password" not in users.columns:
             raise ValueError("Invalid users file structure")
     except Exception:
-        df = pd.DataFrame([{
-            "username": "admin",
-            "password": hash_password("admin123")
-        }])
-        safe_write_csv(df, USERS_FILE)
+        _create_admin_user()
+
 
 def init_journal():
     """Create the paper journal with backward-compatible partial-exit fields."""
@@ -532,8 +572,8 @@ def update_logged_in_password(username, current_password, new_password, confirm_
         return False, "No logged-in username was found. Please log in again."
     if not current_password or not new_password or not confirm_password:
         return False, "Fill all password fields."
-    if len(new_password) < 8:
-        return False, "New password must contain at least 8 characters."
+    if len(new_password) < 6:
+        return False, "New password must contain at least 6 characters."
     if new_password != confirm_password:
         return False, "New password and confirmation do not match."
     if hmac.compare_digest(new_password, current_password):
@@ -570,14 +610,7 @@ def login_panel():
 
     if not st.session_state.logged_in:
         st.sidebar.subheader("Login")
-        if os.path.exists(FIRST_RUN_PASSWORD_FILE):
-            try:
-                st.sidebar.warning("First run: sign in as **admin** with the one-time password below, then change it. "
-                                   "Set ADMIN_PASSWORD in secrets to choose your own.")
-                st.sidebar.code(open(FIRST_RUN_PASSWORD_FILE, encoding="utf-8").read().strip())
-            except Exception:
-                pass
-        username = st.sidebar.text_input("Username")
+        username = st.sidebar.text_input("Username", value=DEFAULT_ADMIN_USERNAME)
         password = st.sidebar.text_input("Password", type="password")
 
         if st.sidebar.button("Login"):
@@ -586,16 +619,11 @@ def login_panel():
                 rows = users[users["username"].astype(str).str.strip() == username.strip()]
                 stored = str(rows["password"].iloc[0]).strip() if not rows.empty else ""
                 # Always run a hash so response time does not reveal whether the user exists.
-                password_ok = verify_password(password, stored if stored else hash_password("x"))
+                password_ok = verify_password(password.strip(), stored if stored else hash_password("x"))
                 if not rows.empty and password_ok:
                     if needs_password_upgrade(stored):   # transparently upgrade legacy SHA-256 hashes
-                        users.loc[rows.index[0], "password"] = hash_password(password)
+                        users.loc[rows.index[0], "password"] = hash_password(password.strip())
                         safe_write_csv(users, USERS_FILE)
-                    try:
-                        if os.path.exists(FIRST_RUN_PASSWORD_FILE):
-                            os.remove(FIRST_RUN_PASSWORD_FILE)
-                    except Exception:
-                        pass
                     st.session_state.logged_in = True
                     st.session_state.username = username.strip()
                     st.session_state.pop("login_failures", None)
@@ -605,16 +633,31 @@ def login_panel():
                     if st.session_state["login_failures"] >= 5:
                         pytime.sleep(min(5, st.session_state["login_failures"] - 4))   # slow brute force
                     st.sidebar.error("Invalid credentials")
+                    st.sidebar.caption("Forgot it? Use 'Forgot password / reset' below.")
             except Exception as e:
                 st.sidebar.error(f"Login error: {e}")
+        with st.sidebar.expander("Forgot password / reset"):
+            if _reset_key():
+                with st.form("login_reset_form", clear_on_submit=True):
+                    _ru = st.text_input("Username to reset", value=DEFAULT_ADMIN_USERNAME, key="reset_user")
+                    _rk = st.text_input("Reset key", type="password", key="reset_key_in")
+                    _rn = st.text_input("New password (min 6 characters)", type="password", key="reset_new")
+                    _rc = st.text_input("Confirm new password", type="password", key="reset_conf")
+                    if st.form_submit_button("Reset password", use_container_width=True):
+                        _ok, _msg = reset_password_with_key(_ru, _rk, _rn, _rc)
+                        (st.success if _ok else st.error)(_msg)
+            else:
+                st.caption(f"To reset manually: delete '{USERS_FILE}' and reload. The login returns to "
+                           f"{DEFAULT_ADMIN_USERNAME} / {DEFAULT_ADMIN_PASSWORD}. To enable in-app reset, set RESET_KEY in secrets or environment.")
         st.stop()
 
     st.sidebar.success(f"Logged in as: {st.session_state.username}")
     try:   # warn if the old default credential is still active
         _u = pd.read_csv(USERS_FILE)
         _row = _u[_u["username"].astype(str).str.strip() == st.session_state.username]
+        st.session_state["pwd_is_default"] = bool(not _row.empty and verify_password(DEFAULT_ADMIN_PASSWORD, str(_row["password"].iloc[0])))
         if not _row.empty and verify_password("admin123", str(_row["password"].iloc[0])):
-            st.sidebar.error("The default password is still active. Change it below now.")
+            st.sidebar.warning("Default password (admin123) is active. Open 'Change / Reset Password' below to set your own.")
     except Exception:
         pass
     if not STORAGE_IS_CONFIGURED and os.path.exists("/mount/src"):
@@ -623,10 +666,10 @@ def login_panel():
 
     # Password reset/change is available only inside an authenticated session.
     # The current password is verified before the stored hash is replaced.
-    with st.sidebar.expander("Change / Reset Password", expanded=False):
+    with st.sidebar.expander("Change / Reset Password", expanded=bool(st.session_state.get("pwd_is_default", False))):
         with st.form("change_logged_in_password_form", clear_on_submit=True):
             current_password = st.text_input("Current password", type="password", key="pwd_reset_current")
-            new_password = st.text_input("New password (minimum 8 characters)", type="password", key="pwd_reset_new")
+            new_password = st.text_input("New password (minimum 6 characters)", type="password", key="pwd_reset_new")
             confirm_password = st.text_input("Confirm new password", type="password", key="pwd_reset_confirm")
             submit_password_change = st.form_submit_button("Update Password", use_container_width=True)
         if submit_password_change:
@@ -5369,7 +5412,9 @@ def walk_forward_validation(df, symbol="", timeframe_label="", option_metrics=No
     """Chronological walk-forward report; fallback EMA folds are labelled and excluded from composite averages."""
     try:
         if df.empty or len(df) < 150:
-            return {"folds": 0, "validated_folds": 0, "avg_win_rate": None, "avg_profit_factor": None, "avg_expectancy": None, "table": pd.DataFrame()}
+            return {"folds": 0, "validated_folds": 0, "avg_win_rate": None, "avg_profit_factor": None, "avg_expectancy": None,
+                    "table": pd.DataFrame(),
+                    "message": f"Walk-forward needs at least 150 candles; only {0 if df is None else len(df)} are available for this symbol/timeframe."}
         # Walk-forward is an interactive report, not a full-history batch job.
         # Bound its workload so long 1m histories cannot freeze the Streamlit run.
         df = df.tail(1200).copy()
@@ -5377,7 +5422,9 @@ def walk_forward_validation(df, symbol="", timeframe_label="", option_metrics=No
         fold_results = []
         total_len = len(df)
         train_size = int(total_len * 0.6)
-        test_size = int(total_len * 0.2)
+        test_size = max(int(total_len * 0.2), 60)      # a test window needs enough bars to contain signals
+        if train_size + test_size > total_len:
+            train_size = max(55, total_len - test_size)
         start = 0
         fold_no = 1
         while (start + train_size + test_size) <= total_len:
@@ -5414,7 +5461,10 @@ def walk_forward_validation(df, symbol="", timeframe_label="", option_metrics=No
         valid = result_df[result_df["Method"] == "Composite signal engine"].copy()
         if valid.empty:
             return {"folds": len(result_df), "validated_folds": 0, "avg_win_rate": None,
-                    "avg_profit_factor": None, "avg_expectancy": None, "table": result_df}
+                    "avg_profit_factor": None, "avg_expectancy": None, "table": result_df,
+                    "message": "The composite engine produced no completed trades inside the test windows "
+                               f"({total_len} bars analysed). Use a lower timeframe or more history; "
+                               "EMA-fallback folds are shown but excluded from the averages."}
         return {
             "folds": len(result_df),
             "validated_folds": len(valid),
@@ -5432,105 +5482,83 @@ def walk_forward_validation(df, symbol="", timeframe_label="", option_metrics=No
 # =========================================================
 # REPORTS / ANALYTICS
 # =========================================================
+def _period_summary(closed, key_name, key_series):
+    """Aggregate closed paper trades into one row per period (full history, not just 'now')."""
+    cols = [key_name, "TotalTrades", "Wins", "Losses", "RealizedPnL", "WinRate"]
+    if closed is None or closed.empty:
+        return pd.DataFrame(columns=cols)
+    work = closed.copy()
+    work["_k"] = key_series
+    work["_pnl"] = pd.to_numeric(work["PnL"], errors="coerce").fillna(0.0)
+    work = work[work["_k"].notna()]
+    rows = []
+    for k, g in work.groupby("_k"):
+        total = len(g)
+        wins = int((g["_pnl"] > 0).sum())
+        losses = int((g["_pnl"] < 0).sum())
+        rows.append({key_name: k, "TotalTrades": total, "Wins": wins, "Losses": losses,
+                     "RealizedPnL": round(float(g["_pnl"].sum()), 2),
+                     "WinRate": round(wins / total * 100, 2) if total else 0.0})
+    out = pd.DataFrame(rows, columns=cols)
+    return out.sort_values(key_name, ascending=False).reset_index(drop=True)
+
+
+def _write_if_changed(df, path):
+    try:
+        if os.path.exists(path):
+            old = pd.read_csv(path)
+            if list(old.columns) == list(df.columns) and len(old) == len(df) and \
+               old.astype(str).reset_index(drop=True).equals(df.astype(str).reset_index(drop=True)):
+                return   # nothing changed: do not rewrite on every Streamlit rerun
+    except Exception:
+        pass
+    safe_write_csv(df, path)
+
+
 def update_daily_summary():
     init_daily_summary()
-    journal = load_journal()
-    closed = _closed_with_exit_dt(journal)
-    if closed.empty:
-        return
-
-    today = ist_now().date()
-    day_df = closed[closed["ExitDT"].dt.date == today]
-    if day_df.empty:
-        return
-
-    total = len(day_df)
-    wins = (pd.to_numeric(day_df["PnL"], errors="coerce").fillna(0) > 0).sum()
-    losses = (pd.to_numeric(day_df["PnL"], errors="coerce").fillna(0) < 0).sum()
-    pnl = pd.to_numeric(day_df["PnL"], errors="coerce").fillna(0).sum()
-    win_rate = (wins / total * 100) if total > 0 else 0
-
-    summary = safe_read_csv(DAILY_SUMMARY_FILE, pd.DataFrame(columns=["Date", "TotalTrades", "Wins", "Losses", "RealizedPnL", "WinRate"]))
-    summary = summary[summary["Date"] != str(today)]
-    new_row = {
-        "Date": str(today),
-        "TotalTrades": total,
-        "Wins": wins,
-        "Losses": losses,
-        "RealizedPnL": round(pnl, 2),
-        "WinRate": round(win_rate, 2)
-    }
-    summary = pd.concat([summary, pd.DataFrame([new_row])], ignore_index=True)
-    safe_write_csv(summary, DAILY_SUMMARY_FILE)
+    closed = _closed_with_exit_dt(load_journal())
+    key = closed["ExitDT"].dt.strftime("%Y-%m-%d") if not closed.empty else None
+    _write_if_changed(_period_summary(closed, "Date", key), DAILY_SUMMARY_FILE)
 
 
 def update_weekly_summary():
     init_weekly_summary()
-    journal = load_journal()
-    closed = _closed_with_exit_dt(journal)
-    if closed.empty:
-        return
-
-    closed["DT"] = closed["ExitDT"]
-    current_week = ist_now().strftime("%G-W%V")
-    start_week = ist_now() - timedelta(days=ist_now().weekday())
-    start_week = datetime(start_week.year, start_week.month, start_week.day)
-    week_df = closed[closed["DT"] >= start_week]
-    if week_df.empty:
-        return
-
-    total = len(week_df)
-    wins = (pd.to_numeric(week_df["PnL"], errors="coerce").fillna(0) > 0).sum()
-    losses = (pd.to_numeric(week_df["PnL"], errors="coerce").fillna(0) < 0).sum()
-    pnl = pd.to_numeric(week_df["PnL"], errors="coerce").fillna(0).sum()
-    win_rate = (wins / total * 100) if total else 0
-
-    summary = safe_read_csv(WEEKLY_SUMMARY_FILE, pd.DataFrame(columns=["WeekKey", "TotalTrades", "Wins", "Losses", "RealizedPnL", "WinRate"]))
-    summary = summary[summary["WeekKey"] != current_week]
-    new_row = {
-        "WeekKey": current_week,
-        "TotalTrades": total,
-        "Wins": wins,
-        "Losses": losses,
-        "RealizedPnL": round(pnl, 2),
-        "WinRate": round(win_rate, 2)
-    }
-    summary = pd.concat([summary, pd.DataFrame([new_row])], ignore_index=True)
-    safe_write_csv(summary, WEEKLY_SUMMARY_FILE)
+    closed = _closed_with_exit_dt(load_journal())
+    key = closed["ExitDT"].dt.strftime("%G-W%V") if not closed.empty else None
+    _write_if_changed(_period_summary(closed, "WeekKey", key), WEEKLY_SUMMARY_FILE)
 
 
 def update_monthly_summary():
     init_monthly_summary()
-    journal = load_journal()
-    closed = _closed_with_exit_dt(journal)
-    if closed.empty:
-        return
+    closed = _closed_with_exit_dt(load_journal())
+    key = closed["ExitDT"].dt.strftime("%Y-%m") if not closed.empty else None
+    _write_if_changed(_period_summary(closed, "MonthKey", key), MONTHLY_SUMMARY_FILE)
 
-    closed["DT"] = closed["ExitDT"]
-    current_month = ist_now().strftime("%Y-%m")
-    start_month = datetime(ist_now().year, ist_now().month, 1)
-    month_df = closed[closed["DT"] >= start_month]
-    if month_df.empty:
-        return
 
-    total = len(month_df)
-    wins = (pd.to_numeric(month_df["PnL"], errors="coerce").fillna(0) > 0).sum()
-    losses = (pd.to_numeric(month_df["PnL"], errors="coerce").fillna(0) < 0).sum()
-    pnl = pd.to_numeric(month_df["PnL"], errors="coerce").fillna(0).sum()
-    win_rate = (wins / total * 100) if total else 0
+def backtest_period_summary(trades_df, freq):
+    """Simulated P&L by day / ISO week / month from the backtest log (clearly NOT the paper account)."""
+    cols = ["Period", "Trades", "Wins", "Losses", "PnL (points)", "WinRate"]
+    if trades_df is None or trades_df.empty or "PnL" not in trades_df.columns or "Date" not in trades_df.columns:
+        return pd.DataFrame(columns=cols)
+    d = pd.to_datetime(trades_df["Date"], format="%d-%m-%Y", errors="coerce")
+    fmt = {"D": "%Y-%m-%d", "W": "%G-W%V", "M": "%Y-%m"}[freq]
+    pnl = pd.to_numeric(trades_df["PnL"], errors="coerce").fillna(0.0)
+    tmp = pd.DataFrame({"Period": d.dt.strftime(fmt), "PnL": pnl}).dropna()
+    rows = []
+    for k, g in tmp.groupby("Period"):
+        wins = int((g["PnL"] > 0).sum()); losses = int((g["PnL"] < 0).sum())
+        rows.append({"Period": k, "Trades": len(g), "Wins": wins, "Losses": losses,
+                     "PnL (points)": round(float(g["PnL"].sum()), 2), "WinRate": round(wins / len(g) * 100, 2)})
+    return pd.DataFrame(rows, columns=cols).sort_values("Period", ascending=False).reset_index(drop=True)
 
-    summary = safe_read_csv(MONTHLY_SUMMARY_FILE, pd.DataFrame(columns=["MonthKey", "TotalTrades", "Wins", "Losses", "RealizedPnL", "WinRate"]))
-    summary = summary[summary["MonthKey"] != current_month]
-    new_row = {
-        "MonthKey": current_month,
-        "TotalTrades": total,
-        "Wins": wins,
-        "Losses": losses,
-        "RealizedPnL": round(pnl, 2),
-        "WinRate": round(win_rate, 2)
-    }
-    summary = pd.concat([summary, pd.DataFrame([new_row])], ignore_index=True)
-    safe_write_csv(summary, MONTHLY_SUMMARY_FILE)
+
+def csv_download_button(label, df, file_name, key):
+    """Always-visible CSV export; disabled with an explanation when there is nothing to export."""
+    has_rows = isinstance(df, pd.DataFrame) and not df.empty
+    st.download_button(label, data=(df.to_csv(index=False).encode("utf-8") if has_rows else b""),
+                       file_name=file_name, mime="text/csv", key=key, disabled=not has_rows,
+                       use_container_width=True, help=None if has_rows else "Nothing to export yet.")
 
 
 def symbol_wise_performance(journal_df):
@@ -6343,9 +6371,9 @@ elif timeframe == "15m":
 elif timeframe == "30m":
     yf_interval, yf_period = "30m", "60d"
 elif timeframe == "1h":
-    yf_interval, yf_period = "60m", "90d"
+    yf_interval, yf_period = "60m", "180d"
 else:
-    yf_interval, yf_period = "1d", "1y"
+    yf_interval, yf_period = "1d", "3y"
 
 data = pd.DataFrame()
 yahoo_primary_rows = 0
@@ -6813,12 +6841,31 @@ with st.expander("🧠 Loss Intelligence & Similar Historical Setups", expanded=
         st.warning(analysis["ai_trainer_paper_block_reason"])
     _ui_side = "BUY" if analysis.get("signal_type") == "buy" else "SELL" if analysis.get("signal_type") == "sell" else None
     intel = get_similar_trade_intelligence(analysis.get("feature_snapshot", {}), _ui_side)
+    _stage = analysis.get("signal_stage", "—")
+    _n_similar = int(intel.get("count", 0) or 0)
+    _bt = backtest_trades_df if isinstance(backtest_trades_df, pd.DataFrame) else pd.DataFrame()
+    _bt_pnl = pd.to_numeric(_bt["PnL"], errors="coerce").dropna() if (not _bt.empty and "PnL" in _bt.columns and "Method" not in _bt.columns) else pd.Series(dtype=float)
     i1, i2, i3, i4, i5 = st.columns(5)
-    i1.metric("Signal Stage", analysis.get("signal_stage", "N/A"))
-    i2.metric("Similar Trades", intel.get("count", 0))
-    i3.metric("Historical Win Rate", f"{intel['win_rate']:.1f}%" if intel.get("win_rate") is not None else "N/A")
-    i4.metric("Historical Loss Rate", f"{intel['loss_rate']:.1f}%" if intel.get("loss_rate") is not None else "N/A")
-    i5.metric("Expected PnL / Trade", f"₹{intel['expected_value']:,.2f}" if intel.get("expected_value") is not None else "N/A")
+    i1.metric("Signal Stage", _stage)
+    if _n_similar >= 1 and intel.get("win_rate") is not None:
+        i2.metric("Similar Trades (your journal)", _n_similar)
+        i3.metric("Historical Win Rate", f"{intel['win_rate']:.1f}%")
+        i4.metric("Historical Loss Rate", f"{intel['loss_rate']:.1f}%" if intel.get("loss_rate") is not None else "—")
+        i5.metric("Expected PnL / Trade", f"₹{intel['expected_value']:,.2f}" if intel.get("expected_value") is not None else "—")
+    elif len(_bt_pnl) >= 5:
+        # No comparable journal trades yet: show the backtest of this symbol/timeframe, clearly labelled.
+        _w = float((_bt_pnl > 0).mean() * 100); _l = float((_bt_pnl < 0).mean() * 100)
+        i2.metric("Backtest Trades (reference)", len(_bt_pnl))
+        i3.metric("Backtest Win Rate", f"{_w:.1f}%")
+        i4.metric("Backtest Loss Rate", f"{_l:.1f}%")
+        i5.metric("Backtest Expected PnL / Trade", f"{float(_bt_pnl.mean()):,.2f}")
+        st.caption(f"No similar closed paper trades yet ({intel.get('reason', 'journal empty')}). "
+                   f"Showing the simulated backtest for {selected} {timeframe} as a reference only — not a prediction. "
+                   "Journal-based similarity appears automatically once comparable paper trades are closed.")
+    else:
+        i2.metric("Journal Trades Compared", 0)
+        st.info("No history to compare yet. Similar-trade statistics appear after closed paper trades exist "
+                f"({intel.get('reason', 'journal is empty')}) or once the backtest has at least 5 completed trades.")
     st.markdown("**Tiered early-alert rules (3m / 5m / 15m)**")
     st.caption("Early alert = 3m EMA9 > EMA21 and RSI > 50. Confirmed BUY = 3m + 5m EMA9 > EMA21, 3m RSI > 55, ADX > 20 and relative volume > 1.5x. Strong BUY = 3m + 5m + 15m EMA9 > EMA21 > EMA50, 3m RSI > 60, ADX > 25 and relative volume > 1.8x. SELL alerts use mirrored bearish conditions.")
     tf_cols = st.columns(3)
@@ -7758,12 +7805,9 @@ elif wf_auto_refresh and not AUTO_REFRESH_AVAILABLE:
 
 # Store the latest report in session state. Global market auto-refresh does not
 # repeatedly recompute this expensive report unless its own auto-refresh is ON.
-try:
-    _wf_tail = backtest_data.tail(500)
-    _wf_content_hash = int(pd.util.hash_pandas_object(_wf_tail, index=True).sum()) if not _wf_tail.empty else 0
-    _wf_data_key = f"{selected}|{timeframe}|{len(backtest_data)}|{_wf_content_hash}"
-except Exception:
-    _wf_data_key = f"{selected}|{timeframe}|{len(backtest_data)}"
+# Keyed by symbol + timeframe + data source only. Keying on the latest candles discarded the finished
+# report every time market auto-refresh added a candle, which is why it kept going blank.
+_wf_data_key = f"{selected}|{timeframe}|{data_source}"
 
 _wf_cached = st.session_state.get("walk_forward_cached_result")
 _wf_cached_key = st.session_state.get("walk_forward_cached_data_key")
@@ -7774,8 +7818,10 @@ _wf_auto_tick_changed = bool(
     and (_wf_previous_tick is None or wf_auto_tick != _wf_previous_tick)
 )
 _wf_auto_just_enabled = bool(wf_auto_refresh and not _wf_previous_auto)
+_wf_first_run_for_key = bool(_wf_cached is None or _wf_cached_key != _wf_data_key)
 _wf_should_run = bool(
     wf_manual_refresh
+    or _wf_first_run_for_key
     or (wf_auto_refresh and (_wf_auto_tick_changed or _wf_auto_just_enabled))
 )
 
@@ -7794,18 +7840,7 @@ else:
     st.session_state["walk_forward_auto_was_enabled"] = wf_auto_refresh
     if wf_auto_tick is not None:
         st.session_state["walk_forward_last_auto_tick"] = wf_auto_tick
-    if _wf_cached_key == _wf_data_key and _wf_cached is not None:
-        walk_forward_result = _wf_cached
-    else:
-        walk_forward_result = {
-            "folds": 0, "validated_folds": 0, "avg_win_rate": None,
-            "avg_profit_factor": None, "avg_expectancy": None,
-            "table": pd.DataFrame()
-        }
-        if _wf_cached is None:
-            st.info("Walk-forward has not run yet. Press Run / Refresh Walk Forward Now, or enable its independent Auto Refresh. It will not run automatically during initial page load.")
-        if _wf_cached is not None:
-            st.info("Market history has changed since the last walk-forward run. Press Run / Refresh Walk Forward Now, or enable its Auto Refresh option. The displayed metrics are not silently carried over from the previous dataset.")
+    walk_forward_result = _wf_cached
 
 if st.session_state.get("walk_forward_last_run_at"):
     st.caption("Last walk-forward calculation: " + str(st.session_state["walk_forward_last_run_at"]))
@@ -7814,6 +7849,8 @@ if wf_auto_refresh and AUTO_REFRESH_AVAILABLE:
 else:
     st.caption("Walk-forward auto refresh is OFF. Use Run / Refresh Walk Forward Now whenever you want to recalculate.")
 
+if walk_forward_result.get("message"):
+    st.info(walk_forward_result["message"])
 wf1, wf2, wf3, wf4 = st.columns(4)
 with wf1:
     st.metric("Folds", walk_forward_result["folds"])
@@ -7882,16 +7919,47 @@ else:
     st.info("No closed trades in journal yet.")
 
 st.subheader("Daily / Weekly / Monthly Reports")
+_daily_df, _weekly_df, _monthly_df = (safe_read_csv(DAILY_SUMMARY_FILE), safe_read_csv(WEEKLY_SUMMARY_FILE),
+                                      safe_read_csv(MONTHLY_SUMMARY_FILE))
+st.caption("Paper-account reports are built from CLOSED paper trades in your journal (by exit date, IST). "
+           "They fill in automatically as trades close.")
+if _daily_df.empty and _weekly_df.empty and _monthly_df.empty:
+    st.info("No closed paper trades yet, so there is nothing to report for the paper account. "
+            "Open a paper trade and close it (manually or by stop/target) to see daily, weekly and monthly results. "
+            "The simulated backtest results are shown below in the meantime.")
 rep1, rep2, rep3 = st.columns(3)
-with rep1:
-    st.markdown("**Daily Summary**")
-    st.dataframe(safe_read_csv(DAILY_SUMMARY_FILE), use_container_width=True)
-with rep2:
-    st.markdown("**Weekly Summary**")
-    st.dataframe(safe_read_csv(WEEKLY_SUMMARY_FILE), use_container_width=True)
-with rep3:
-    st.markdown("**Monthly Summary**")
-    st.dataframe(safe_read_csv(MONTHLY_SUMMARY_FILE), use_container_width=True)
+for _col, _title, _df_r, _fname in ((rep1, "Daily Summary", _daily_df, "daily_summary.csv"),
+                                    (rep2, "Weekly Summary", _weekly_df, "weekly_summary.csv"),
+                                    (rep3, "Monthly Summary", _monthly_df, "monthly_summary.csv")):
+    with _col:
+        st.markdown(f"**{_title}**")
+        if _df_r.empty:
+            st.caption("No closed paper trades in this period yet.")
+        else:
+            st.dataframe(_df_r, use_container_width=True, hide_index=True)
+        csv_download_button(f"Download {_title} (CSV)", _df_r, _fname, f"dl_{_fname}")
+
+with st.expander("Backtest P&L by day / week / month (simulated, not your paper account)", expanded=_daily_df.empty):
+    _bt_tabs = st.tabs(["Daily", "Weekly", "Monthly"])
+    for _tab, _fq in zip(_bt_tabs, ("D", "W", "M")):
+        with _tab:
+            _bt_rep = backtest_period_summary(backtest_trades_df, _fq)
+            if _bt_rep.empty:
+                st.info("No completed backtest trades for this symbol/timeframe.")
+            else:
+                st.dataframe(_bt_rep, use_container_width=True, hide_index=True)
+            csv_download_button("Download (CSV)", _bt_rep, f"backtest_{_fq}.csv", f"dl_bt_{_fq}")
+
+st.subheader("CSV Exports")
+_exp1, _exp2, _exp3, _exp4 = st.columns(4)
+with _exp1:
+    csv_download_button("Trade journal (all)", journal, "trade_journal.csv", "dl_journal_all")
+with _exp2:
+    csv_download_button("Closed trades only", closed_journal, "closed_trades.csv", "dl_journal_closed")
+with _exp3:
+    csv_download_button("Backtest trade log", backtest_trades_df, "backtest_trades.csv", "dl_backtest_log")
+with _exp4:
+    csv_download_button("Signal audit log", safe_read_csv(SIGNAL_AUDIT_FILE), "signal_audit.csv", "dl_signal_audit")
 
 st.subheader("Option Suggestion")
 if option_suggestion["type"] == "CALL":
