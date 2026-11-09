@@ -272,31 +272,24 @@ def data_integrity_check(df, required_cols=None, min_rows=1):
 # =========================================================
 # INIT FILES
 # =========================================================
-FIRST_RUN_PASSWORD_FILE = os.path.join(DATA_DIR, "FIRST_RUN_ADMIN_PASSWORD.txt")
-
-
-def _create_admin_user():
-    password, generated = _initial_admin_password()
-    safe_write_csv(pd.DataFrame([{"username": "admin", "password": hash_password(password)}]), USERS_FILE)
-    if generated:
-        try:  # shown once on the login screen, deleted after the first successful login
-            with open(FIRST_RUN_PASSWORD_FILE, "w", encoding="utf-8") as fh:
-                fh.write(password)
-        except Exception as exc:
-            log_app_error("first_run_password", exc)
-
-
 def init_users():
     if not os.path.exists(USERS_FILE):
-        _create_admin_user()
+        df = pd.DataFrame([{
+            "username": "admin",
+            "password": hash_password("admin123")
+        }])
+        safe_write_csv(df, USERS_FILE)
         return
     try:
         users = pd.read_csv(USERS_FILE)
         if "username" not in users.columns or "password" not in users.columns:
             raise ValueError("Invalid users file structure")
     except Exception:
-        _create_admin_user()
-
+        df = pd.DataFrame([{
+            "username": "admin",
+            "password": hash_password("admin123")
+        }])
+        safe_write_csv(df, USERS_FILE)
 
 def init_journal():
     """Create the paper journal with backward-compatible partial-exit fields."""
