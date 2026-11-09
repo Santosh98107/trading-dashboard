@@ -4,8 +4,6 @@ import math
 import shutil
 import hashlib
 import hmac
-import gzip
-from urllib.parse import quote, urlencode
 from datetime import datetime, timedelta, time, timezone
 import threading
 import time as pytime
@@ -18,7 +16,7 @@ import streamlit as st
 import yfinance as yf
 import institutional_upgrades as inst
 # Visible deployment marker: confirms which source file Streamlit Cloud is running.
-APP_BUILD_ID = "2026-11-09-YAHOO-CHART-API-ROBUST-FIX-05"
+APP_BUILD_ID = "2026-11-04-LOSS-INTELLIGENCE-SIGNAL-V2-01"
 # Optional integrations: Yahoo mode must still start if Angel SDK/TOTP or
 # the auto-refresh helper is not installed.
 try:
@@ -77,6 +75,9 @@ WS_RETRY_DELAY_SEC = 5
 MIN_RR_REQUIRED = 2.0
 IDEAL_RR = 3.0
 STRICT_TRADE_ONLY_STRONG = False
+# Configurable group weights applied to the signal engine (1.0 = unchanged).
+SIGNAL_WEIGHTS = {"trend": 1.0, "momentum": 1.0, "price_action": 1.0,
+                  "mtf": 1.0, "options": 1.0, "institutional": 1.0}
 DISABLE_BUY_BIAS_TRADING = False
 DISABLE_SELL_BIAS_TRADING = False
 MANDATORY_ADX = 20
@@ -117,8 +118,16 @@ WS_SHARED_STATE = {
 # =========================================================
 # BASIC UTILITIES
 # =========================================================
+IST_OFFSET = timezone(timedelta(hours=5, minutes=30))
+
+
+def ist_now():
+    """Naive datetime in Indian Standard Time (servers such as Streamlit Cloud run in UTC)."""
+    return datetime.now(IST_OFFSET).replace(tzinfo=None)
+
+
 def now_str():
-    return datetime.now().strftime("%d-%m-%Y %H:%M:%S")
+    return ist_now().strftime("%d-%m-%Y %H:%M:%S")
 
 
 def hash_password(password: str) -> str:
@@ -128,7 +137,7 @@ def hash_password(password: str) -> str:
 def backup_file(path):
     try:
         if os.path.exists(path):
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            ts = ist_now().strftime("%Y%m%d_%H%M%S")
             name = os.path.basename(path)
             shutil.copy(path, os.path.join(BACKUP_DIR, f"{ts}_{name}"))
             enforce_backup_retention()
@@ -243,7 +252,7 @@ def init_journal():
             "MTFTrendStatus", "TrendSlope", "SupportDistancePct", "ResistanceDistancePct",
             "DistanceEMA20Pct", "DistanceEMA50Pct", "DistanceVWAPPct", "RiskRewardRatio",
             "ConfidenceAtEntry", "HistoricalWinRateAtEntry", "SimilarTradesAtEntry",
-            "LossReason", "SignalStage"
+            "LossReason", "SignalStage", "ExitTime"
         ]
         safe_write_csv(pd.DataFrame(columns=cols), JOURNAL_FILE)
 
@@ -289,7 +298,8 @@ def init_risk_state():
             "RiskPerTradePct": 1.0,
             "TradingEnabled": True,
             "DailyLock": False,
-            "CapitalProtectionPct": 20.0
+            "CapitalProtectionPct": 20.0,
+            "MaxOpenPositions": 3
         }])
         safe_write_csv(df, RISK_STATE_FILE)
 
@@ -297,7 +307,7 @@ def init_risk_state():
 def init_weekly_risk():
     if not os.path.exists(WEEKLY_RISK_FILE):
         df = pd.DataFrame([{
-            "WeekKey": datetime.now().strftime("%Y-W%U"),
+            "WeekKey": ist_now().strftime("%G-W%V"),
             "WeeklyLossLimit": 5000.0,
             "WeeklyPnL": 0.0,
             "WeeklyLock": False
@@ -308,7 +318,7 @@ def init_weekly_risk():
 def init_monthly_risk():
     if not os.path.exists(MONTHLY_RISK_FILE):
         df = pd.DataFrame([{
-            "MonthKey": datetime.now().strftime("%Y-%m"),
+            "MonthKey": ist_now().strftime("%Y-%m"),
             "MonthlyLossLimit": 15000.0,
             "MonthlyPnL": 0.0,
             "MonthlyLock": False
@@ -334,7 +344,7 @@ def load_journal():
     init_journal()
     journal = safe_read_csv(JOURNAL_FILE, pd.DataFrame())
     if journal.empty:
-        for text_col in ["Symbol", "Timeframe", "Signal", "Side", "Status", "Notes", "Result", "StrategyGrade", "LastUpdateTime"]:
+        for text_col in ["Symbol", "Timeframe", "Signal", "Side", "Status", "Notes", "Result", "StrategyGrade", "LastUpdateTime", "ExitTime", "LossReason", "SignalStage"]:
             if text_col in journal.columns:
                 journal[text_col] = journal[text_col].astype(object)
         return journal
@@ -350,17 +360,14 @@ def load_journal():
         "DistanceEMA20Pct": np.nan, "DistanceEMA50Pct": np.nan, "DistanceVWAPPct": np.nan,
         "RiskRewardRatio": np.nan, "ConfidenceAtEntry": np.nan,
         "HistoricalWinRateAtEntry": np.nan, "SimilarTradesAtEntry": 0,
-        "LossReason": "", "SignalStage": "", "MACD": np.nan, "ATR": np.nan,
-        "VolumeDelta": np.nan, "TrendSlope": np.nan, "SupportDistancePct": np.nan,
-        "ResistanceDistancePct": np.nan, "DistanceEMA20Pct": np.nan,
-        "DistanceEMA50Pct": np.nan, "DistanceVWAPPct": np.nan, "RiskRewardRatio": np.nan
+        "LossReason": "", "SignalStage": "", "ExitTime": ""
     }
     for col, default in defaults.items():
         if col not in journal.columns:
             journal[col] = default
             changed = True
     # Keep text/status fields object-typed so older CSVs with blank cells can accept later updates.
-    for text_col in ["Symbol", "Timeframe", "Signal", "Side", "Status", "Notes", "Result", "StrategyGrade", "LastUpdateTime"]:
+    for text_col in ["Symbol", "Timeframe", "Signal", "Side", "Status", "Notes", "Result", "StrategyGrade", "LastUpdateTime", "ExitTime", "LossReason", "SignalStage"]:
         if text_col in journal.columns:
             journal[text_col] = journal[text_col].fillna("").astype(object)
     if "Quantity" in journal.columns:
@@ -404,7 +411,10 @@ def save_paper_state(df):
 
 def load_risk_state():
     init_risk_state()
-    return safe_read_csv(RISK_STATE_FILE)
+    df = safe_read_csv(RISK_STATE_FILE)
+    if not df.empty and "MaxOpenPositions" not in df.columns:
+        df["MaxOpenPositions"] = 3
+    return df
 
 
 def save_risk_state(df):
@@ -414,7 +424,7 @@ def save_risk_state(df):
 def load_weekly_risk():
     init_weekly_risk()
     df = safe_read_csv(WEEKLY_RISK_FILE)
-    current_key = datetime.now().strftime("%Y-W%U")
+    current_key = ist_now().strftime("%G-W%V")
     if df.empty or str(df.loc[0, "WeekKey"]) != current_key:
         df = pd.DataFrame([{
             "WeekKey": current_key,
@@ -433,7 +443,7 @@ def save_weekly_risk(df):
 def load_monthly_risk():
     init_monthly_risk()
     df = safe_read_csv(MONTHLY_RISK_FILE)
-    current_key = datetime.now().strftime("%Y-%m")
+    current_key = ist_now().strftime("%Y-%m")
     if df.empty or str(df.loc[0, "MonthKey"]) != current_key:
         df = pd.DataFrame([{
             "MonthKey": current_key,
@@ -557,255 +567,62 @@ def login_panel():
 # =========================================================
 # DATA FETCH
 # =========================================================
-_YAHOO_FETCH_DIAGNOSTICS = {"status": "not_requested", "source": None, "rows": 0, "error": None}
-
-
-def _yahoo_chart_api_frame(ticker, interval, period):
-    """Fetch actual Yahoo chart OHLCV directly, avoiding yfinance schema drift."""
-    range_value = str(period or "7d").lower()
-    allowed_ranges = {"1d", "5d", "7d", "1mo", "3mo", "6mo", "1y", "2y", "5d", "30d", "60d", "90d"}
-    if range_value not in allowed_ranges:
-        range_value = "7d"
-    # Yahoo chart API accepts common range tokens; normalize day-count aliases.
-    range_value = {"30d": "1mo", "60d": "3mo", "90d": "3mo"}.get(range_value, range_value)
-    params = {
-        "range": range_value,
-        "interval": str(interval),
-        "includePrePost": "true",
-        "events": "div,splits",
-    }
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0 Safari/537.36",
-        "Accept": "application/json,text/plain,*/*",
-    }
-    last_error = None
-    for host in ("query1.finance.yahoo.com", "query2.finance.yahoo.com"):
-        url = f"https://{host}/v8/finance/chart/{quote(str(ticker), safe='^.-')}"
-        try:
-            response = requests.get(url, params=params, headers=headers, timeout=(4, 9))
-            response.raise_for_status()
-            payload = response.json()
-            chart = payload.get("chart", {})
-            if chart.get("error"):
-                err = chart["error"]
-                raise RuntimeError(str(err.get("description") or err.get("code") or err))
-            results = chart.get("result") or []
-            if not results:
-                raise RuntimeError("Yahoo chart API returned no result")
-            item = results[0]
-            stamps = item.get("timestamp") or []
-            quote_rows = ((item.get("indicators") or {}).get("quote") or [{}])[0]
-            if not stamps or not quote_rows:
-                raise RuntimeError("Yahoo chart response has no timestamps or OHLCV quote")
-            frame = pd.DataFrame({
-                "Open": quote_rows.get("open", []),
-                "High": quote_rows.get("high", []),
-                "Low": quote_rows.get("low", []),
-                "Close": quote_rows.get("close", []),
-                "Volume": quote_rows.get("volume", []),
-            }, index=pd.to_datetime(stamps, unit="s", utc=True))
-            frame.index.name = "Datetime"
-            frame = frame.dropna(subset=["Open", "High", "Low", "Close"])
-            if frame.empty:
-                raise RuntimeError("Yahoo chart response contained no complete OHLC candles")
-            frame["Volume"] = pd.to_numeric(frame["Volume"], errors="coerce").fillna(0)
-            for col in ("Open", "High", "Low", "Close"):
-                frame[col] = pd.to_numeric(frame[col], errors="coerce")
-            frame = frame.dropna(subset=["Open", "High", "Low", "Close"])
-            return frame.loc[~frame.index.duplicated(keep="last")].sort_index(), None
-        except Exception as exc:
-            last_error = f"{host}: {type(exc).__name__}: {exc}"
-    return pd.DataFrame(), last_error
-
-
-@st.cache_data(ttl=8, show_spinner=False)
+@st.cache_data(ttl=10, show_spinner=False)
 def fetch_data(ticker, interval, period):
-    """Reliable Yahoo OHLCV loader: chart endpoint first, yfinance as fallback."""
-    global _YAHOO_FETCH_DIAGNOSTICS
+    """Yahoo OHLCV loader tolerant of yfinance MultiIndex layout changes."""
     needed = ["Open", "High", "Low", "Close", "Volume"]
     errors = []
+    df = pd.DataFrame()
     try:
-        frame, direct_error = _yahoo_chart_api_frame(ticker, interval, period)
-        if not frame.empty:
-            _YAHOO_FETCH_DIAGNOSTICS = {
-                "status": "success", "source": "Yahoo Chart API", "rows": int(len(frame)), "error": None,
-                "last_candle": str(frame.index[-1]),
-            }
-            return frame[needed].copy()
-        if direct_error:
-            errors.append("Yahoo Chart API: " + direct_error)
-
-        # Compatibility fallback for installations where Yahoo's chart host is blocked.
         try:
-            raw = yf.download(
-                ticker, interval=interval, period=period, progress=False,
-                auto_adjust=False, threads=False, timeout=10,
-                multi_level_index=False,
-            )
+            df = yf.download(ticker, interval=interval, period=period,
+                             progress=False, auto_adjust=False, threads=False, timeout=8,
+                             multi_level_index=False)
         except TypeError:
-            try:
-                raw = yf.download(
-                    ticker, interval=interval, period=period, progress=False,
-                    auto_adjust=False, threads=False, timeout=10,
-                )
-            except Exception as exc:
-                raw = pd.DataFrame()
-                errors.append(f"yfinance download compatibility fallback: {type(exc).__name__}: {exc}")
+            df = yf.download(ticker, interval=interval, period=period,
+                             progress=False, auto_adjust=False, threads=False, timeout=8)
         except Exception as exc:
-            raw = pd.DataFrame()
-            errors.append(f"yfinance download: {type(exc).__name__}: {exc}")
+            errors.append(f"download: {exc}")
 
-        if isinstance(raw, pd.DataFrame) and isinstance(raw.columns, pd.MultiIndex):
-            selected_level = None
-            selected_count = -1
-            for level in range(raw.columns.nlevels):
-                values = [str(value) for value in raw.columns.get_level_values(level)]
-                count = sum(name in values for name in needed)
-                if count > selected_count:
-                    selected_level, selected_count = level, count
-            if selected_level is not None:
-                raw.columns = raw.columns.get_level_values(selected_level)
-        if isinstance(raw, pd.DataFrame):
-            raw = raw.loc[:, ~pd.Index(raw.columns).duplicated()].copy()
-            if all(name in raw.columns for name in needed):
-                frame = raw[needed].copy()
-            else:
-                frame = pd.DataFrame()
+        # yfinance versions differ: columns may be (Price, Ticker) or (Ticker, Price).
+        if isinstance(df.columns, pd.MultiIndex):
+            best_level = None
+            best_count = -1
+            for level in range(df.columns.nlevels):
+                vals = [str(v) for v in df.columns.get_level_values(level)]
+                count = sum(col in vals for col in needed)
+                if count > best_count:
+                    best_count, best_level = count, level
+            if best_level is not None:
+                df.columns = df.columns.get_level_values(best_level)
+        if not df.empty and all(c in df.columns for c in needed):
+            df = df.loc[:, ~pd.Index(df.columns).duplicated()].copy()
+            df = df[needed].copy()
         else:
-            frame = pd.DataFrame()
-
-        if frame.empty:
+            # Ticker.history is a useful fallback when download returns a changed schema.
             try:
-                hist = yf.Ticker(ticker).history(
-                    period=period, interval=interval, auto_adjust=False,
-                    prepost=True, timeout=10,
-                )
-                if isinstance(hist, pd.DataFrame) and all(name in hist.columns for name in needed):
-                    frame = hist[needed].copy()
+                hist = yf.Ticker(ticker).history(period=period, interval=interval,
+                                                 auto_adjust=False, prepost=False, timeout=8)
+                if not hist.empty and all(c in hist.columns for c in needed):
+                    df = hist[needed].copy()
             except Exception as exc:
-                errors.append(f"yfinance history: {type(exc).__name__}: {exc}")
+                errors.append(f"history: {exc}")
 
-        if frame.empty:
-            message = " | ".join(errors) or "Yahoo returned an empty OHLCV response"
-            _YAHOO_FETCH_DIAGNOSTICS = {"status": "failed", "source": None, "rows": 0, "error": message}
-            log_app_error("fetch_data", message)
+        if df.empty or not all(c in df.columns for c in needed):
+            if errors:
+                log_app_error("fetch_data", " | ".join(errors))
             return pd.DataFrame()
-
-        frame.index = pd.to_datetime(frame.index, errors="coerce")
-        frame = frame[~frame.index.isna()].copy()
+        df.index = pd.to_datetime(df.index, errors="coerce")
+        df = df[~df.index.isna()].copy()
         for col in needed:
-            frame[col] = pd.to_numeric(frame[col], errors="coerce")
-        frame = frame.dropna(subset=["Open", "High", "Low", "Close"])
-        frame["Volume"] = frame["Volume"].fillna(0)
-        frame = frame[~frame.index.duplicated(keep="last")].sort_index()
-        _YAHOO_FETCH_DIAGNOSTICS = {
-            "status": "success", "source": "yfinance fallback", "rows": int(len(frame)),
-            "error": " | ".join(errors) if errors else None,
-            "last_candle": str(frame.index[-1]) if not frame.empty else None,
-        }
-        return frame
-    except Exception as exc:
-        message = f"{type(exc).__name__}: {exc}"
-        _YAHOO_FETCH_DIAGNOSTICS = {"status": "failed", "source": None, "rows": 0, "error": message}
-        log_app_error("fetch_data", message)
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = df.dropna(subset=["Open", "High", "Low", "Close"])
+        df["Volume"] = df["Volume"].fillna(0)
+        df = df[~df.index.duplicated(keep="last")].sort_index()
+        return df
+    except Exception as e:
+        log_app_error("fetch_data", e)
         return pd.DataFrame()
-
-
-@st.cache_data(ttl=5, show_spinner=False)
-def fetch_yahoo_ltp(ticker):
-    """Return Yahoo's latest quote, or latest real intraday bar if quote metadata is absent.
-
-    A candle close is never described as exchange-real-time LTP. The result
-    includes source, timestamp and status so the UI can distinguish them.
-    """
-    try:
-        # Prefer the direct Yahoo chart endpoint; fast_info may be empty or stale
-        # for index symbols such as ^NSEI in some yfinance releases.
-        for quote_interval, quote_period in (("1m", "1d"), ("5m", "5d")):
-            quote_frame, _quote_error = _yahoo_chart_api_frame(ticker, quote_interval, quote_period)
-            if quote_frame is not None and not quote_frame.empty:
-                last_stamp = pd.Timestamp(quote_frame.index[-1])
-                last_price = float(quote_frame["Close"].iloc[-1])
-                now = pd.Timestamp.now(tz=last_stamp.tz) if last_stamp.tz is not None else pd.Timestamp.now()
-                age = max(0, int((now - last_stamp).total_seconds()))
-                return {
-                    "price": last_price,
-                    "source": f"Yahoo Chart API latest {quote_interval} candle close (not exchange LTP)",
-                    "timestamp": last_stamp.strftime("%Y-%m-%d %H:%M:%S %Z").strip(),
-                    "status": "latest_intraday_bar",
-                    "age_seconds": age,
-                }
-        instrument = yf.Ticker(ticker)
-        try:
-            info = instrument.fast_info
-        except Exception:
-            info = None
-
-        # yfinance FastInfo differs across releases; support mapping and attributes.
-        for key in ("last_price", "regular_market_price", "lastPrice"):
-            try:
-                value = info.get(key) if hasattr(info, "get") else None
-                if value is None:
-                    value = getattr(info, key, None)
-                if value is None:
-                    try:
-                        value = info[key]
-                    except Exception:
-                        value = None
-                value = float(value)
-                if np.isfinite(value) and value > 0:
-                    return {
-                        "price": value,
-                        "source": "Yahoo Finance fast_info (latest available quote)",
-                        "timestamp": now_str(),
-                        "status": "quote_received",
-                        "age_seconds": None,
-                    }
-            except Exception:
-                continue
-
-        # Some symbols/releases omit last_price. Use a genuine latest intraday
-        # bar, but label it as a candle close—not a real-time exchange LTP.
-        for interval in ("1m", "5m"):
-            try:
-                history = instrument.history(
-                    period="1d", interval=interval, auto_adjust=False,
-                    prepost=True, timeout=8
-                )
-                if history is None or history.empty or "Close" not in history.columns:
-                    continue
-                closes = pd.to_numeric(history["Close"], errors="coerce").dropna()
-                if closes.empty:
-                    continue
-                stamp = pd.Timestamp(closes.index[-1])
-                age_seconds = None
-                try:
-                    now = pd.Timestamp.now(tz=stamp.tz) if stamp.tz is not None else pd.Timestamp.now()
-                    age_seconds = max(0, int((now - stamp).total_seconds()))
-                    stamp_text = stamp.strftime("%Y-%m-%d %H:%M:%S %Z").strip()
-                except Exception:
-                    stamp_text = str(stamp)
-                price = float(closes.iloc[-1])
-                if np.isfinite(price) and price > 0:
-                    return {
-                        "price": price,
-                        "source": f"Yahoo Finance latest {interval} candle close (not exchange LTP)",
-                        "timestamp": stamp_text,
-                        "status": "latest_intraday_bar",
-                        "age_seconds": age_seconds,
-                    }
-            except Exception:
-                continue
-    except Exception as exc:
-        log_app_error("fetch_yahoo_ltp", exc)
-
-    return {
-        "price": None,
-        "source": "Yahoo quote and intraday bar unavailable",
-        "timestamp": None,
-        "status": "no_quote",
-        "age_seconds": None,
-    }
 
 
 def resample_ohlcv(df, rule):
@@ -1265,7 +1082,7 @@ def get_angel_ltp_polling(api_key, client_code, pin, totp_secret, symbol_name):
 # =========================================================
 def ws_log(msg):
     with WS_STATE_LOCK:
-        ts = datetime.now().strftime("%H:%M:%S")
+        ts = ist_now().strftime("%H:%M:%S")
         WS_SHARED_STATE["log"].append(f"[{ts}] {msg}")
         WS_SHARED_STATE["log"] = WS_SHARED_STATE["log"][-100:]
 
@@ -1547,6 +1364,9 @@ def compute_rsi(series, window=14):
     avg_loss = loss.ewm(alpha=1 / window, min_periods=window, adjust=False).mean()
     rs = avg_gain / avg_loss.replace(0, np.nan)
     rsi = 100 - (100 / (1 + rs))
+    # Zero average loss with positive gains is RSI 100 (not "unknown"); zero/zero is neutral.
+    rsi = rsi.mask((avg_loss == 0) & (avg_gain > 0), 100.0)
+    rsi = rsi.mask((avg_loss == 0) & (avg_gain == 0), 50.0)
     return rsi.fillna(50).clip(1, 99)
 
 
@@ -2183,7 +2003,7 @@ def render_live_global_india_market_board():
                 global_rows, indian_rows = build_live_market_board_rows()
             st.session_state["market_board_cache"] = {
                 "global": global_rows, "indian": indian_rows,
-                "checked_at": datetime.now().strftime("%d-%b-%Y %H:%M:%S"),
+                "checked_at": ist_now().strftime("%d-%b-%Y %H:%M:%S"),
             }
             st.session_state["market_board_last_fetch_epoch"] = now_epoch
         except Exception as exc:
@@ -3128,7 +2948,9 @@ def analyze_signal(
     news_info=None,
     backtest_trade_count=0,
     backtest_is_comparable=False,
+    use_institutional=True,
     benchmark_df=None,
+    signal_weights=None,
 ):
     """Explainable multi-factor signal engine.
 
@@ -3226,6 +3048,28 @@ def analyze_signal(
     bullish = 0.0
     bearish = 0.0
     reasons = []
+    _w = dict(SIGNAL_WEIGHTS)
+    if isinstance(signal_weights, dict):
+        _w.update({k: float(v) for k, v in signal_weights.items() if k in _w})
+    score_audit = []
+    _mark_state = {"b": 0.0, "r": 0.0}
+
+    def _mark(group, label, bull, bear, available=True, reason=""):
+        """Close a scoring segment: apply the configurable group weight to the points
+        added since the previous mark and record exactly what was added."""
+        raw_b = bull - _mark_state["b"]
+        raw_r = bear - _mark_state["r"]
+        w = _w.get(group, 1.0)
+        fin_b, fin_r = raw_b * w, raw_r * w
+        new_b, new_r = _mark_state["b"] + fin_b, _mark_state["r"] + fin_r
+        _mark_state["b"], _mark_state["r"] = new_b, new_r
+        score_audit.append({"Indicator": label, "Group": group, "Weight": w,
+                            "Bullish": round(fin_b, 2), "Bearish": round(fin_r, 2),
+                            "Net": round(fin_b - fin_r, 2),
+                            "Data available": "Yes" if available else "No",
+                            "Status": ("Bullish" if fin_b > fin_r else "Bearish" if fin_r > fin_b else "Neutral"),
+                            "Reason": reason})
+        return new_b, new_r
 
     # Trend structure: intentionally separate, modest weights to limit correlated double-counting.
     if ema20 > ema50:
@@ -3252,6 +3096,8 @@ def analyze_signal(
     elif supertrend_dir == -1:
         bearish += 2; reasons.append("SuperTrend bearish (+2)")
 
+    bullish, bearish = _mark("trend", "Trend structure (EMA20/50/200, VWAP, SuperTrend)", bullish, bearish,
+                              True, "EMA200 included only when mature" if ema200_available else "EMA200 immature; excluded")
     # Momentum: RSI zones avoid the old 55/45 cliff; MACD is a separate confirmation.
     if rsi >= 55:
         bullish += 2; reasons.append("RSI bullish zone (+2)")
@@ -3289,6 +3135,8 @@ def analyze_signal(
     elif stoch_k < stoch_d and stoch_k > 20:
         bearish += 1; reasons.append("Stochastic bearish crossover (+1)")
 
+    bullish, bearish = _mark("momentum", "Momentum (RSI, MACD, ADX/DI, Stochastic, EMA slope)", bullish, bearish,
+                              True, f"ADX {adx:.1f}")
     # Price-action confirmation. Patterns are capped and do not override trend/momentum.
     candle_pattern = str(latest.get("CandlePattern", "No clear pattern"))
     candle_bias = str(latest.get("CandlePatternBias", "Neutral"))
@@ -3327,6 +3175,8 @@ def analyze_signal(
     elif not volume_data_available:
         reasons.append("Volume unavailable/non-representative for this instrument; volume is not used as a veto")
 
+    bullish, bearish = _mark("price_action", "Price action (candlestick patterns, Heikin-Ashi, breakout/retest, volume)", bullish, bearish,
+                              True, f"pattern: {candle_pattern}" + ("" if volume_data_available else "; volume unavailable"))
     # Higher timeframe and MTF are confirmations, not duplicated fake counts.
     mtf_available_count = max(0, int(mtf_available_count or 0))
     mtf_bull_count = max(0, int(mtf_bull_count or 0))
@@ -3345,6 +3195,9 @@ def analyze_signal(
     else:
         reasons.append("MTF feed unavailable; no directional points or penalty applied")
 
+    bullish, bearish = _mark("mtf", "Higher timeframe + multi-timeframe alignment", bullish, bearish,
+                              mtf_available_count > 0 or htf_bias is not None,
+                              f"MTF {mtf_bull_count}B/{mtf_bear_count}S of {mtf_available_count}; HTF {htf_bias}")
     option_metrics = option_metrics if isinstance(option_metrics, dict) else {}
     pcr = option_metrics.get("pcr")
     try:
@@ -3364,6 +3217,48 @@ def analyze_signal(
     else:
         reasons.append("PCR unavailable; excluded from scoring")
     # Avoid double-counting OI bias where it is derived from the same total CE/PE OI as PCR.
+    bullish, bearish = _mark("options", "Options PCR", bullish, bearish, pcr is not None,
+                              f"PCR {pcr:.2f}" if pcr is not None else "Option-chain unavailable; contributes 0")
+
+    # ================= INSTITUTIONAL ANALYSIS (part of the real score) =================
+    institutional_score = 0.0
+    inst_components = []
+    liquidity_block_buy = liquidity_block_sell = False
+    inst_status = "disabled"
+    # Same 250-bar window in live use and backtests keeps structure/volume-profile parity.
+    if use_institutional and max(bullish, bearish) >= 4:
+        try:
+            _inst_diag = inst.collect_institutional_diagnostics(df.tail(250), benchmark_df=benchmark_df) or {}
+            inst_components, institutional_score, liquidity_block_buy, liquidity_block_sell = \
+                inst.institutional_score_components(_inst_diag, cap=inst.INSTITUTIONAL_SCORE_CAP)
+            inst_status = "ok" if inst_components else "unavailable"
+        except Exception as _inst_err:
+            log_app_error("institutional_score", _inst_err)
+            inst_status = f"error: {type(_inst_err).__name__}"
+        for _c in inst_components:
+            _b, _r = _c["bullish"], _c["bearish"]
+            bullish += _b
+            bearish += _r
+            if _b or _r:
+                reasons.append(f"Institutional {_c['name']}: {_c['reason']} ({'+%.1f bullish' % _b if _b else '+%.1f bearish' % _r})")
+        # keep the capped net consistent with the amounts actually added
+        _added_net = sum(_c["net"] for _c in inst_components)
+        _overflow = _added_net - institutional_score
+        if abs(_overflow) > 1e-9:
+            if _overflow > 0:
+                bullish -= _overflow
+            else:
+                bearish -= abs(_overflow)
+        bullish, bearish = _mark("institutional", "Institutional (structure, liquidity, OB, FVG, volume profile, premium/discount, RS)",
+                                  bullish, bearish, inst_status == "ok",
+                                  f"net {institutional_score:+.1f}; RS benchmark {'available' if benchmark_df is not None else 'unavailable'}")
+        if liquidity_block_buy:
+            reasons.append("Liquidity sweep above recent highs: BUY entries blocked")
+        if liquidity_block_sell:
+            reasons.append("Liquidity sweep below recent lows: SELL entries blocked")
+    elif use_institutional:
+        reasons.append("Institutional analysis skipped (directional evidence below 4 points)")
+        bullish, bearish = _mark("institutional", "Institutional", bullish, bearish, False, "Skipped: low pre-score")
 
     regime = detect_market_regime(df)
     _news_message_for_regime = str((news_info or {}).get("message", ""))
@@ -3381,54 +3276,6 @@ def analyze_signal(
     session_allowed = bool(session_info.get("valid", True))
     news_allowed = bool(news_info.get("allow_trade", True))
 
-    # INSTITUTIONAL CONFIRMATION IS PART OF THE MAIN DIRECTIONAL SCORE.
-    # Each component is computed from the same validated OHLCV frame. Missing
-    # diagnostics contribute zero; they never create synthetic bullish/bearish evidence.
-    institutional_diagnostics = {}
-    institutional_score = 0.0
-    try:
-        institutional_diagnostics = inst.collect_institutional_diagnostics(df, benchmark_df=benchmark_df)
-        institutional_participation = {}
-        raw_institutional_score = 0.0
-        if isinstance(institutional_diagnostics, dict) and institutional_diagnostics.get("available", True):
-            for component in ("market_structure", "liquidity", "order_blocks", "fvg", "volume_profile"):
-                item = institutional_diagnostics.get(component)
-                if isinstance(item, dict):
-                    component_score = _safe_num(item.get("score"), 0.0)
-                    raw_institutional_score += component_score
-                    institutional_participation[component] = {"status": "ACTIVE", "score": component_score, "reason": str(item.get("structure", item.get("type", item.get("retest", item.get("signal", "Calculated")))))}
-                else:
-                    institutional_participation[component] = {"status": "UNAVAILABLE", "score": 0.0, "reason": "Insufficient source data"}
-            relative_strength = institutional_diagnostics.get("relative_strength")
-            if benchmark_df is not None and isinstance(relative_strength, (int, float)) and np.isfinite(relative_strength):
-                rs_component = (float(relative_strength) - 5.0) * 2.0
-                raw_institutional_score += rs_component
-                institutional_participation["relative_strength"] = {"status": "ACTIVE", "score": rs_component, "reason": f"Benchmark-relative score {relative_strength:.2f}/10"}
-            else:
-                institutional_participation["relative_strength"] = {"status": "UNAVAILABLE / NEUTRAL", "score": 0.0, "reason": "Real aligned benchmark candles not supplied; no synthetic RS score"}
-            institutional_participation["sector_strength"] = {"status": "UNAVAILABLE / NEUTRAL", "score": 0.0, "reason": "No verified symbol-to-sector OHLCV mapping supplied"}
-            institutional_participation["oi_positioning"] = {"status": "UNAVAILABLE / NEUTRAL", "score": 0.0, "reason": "Independent price/OI change series not supplied; PCR is not double-counted"}
-            institutional_score = float(max(-8.0, min(8.0, raw_institutional_score)))
-            institutional_participation["aggregate"] = {"status": "APPLIED", "raw_score": raw_institutional_score, "score": institutional_score, "cap": 8.0, "cap_applied": not np.isclose(raw_institutional_score, institutional_score), "reason": "Existing institutional aggregate cap preserved at +/-8"}
-            if institutional_score > 0:
-                bullish += institutional_score
-                reasons.append(f"Institutional Confirmation (+{institutional_score:.1f}; raw {raw_institutional_score:.1f})")
-            elif institutional_score < 0:
-                bearish += abs(institutional_score)
-                reasons.append(f"Institutional Bearish Confirmation ({abs(institutional_score):.1f}; raw {raw_institutional_score:.1f})")
-        else:
-            institutional_participation = {k: {"status": "UNAVAILABLE", "score": 0.0, "reason": institutional_diagnostics.get("message", "Diagnostics unavailable")} for k in ("market_structure", "liquidity", "order_blocks", "fvg", "volume_profile", "relative_strength", "sector_strength", "oi_positioning")}
-            institutional_participation["aggregate"] = {"status": "NOT APPLIED", "raw_score": 0.0, "score": 0.0, "cap": 8.0, "cap_applied": False, "reason": "No valid OHLCV diagnostics"}
-        institutional_diagnostics["participation_audit"] = institutional_participation
-        liquidity_item = institutional_diagnostics.get("liquidity") if isinstance(institutional_diagnostics, dict) else None
-        liquidity_block_entry = bool(isinstance(liquidity_item, dict) and liquidity_item.get("block_entry", False))
-        if liquidity_block_entry:
-            reasons.append(f"Liquidity sweep entry blocker active ({liquidity_item.get('type', 'sweep')}); review before entry")
-    except Exception as institutional_error:
-        institutional_diagnostics = {"error": str(institutional_error), "status": "UNAVAILABLE"}
-        institutional_score = 0.0
-        reasons.append("Institutional diagnostics unavailable; no score applied")
-
     # Candidate direction requires both score advantage and price/trend structure.
     directional_edge = abs(bullish - bearish)
     directional_bias = "Bullish" if bullish > bearish else "Bearish" if bearish > bullish else "Neutral"
@@ -3440,7 +3287,7 @@ def analyze_signal(
     sell_trend_votes = sum([close_price < ema20, ema20 < ema50, (close_price < ema200) if ema200_available else False, supertrend_dir == -1])
     buy_momentum_ok = (macd > macd_signal) or (rsi >= 52) or breakout or retest_bull
     sell_momentum_ok = (macd < macd_signal) or (rsi <= 48) or breakdown or retest_bear
-    adx_ok = adx >= 15 or breakout or breakdown or retest_bull or retest_bear
+    adx_ok = adx >= MANDATORY_ADX or breakout or breakdown or retest_bull or retest_bear
 
     # Prior-bar S/R and ATR-aware buffer: 0.5% was far too wide for NIFTY intraday.
     sr_buffer = max(0.20 * atr, close_price * 0.0005, 0.01)
@@ -3467,8 +3314,6 @@ def analyze_signal(
             momentum_ok = sell_momentum_ok
             conflict = mtf_sell_conflict or htf_sell_conflict
             near_level = sell_near_support
-        if liquidity_block_entry:
-            out.append(f"Liquidity sweep risk blocks {side} entry ({liquidity_item.get('type', 'sweep')}); wait for a fresh confirmed setup")
         if not score_ok:
             out.append("Directional score is not sufficiently separated (need score >= 7 and edge >= 3)")
         if votes < 2:
@@ -3476,9 +3321,16 @@ def analyze_signal(
         if not momentum_ok:
             out.append("Momentum confirmation missing (MACD/RSI/breakout)")
         if not adx_ok:
-            out.append(f"ADX weak ({adx:.1f}); no breakout/retest override")
+            out.append(f"ADX {adx:.1f} below mandatory {MANDATORY_ADX}; no breakout/retest override")
         if conflict:
             out.append("Higher-timeframe/MTF direction conflicts with this setup")
+        aligned = mtf_bull_count if side == "BUY" else mtf_bear_count
+        if mtf_available_count >= MANDATORY_MTF_ALIGN_COUNT and aligned < MANDATORY_MTF_ALIGN_COUNT:
+            out.append(f"MTF alignment {aligned}/{mtf_available_count} below the mandatory {MANDATORY_MTF_ALIGN_COUNT}")
+        if side == "BUY" and liquidity_block_buy:
+            out.append("Liquidity sweep above recent highs (BUY trap risk)")
+        if side == "SELL" and liquidity_block_sell:
+            out.append("Liquidity sweep below recent lows (SELL trap risk)")
         if sideways and not (breakout or breakdown or retest_bull or retest_bear) and votes < 3:
             out.append("Sideways regime without a confirmed range breakout")
         if not session_allowed:
@@ -3503,11 +3355,13 @@ def analyze_signal(
     selected_blockers = []
     
     selected_side = None
+    is_strong = False
+    
+    
     if buy_allowed and (not sell_allowed or bullish - bearish >= bearish - bullish):
         selected_side = "BUY"
     elif sell_allowed:
         selected_side = "SELL"
-
     if selected_side:
         risk = max(atr, close_price * 0.001, 0.01)
         if selected_side == "BUY":
@@ -3516,6 +3370,7 @@ def analyze_signal(
             target1, target2, target3 = close_price + 2*risk, close_price + 3*risk, close_price + 4*risk
             trailing_stop = close_price - 0.75*risk
             strong = bullish >= 25 and (bullish - bearish) >= 6 and buy_trend_votes >= 3 and adx >= 20 and (htf_bias == "bullish" or mtf_bull_count > mtf_bear_count or breakout or volume_spike)
+            is_strong = bool(strong)
             signal_text = "STRONG BUY" if strong else "BUY"
             strength = "High" if strong else "Medium"
             selected_blockers = []
@@ -3525,6 +3380,7 @@ def analyze_signal(
             target1, target2, target3 = close_price - 2*risk, close_price - 3*risk, close_price - 4*risk
             trailing_stop = close_price + 0.75*risk
             strong = bearish >= 25 and (bearish - bullish) >= 6 and sell_trend_votes >= 3 and adx >= 20 and (htf_bias == "bearish" or mtf_bear_count > mtf_bull_count or breakdown or volume_spike)
+            is_strong = bool(strong)
             signal_text = "STRONG SELL" if strong else "SELL"
             strength = "High" if strong else "Medium"
         partial_exit = target1
@@ -3588,12 +3444,23 @@ def analyze_signal(
         selected_blockers.append(
             f"Trade Quality Too Low ({trade_quality_score}/100)"
         )
+    # Mandatory settings applied consistently after scoring.
+    if signal_type != "neutral" and STRICT_TRADE_ONLY_STRONG and not is_strong:
+        signal_text, signal_type = "NO TRADE", "neutral"
+        selected_blockers.append("STRICT_TRADE_ONLY_STRONG is on and this setup is not STRONG")
+    if signal_type != "neutral" and (rr_ratio is None or rr_ratio < MIN_RR_REQUIRED):
+        signal_text, signal_type = "NO TRADE", "neutral"
+        selected_blockers.append(f"Risk/reward {rr_ratio} below MIN_RR_REQUIRED {MIN_RR_REQUIRED}")
+    if signal_type == "neutral":
+        # A rejected setup must not leave stale levels behind.
+        stop_loss = target1 = target2 = target3 = partial_exit = trailing_stop = rr_ratio = None
+        strength = "Low"
+        confidence = None
+        trade_quality_score = 0
     no_trade_zone = candidate_no_trade_zone
     no_trade_reason = "; ".join(selected_blockers) if selected_blockers else None
     reasons.extend(selected_blockers if signal_type == "neutral" else [f"Entry approved: {signal_text}"])
-    regime = detect_market_regime(df)
-    gap_info = detect_gap_filter(df)
-    session_info = session_filter(df, timeframe_label)
+    net_score = round(bullish - bearish, 1)
     return {
         "close_price": close_price, "ema20": ema20, "ema50": ema50, "ema200": ema200,
         "vwap": vwap_value, "rsi": rsi, "macd": macd, "macd_signal": macd_signal,
@@ -3609,10 +3476,10 @@ def analyze_signal(
         "target2": target2, "target3": target3, "trailing_stop": trailing_stop,
         "rr_ratio": rr_ratio, "reasons": reasons, "no_trade_reason": no_trade_reason,
         "no_trade_reasons": selected_blockers, "bullish_score": round(bullish, 1),
-        "bearish_score": round(bearish, 1), "institutional_score": round(institutional_score, 1),
-        "institutional_diagnostics": institutional_diagnostics,
-        "institutional_participation_audit": institutional_diagnostics.get("participation_audit", {}) if isinstance(institutional_diagnostics, dict) else {},
-        "liquidity_block_entry": bool(liquidity_block_entry), "directional_bias": directional_bias,
+        "bearish_score": round(bearish, 1),"institutional_score": round(institutional_score, 1), "directional_bias": directional_bias,
+        "net_score": net_score, "score_audit": score_audit, "institutional_components": inst_components,
+        "institutional_status": inst_status, "liquidity_block_buy": liquidity_block_buy,
+        "liquidity_block_sell": liquidity_block_sell, "signal_weights": _w,
         "directional_edge": round(directional_edge, 1), "session_message": session_info["message"],
         "supertrend_direction": supertrend_dir, "ha_bullish": ha_bullish, "ha_bearish": ha_bearish,
         "ha_trend_up": ha_trend_up, "ha_trend_down": ha_trend_down,
@@ -3693,8 +3560,6 @@ def build_trade_feature_snapshot(df, analysis, mtf_bull_count=0, mtf_bear_count=
         "HistoricalWinRateAtEntry": _safe_num(analysis.get("historical_win_rate")),
         "SimilarTradesAtEntry": int(analysis.get("similar_trades_found", 0) or 0),
         "SignalStage": str(analysis.get("signal_stage", "")),
-        "Symbol": str(analysis.get("symbol", "") or ""),
-        "Timeframe": str(analysis.get("timeframe", "") or ""),
     }
     return snap
 
@@ -3721,109 +3586,56 @@ def classify_trade_loss(snapshot, pnl, side="BUY", exit_price=None, entry_price=
     return "Unclassified Loss - Review News, Entry Timing and Execution"
 
 
-def _similarity_score(current, historical, min_features=5):
-    """Robust similarity using every captured numeric feature that is comparable.
-
-    Price/volume scale features are compared relatively; oscillator, ratio and
-    percentage-distance features use bounded absolute tolerances. Sparse rows
-    are rejected instead of being treated as convincing matches.
-    """
-    if not isinstance(current, dict) or not isinstance(historical, dict):
-        return 0.0
-    # Absolute tolerances for dimensionless indicators and percentage distances.
-    absolute_tolerances = {
-        "RSI": 12.0, "ADX": 12.0, "RelativeVolume": 0.9,
-        "RiskRewardRatio": 1.5, "TrendSlope": 0.15,
-        "SupportDistancePct": 1.0, "ResistanceDistancePct": 1.0,
-        "DistanceEMA20Pct": 0.8, "DistanceEMA50Pct": 1.2,
-        "DistanceVWAPPct": 0.8,
-    }
-    # Relative tolerances avoid raw price/volume levels dominating the score.
-    relative_tolerances = {
-        "EMA9": 0.015, "EMA21": 0.015, "EMA20": 0.015,
-        "EMA50": 0.02, "EMA200": 0.025, "VWAP": 0.015,
-        "ATR": 0.35, "MACD": 0.50, "Volume": 0.75,
-        "VolumeDelta": 1.0,
-    }
+def _similarity_score(current, historical):
+    """Distance over available comparable numeric features; tolerates old/incomplete journal rows."""
     pairs = []
-    for key in LOSS_FEATURE_COLUMNS:
+    tolerances = {"RSI": 12, "ADX": 12, "RelativeVolume": 0.9, "RiskRewardRatio": 1.5,
+                  "DistanceEMA20Pct": 0.8, "DistanceEMA50Pct": 1.2, "TrendSlope": max(abs(_safe_num(current.get("TrendSlope"), 0))*1.5, 0.05)}
+    for key in ("RSI", "ADX", "RelativeVolume", "RiskRewardRatio", "DistanceEMA20Pct", "DistanceEMA50Pct", "TrendSlope"):
         a, b = _safe_num(current.get(key)), _safe_num(historical.get(key))
-        if not (np.isfinite(a) and np.isfinite(b)):
-            continue
-        if key in absolute_tolerances:
-            distance = abs(a - b) / max(absolute_tolerances[key], 1e-9)
-        else:
-            scale = max(abs(a), abs(b), 1e-9)
-            distance = (abs(a - b) / scale) / relative_tolerances.get(key, 0.25)
-        pairs.append(max(0.0, 1.0 - min(distance, 1.0)))
-    if len(pairs) < min_features:
-        return 0.0
+        if np.isfinite(a) and np.isfinite(b):
+            tol = tolerances.get(key, 1.0)
+            pairs.append(max(0.0, 1.0 - abs(a-b) / max(tol, 1e-6)))
+    if not pairs: return 0.0
     score = float(np.mean(pairs))
-    # Context features add only a small tie-breaker after numeric coverage passes.
-    if current.get("MarketRegime") and historical.get("MarketRegime") and str(current.get("MarketRegime")).strip().lower() == str(historical.get("MarketRegime")).strip().lower():
-        score = min(1.0, score + 0.025)
-    if current.get("MTFTrendStatus") and historical.get("MTFTrendStatus") and str(current.get("MTFTrendStatus")).strip().lower() == str(historical.get("MTFTrendStatus")).strip().lower():
-        score = min(1.0, score + 0.025)
+    if current.get("MarketRegime") and historical.get("MarketRegime") and str(current.get("MarketRegime")) == str(historical.get("MarketRegime")):
+        score = min(1.0, score + 0.08)
+    if current.get("MTFTrendStatus") and historical.get("MTFTrendStatus") and str(current.get("MTFTrendStatus")) == str(historical.get("MTFTrendStatus")):
+        score = min(1.0, score + 0.05)
     return score
 
 
-def get_similar_trade_intelligence(snapshot, side, min_similarity=0.68, min_features=5):
-    """Compare only closed trades with the same directional side and sufficient feature coverage."""
-    empty = {"matches": pd.DataFrame(), "count": 0, "win_rate": None, "loss_rate": None,
-             "avg_profit": None, "avg_loss": None, "expected_value": None,
-             "loser_match_rate": None, "reason": "No sufficiently comparable closed trades found.",
-             "min_features": min_features}
-    side = str(side or "").strip().upper()
-    if side not in ("BUY", "SELL"):
-        empty["reason"] = "Neutral / NO TRADE signal: directional similarity matching skipped."
-        return empty
-    if not isinstance(snapshot, dict) or not snapshot:
-        empty["reason"] = "Current feature snapshot is unavailable."
-        return empty
+def get_similar_trade_intelligence(snapshot, side, min_similarity=0.68):
     journal = load_journal()
-    if journal.empty or not {"Status", "Result"}.issubset(journal.columns):
-        empty["reason"] = "Journal is empty or lacks Status/Result fields."
-        return empty
+    result = {"matches": pd.DataFrame(), "count": 0, "win_rate": None, "loss_rate": None,
+              "avg_profit": None, "avg_loss": None, "expected_value": None, "loser_match_rate": None}
+    if journal.empty or not {"Status", "Result"}.issubset(journal.columns): return result
     closed = journal[journal["Status"].astype(str).str.upper().eq("CLOSED")].copy()
-    if "Side" in closed.columns:
-        closed = closed[closed["Side"].astype(str).str.upper().eq(side)]
-    # When timeframe metadata exists on both sides, do not mix unlike timeframes.
-    current_tf = str(snapshot.get("Timeframe", "") or "").strip().lower()
-    if current_tf and "Timeframe" in closed.columns:
-        hist_tf = closed["Timeframe"].astype(str).str.strip().str.lower()
-        closed = closed[hist_tf.eq(current_tf) | hist_tf.eq("") | hist_tf.eq("nan")]
-    if closed.empty:
-        empty["reason"] = f"No closed {side} journal trades available for this timeframe."
-        return empty
+    if "Side" in closed.columns: closed = closed[closed["Side"].astype(str).str.upper().eq(str(side).upper())]
+    if closed.empty: return result
     scores = []
-    for idx, row in closed.iterrows():
+    for _, row in closed.iterrows():
         hist = {k: row.get(k) for k in LOSS_FEATURE_COLUMNS + ["MarketRegime", "MTFTrendStatus"]}
-        score = _similarity_score(snapshot, hist, min_features=min_features)
+        score = _similarity_score(snapshot, hist)
         if score >= min_similarity:
-            scores.append((idx, score))
-    if not scores:
-        empty["reason"] = f"No {side} trades met {min_features}-feature coverage and {min_similarity:.0%} similarity."
-        return empty
+            scores.append((row.name, score))
+    if not scores: return result
     matches = closed.loc[[x[0] for x in scores]].copy()
     matches["Similarity"] = [x[1] for x in scores]
     pnl = pd.to_numeric(matches.get("PnL", pd.Series(0, index=matches.index)), errors="coerce").fillna(0)
-    wins, losses = pnl[pnl > 0], pnl[pnl < 0]
+    wins = pnl[pnl > 0]; losses = pnl[pnl < 0]
     count = len(matches)
-    result = {"matches": matches.sort_values("Similarity", ascending=False), "count": count,
-              "win_rate": float((pnl > 0).mean() * 100), "loss_rate": float((pnl < 0).mean() * 100),
-              "avg_profit": float(wins.mean()) if len(wins) else 0.0,
-              "avg_loss": float(losses.mean()) if len(losses) else 0.0,
-              "expected_value": float(pnl.mean()), "loser_match_rate": float((pnl < 0).mean() * 100),
-              "reason": f"{count} closed {side} trades matched using at least {min_features} comparable features.",
-              "min_features": min_features}
+    result.update({"matches": matches.sort_values("Similarity", ascending=False), "count": count,
+                   "win_rate": float((pnl > 0).mean() * 100), "loss_rate": float((pnl < 0).mean() * 100),
+                   "avg_profit": float(wins.mean()) if len(wins) else 0.0,
+                   "avg_loss": float(losses.mean()) if len(losses) else 0.0,
+                   "expected_value": float(pnl.mean()), "loser_match_rate": float((pnl < 0).mean() * 100)})
     return result
 
 
 def apply_adaptive_signal_intelligence(df, analysis, symbol, timeframe, mtf_bull_count=0, mtf_bear_count=0, mtf_available_count=0):
     """Add similar-trade learning, conservative confidence adjustment and staged signal labels."""
-    side = "BUY" if analysis.get("signal_type") == "buy" else "SELL" if analysis.get("signal_type") == "sell" else None
-    analysis["symbol"] = symbol
-    analysis["timeframe"] = timeframe
+    side = "BUY" if analysis.get("signal_type") == "buy" else "SELL" if analysis.get("signal_type") == "sell" else "BUY"
     snapshot = build_trade_feature_snapshot(df, analysis, mtf_bull_count, mtf_bear_count, mtf_available_count)
     intelligence = get_similar_trade_intelligence(snapshot, side)
     analysis["similar_trades_found"] = intelligence["count"]
@@ -3899,36 +3711,34 @@ def apply_adaptive_signal_intelligence(df, analysis, symbol, timeframe, mtf_bull
     similar_trades = analysis.get("similar_trades_found", 0)
     repeat_loss_warning = analysis.get("repeat_loss_warning", False)
     
-    if (
-        similar_trades >= 20
-        and historical_loss_rate is not None
-    ):
-    
+    def _clear_levels(a):
+        for k in ("stop_loss", "target1", "target2", "target3", "partial_exit", "trailing_stop", "rr_ratio"):
+            a[k] = None
+        a["strength"] = "Low"
+        a["confidence"] = None
+        a["trade_quality_score"] = 0
+        a["trade_allowed"] = False
+
+    is_live_signal = analysis.get("signal_type") in ("buy", "sell")
+    if is_live_signal and similar_trades >= 20 and historical_loss_rate is not None:
         if historical_loss_rate >= 80:
-    
             analysis["signal_text"] = "NO TRADE"
             analysis["signal_type"] = "neutral"
-    
-            analysis["no_trade_reasons"].append(
-                f"AI Block: {historical_loss_rate:.1f}% similar setups were losing trades"
-            )
-    
+            analysis.setdefault("no_trade_reasons", []).append(
+                f"AI Block: {historical_loss_rate:.1f}% of similar setups were losing trades")
+            _clear_levels(analysis)
+            is_live_signal = False
         elif historical_loss_rate >= 65:
-    
             if analysis["signal_text"] == "STRONG BUY":
                 analysis["signal_text"] = "BUY"
-    
             elif analysis["signal_text"] == "STRONG SELL":
                 analysis["signal_text"] = "SELL"
-    
-            _old_confidence = _safe_num(analysis.get("confidence"), 0.0)
-            analysis["confidence"] = max(0, int(_old_confidence - 15))
-    
-    # The repeat-loss penalty was already included above; do not subtract it twice.
-    # Confidence can be None after a neutral override, so never perform arithmetic on None.
-    if analysis.get("confidence") is not None:
-        analysis["confidence"] = max(0, min(100, int(analysis["confidence"])))
-    analysis["ai_override_applied"] = bool(similar_trades >= 20 and historical_loss_rate is not None and historical_loss_rate >= 65)
+            if analysis.get("confidence") is not None:
+                analysis["confidence"] = max(0, int(analysis["confidence"] - 15))
+    if is_live_signal and repeat_loss_warning and analysis.get("confidence") is not None:
+        analysis["confidence"] = max(0, int(analysis["confidence"] - 10))
+    # The learning layer may only tighten a signal; it can never relax a risk blocker.
+    analysis["ai_override_applied"] = True
     return analysis
 
 
@@ -4013,7 +3823,7 @@ def train_trade_success_model(min_trades=30):
 def add_signal_audit(symbol, timeframe, analysis):
     try:
         audit = load_signal_audit()
-        expiry_time = datetime.now() + timedelta(minutes=SIGNAL_EXPIRY_MINUTES)
+        expiry_time = ist_now() + timedelta(minutes=SIGNAL_EXPIRY_MINUTES)
         row = {
             "DateTime": now_str(),
             "Symbol": symbol,
@@ -4041,7 +3851,7 @@ def is_duplicate_signal(symbol, timeframe, analysis):
         if audit.empty:
             return False
         audit["DateTimeParsed"] = pd.to_datetime(audit["DateTime"], format="%d-%m-%Y %H:%M:%S", errors="coerce")
-        cutoff = datetime.now() - timedelta(minutes=MAX_SIGNAL_DUPLICATE_WINDOW_MIN)
+        cutoff = ist_now() - timedelta(minutes=MAX_SIGNAL_DUPLICATE_WINDOW_MIN)
         recent = audit[
             (audit["DateTimeParsed"] >= cutoff) &
             (audit["Symbol"] == symbol) &
@@ -4070,7 +3880,7 @@ def get_signal_expiry_remaining(symbol, timeframe, signal_text):
         expiry = rows["ExpiryParsed"].max()
         if pd.isna(expiry):
             return None
-        diff = expiry - datetime.now()
+        diff = expiry - ist_now()
         return max(0, int(diff.total_seconds()))
     except Exception as e:
         log_app_error("get_signal_expiry_remaining", e)
@@ -4080,41 +3890,61 @@ def get_signal_expiry_remaining(symbol, timeframe, signal_text):
 # =========================================================
 # RISK / PAPER TRADING
 # =========================================================
-def get_today_closed_trades():
-    journal = load_journal()
-    if journal.empty:
+def _closed_with_exit_dt(journal):
+    """Closed trades with an `ExitDT` column (exit time; falls back to entry time for old rows)."""
+    if journal is None or journal.empty or "Status" not in journal.columns:
         return pd.DataFrame()
-    closed = journal[journal["Status"] == "CLOSED"].copy()
+    closed = journal[journal["Status"].astype(str).str.upper() == "CLOSED"].copy()
     if closed.empty:
         return closed
-    closed["DateOnly"] = pd.to_datetime(closed["DateTime"], format="%d-%m-%Y %H:%M:%S", errors="coerce").dt.date
-    today = datetime.now().date()
-    return closed[closed["DateOnly"] == today].copy()
+    fmt = "%d-%m-%Y %H:%M:%S"
+    entry_dt = pd.to_datetime(closed["DateTime"], format=fmt, errors="coerce")
+    if "ExitTime" in closed.columns:
+        exit_dt = pd.to_datetime(closed["ExitTime"], format=fmt, errors="coerce")
+        closed["ExitDT"] = exit_dt.fillna(entry_dt)
+    else:
+        closed["ExitDT"] = entry_dt
+    return closed
+
+
+def get_today_closed_trades():
+    closed = _closed_with_exit_dt(load_journal())
+    if closed.empty:
+        return closed
+    return closed[closed["ExitDT"].dt.date == ist_now().date()].copy()
 
 
 def get_week_closed_trades():
-    journal = load_journal()
-    if journal.empty:
-        return pd.DataFrame()
-    closed = journal[journal["Status"] == "CLOSED"].copy()
+    closed = _closed_with_exit_dt(load_journal())
     if closed.empty:
         return closed
-    closed["DateOnly"] = pd.to_datetime(closed["DateTime"], format="%d-%m-%Y %H:%M:%S", errors="coerce")
-    start_week = datetime.now() - timedelta(days=datetime.now().weekday())
-    start_week = datetime(start_week.year, start_week.month, start_week.day)
-    return closed[closed["DateOnly"] >= start_week].copy()
+    now = ist_now()
+    start_week = datetime(now.year, now.month, now.day) - timedelta(days=now.weekday())
+    return closed[closed["ExitDT"] >= start_week].copy()
 
 
 def get_month_closed_trades():
-    journal = load_journal()
-    if journal.empty:
-        return pd.DataFrame()
-    closed = journal[journal["Status"] == "CLOSED"].copy()
+    closed = _closed_with_exit_dt(load_journal())
     if closed.empty:
         return closed
-    closed["DateOnly"] = pd.to_datetime(closed["DateTime"], format="%d-%m-%Y %H:%M:%S", errors="coerce")
-    start_month = datetime(datetime.now().year, datetime.now().month, 1)
-    return closed[closed["DateOnly"] >= start_month].copy()
+    now = ist_now()
+    return closed[closed["ExitDT"] >= datetime(now.year, now.month, 1)].copy()
+
+
+def get_today_opened_count():
+    """Trades OPENED today (open + closed) so MaxTradesPerDay cannot be bypassed by leaving trades open."""
+    journal = load_journal()
+    if journal.empty or "DateTime" not in journal.columns:
+        return 0
+    entry_dt = pd.to_datetime(journal["DateTime"], format="%d-%m-%Y %H:%M:%S", errors="coerce")
+    return int((entry_dt.dt.date == ist_now().date()).sum())
+
+
+def get_open_position_count():
+    journal = load_journal()
+    if journal.empty or "Status" not in journal.columns:
+        return 0
+    return int((journal["Status"].astype(str).str.upper() == "OPEN").sum())
 
 
 def update_risk_locks():
@@ -4137,7 +3967,9 @@ def update_risk_locks():
         monthly_limit = float(monthly.loc[0, "MonthlyLossLimit"])
         capital_protection_pct = float(risk_state.loc[0, "CapitalProtectionPct"])
 
-        balance = float(paper.loc[0, "Balance"])
+        # Equity = free cash + notional reserved by open positions. Using cash alone
+        # would falsely trip capital protection the moment a large position is opened.
+        balance = float(paper.loc[0, "Balance"]) + float(paper.loc[0, "UsedMargin"])
         initial_balance = float(paper.loc[0, "InitialBalance"])
         capital_floor = initial_balance * (1 - capital_protection_pct / 100)
 
@@ -4159,14 +3991,14 @@ def risk_check_before_trade():
     risk_state = load_risk_state()
     weekly_risk = load_weekly_risk()
     monthly_risk = load_monthly_risk()
-    journal_today = get_today_closed_trades()
 
     trading_enabled = bool(risk_state.loc[0, "TradingEnabled"])
     daily_lock = bool(risk_state.loc[0, "DailyLock"])
     weekly_lock = bool(weekly_risk.loc[0, "WeeklyLock"])
     monthly_lock = bool(monthly_risk.loc[0, "MonthlyLock"])
     max_trades_per_day = int(risk_state.loc[0, "MaxTradesPerDay"])
-    trades_today = len(journal_today)
+    trades_today = get_today_opened_count()
+    max_open = int(risk_state.loc[0, "MaxOpenPositions"]) if "MaxOpenPositions" in risk_state.columns else 3
 
     if not trading_enabled:
         return False, "Trading disabled by risk management"
@@ -4176,6 +4008,8 @@ def risk_check_before_trade():
         return False, "Weekly lock active"
     if monthly_lock:
         return False, "Monthly lock active"
+    if get_open_position_count() >= max_open:
+        return False, f"Max open positions reached ({max_open})"
     if trades_today >= max_trades_per_day:
         return False, f"Max trades per day reached ({max_trades_per_day})"
     return True, "Risk checks passed"
@@ -4275,8 +4109,8 @@ def add_trade_to_journal(symbol, timeframe, signal, entry_price, quantity, stop_
     journal = load_journal()
     side = "SELL" if "SELL" in str(signal).upper() else "BUY"
     new_row = {
-        "DateTime": now_str(), "TradeDate": datetime.now().strftime("%Y-%m-%d"),
-        "TradeTime": datetime.now().strftime("%H:%M:%S"), "Symbol": symbol, "Timeframe": timeframe,
+        "DateTime": now_str(), "TradeDate": ist_now().strftime("%Y-%m-%d"),
+        "TradeTime": ist_now().strftime("%H:%M:%S"), "Symbol": symbol, "Timeframe": timeframe,
         "Signal": side, "SignalType": str(analysis.get("signal_text", side)), "Side": side,
         "EntryPrice": float(entry_price), "ExitPrice": np.nan,
         "Quantity": int(quantity), "RemainingQty": int(quantity), "StopLoss": float(stop_loss),
@@ -4314,6 +4148,7 @@ def close_trade_in_journal(index_id, exit_price, result=None, t1_hit=None, t2_hi
     journal.at[index_id, "RemainingQty"] = 0
     journal.at[index_id, "RealizedPnL"] = total
     journal.at[index_id, "ExitPrice"] = float(exit_price)
+    journal.at[index_id, "ExitTime"] = now_str()
     journal.at[index_id, "Status"] = "CLOSED"
     journal.at[index_id, "PnL"] = round(total, 2)
     journal.at[index_id, "PnLPercent"] = round((total / (entry * float(row["Quantity"])) * 100) if entry else 0, 2)
@@ -4413,6 +4248,7 @@ def close_paper_position(index_id, exit_price, reason="Manual Close"):
         journal.at[index_id, "ExitPrice"] = exit_price
         journal.at[index_id, "LastPrice"] = exit_price
         journal.at[index_id, "LastUpdateTime"] = now_str()
+        journal.at[index_id, "ExitTime"] = now_str()
         journal.at[index_id, "Status"] = "CLOSED"
         journal.at[index_id, "PnL"] = round(total, 2)
         initial_notional = entry * float(row.get("Quantity", qty))
@@ -4456,6 +4292,7 @@ def _paper_partial_exit(index_id, exit_price, quantity, target_flag=None):
     if new_remaining <= 0:
         journal.at[index_id, "RemainingQty"] = 0
         journal.at[index_id, "ExitPrice"] = float(exit_price)
+        journal.at[index_id, "ExitTime"] = now_str()
         journal.at[index_id, "Status"] = "CLOSED"
         journal.at[index_id, "Result"] = "WIN" if total_realized > 0 else "LOSS" if total_realized < 0 else "BREAKEVEN"
         initial_notional = entry * float(row.get("Quantity", q))
@@ -4500,13 +4337,17 @@ def auto_paper_trade_exit(current_price, symbol=None, atr=None):
                 atr_value = float(row_atr) if pd.notna(row_atr) and float(row_atr) > 0 else float(atr or 0.0)
             except Exception:
                 atr_value = float(atr or 0.0)
-            trail_gap = max(0.5 * atr_value, entry * 0.0005, 0.01)
+            trail_gap = max(1.0 * atr_value, entry * 0.0005, 0.01)
             old_trail = row.get("TrailingStop", row.get("StopLoss", np.nan))
             try:
                 old_trail = float(old_trail) if pd.notna(old_trail) else float(row["StopLoss"])
             except Exception:
                 old_trail = float(row["StopLoss"])
-            new_trail = max(old_trail, price - trail_gap) if is_long else min(old_trail, price + trail_gap)
+            # Trail only once T1 is banked; trailing from entry stops trades out on normal noise.
+            if _paper_bool(row.get("T1_Hit", False), False):
+                new_trail = max(old_trail, price - trail_gap) if is_long else min(old_trail, price + trail_gap)
+            else:
+                new_trail = old_trail
             journal.at[idx, "TrailingStop"] = new_trail
             journal.at[idx, "LastPrice"] = price
             journal.at[idx, "LastUpdateTime"] = now_str()
@@ -4568,138 +4409,6 @@ def auto_paper_trade_exit(current_price, symbol=None, atr=None):
 
 
 # =========================================================
-# AI BACKTEST TRAINER: explainable alerts + train/holdout parameter search
-
-def _trainer_metrics(frame):
-    if frame is None or frame.empty or "PnL" not in frame:
-        return {"trades": 0, "win_rate": None, "profit_factor": None, "expectancy": None}
-    pnl = pd.to_numeric(frame["PnL"], errors="coerce").dropna()
-    if pnl.empty:
-        return {"trades": 0, "win_rate": None, "profit_factor": None, "expectancy": None}
-    gp = float(pnl[pnl > 0].sum())
-    gl = float(abs(pnl[pnl < 0].sum()))
-    pf = gp / gl if gl > 0 else (999.0 if gp > 0 else 0.0)
-    return {"trades": int(len(pnl)), "win_rate": round(float((pnl > 0).mean() * 100), 2),
-            "profit_factor": round(float(pf), 2), "expectancy": round(float(pnl.mean()), 4)}
-
-
-def analyze_backtest_for_training(trades_df):
-    """Create evidence-based alerts and test one simple filter on chronological holdout.
-
-    The optimizer chooses a single candidate using only the first 70% of trades;
-    the last 30% is untouched holdout. It never changes the strategy automatically.
-    """
-    empty = {"ready": False, "message": "No completed backtest trades available.", "baseline": _trainer_metrics(pd.DataFrame()),
-             "alerts": [], "candidates": pd.DataFrame(), "best_candidate": None, "holdout": None}
-    if trades_df is None or trades_df.empty or "PnL" not in trades_df:
-        return empty
-    df = trades_df.copy().reset_index(drop=True)
-    df["PnL"] = pd.to_numeric(df["PnL"], errors="coerce")
-    df = df.dropna(subset=["PnL"]).reset_index(drop=True)
-    if "Result" not in df:
-        df["Result"] = np.where(df["PnL"] > 0, "WIN", np.where(df["PnL"] < 0, "LOSS", "BREAKEVEN"))
-    baseline = _trainer_metrics(df)
-    alerts = []
-    # Descriptive buckets are alerts, not causal claims or guaranteed filters.
-    if "Signal" in df:
-        for side in ("BUY", "SELL"):
-            part = df[df["Signal"].astype(str).str.upper() == side]
-            m = _trainer_metrics(part)
-            if m["trades"] >= 8 and baseline["win_rate"] is not None and m["win_rate"] <= baseline["win_rate"] - 5:
-                alerts.append({"Priority": "Review", "Finding": f"{side} side underperforms overall", "Evidence": f"{m['trades']} trades; {m['win_rate']:.1f}% win rate", "Suggestion": f"Audit {side} entry conditions separately; do not disable it without holdout validation."})
-    for col, label in (("ADX", "ADX"), ("RSI", "RSI")):
-        if col in df:
-            vals = pd.to_numeric(df[col], errors="coerce")
-            valid = df[vals.notna()].copy()
-            valid[col] = vals[vals.notna()]
-            if len(valid) >= 20:
-                try:
-                    valid["_bucket"] = pd.qcut(valid[col], q=3, duplicates="drop")
-                    bucket_rows = []
-                    for bucket, part in valid.groupby("_bucket", observed=False):
-                        m = _trainer_metrics(part)
-                        if m["trades"] >= 6:
-                            bucket_rows.append((str(bucket), m))
-                    if len(bucket_rows) >= 2:
-                        weakest = min(bucket_rows, key=lambda x: (x[1]["expectancy"] if x[1]["expectancy"] is not None else -1e9))
-                        strongest = max(bucket_rows, key=lambda x: (x[1]["expectancy"] if x[1]["expectancy"] is not None else -1e9))
-                        if weakest[1]["expectancy"] is not None and strongest[1]["expectancy"] is not None and weakest[1]["expectancy"] < 0 < strongest[1]["expectancy"]:
-                            alerts.append({"Priority": "Investigate", "Finding": f"{label} ranges show different expectancy", "Evidence": f"Weakest {weakest[0]}: {weakest[1]['expectancy']:.3f}; strongest {strongest[0]}: {strongest[1]['expectancy']:.3f}", "Suggestion": f"Test a {label}-based filter on unseen data before changing the entry rules."})
-                except Exception:
-                    pass
-    if baseline["trades"] < 30:
-        return {"ready": False, "message": f"Only {baseline['trades']} completed trades. Need at least 30 for a cautious trainer review; no optimization proposal generated.",
-                "baseline": baseline, "alerts": alerts, "candidates": pd.DataFrame(), "best_candidate": None, "holdout": None}
-    split = max(1, min(len(df)-1, int(len(df) * 0.70)))
-    train, holdout = df.iloc[:split].copy(), df.iloc[split:].copy()
-    if len(train) < 15 or len(holdout) < 8:
-        return {"ready": False, "message": "Not enough chronological train/holdout trades for optimization.", "baseline": baseline,
-                "alerts": alerts, "candidates": pd.DataFrame(), "best_candidate": None, "holdout": None}
-    base_test = _trainer_metrics(holdout)
-    candidates = []
-    # Each candidate is selected using TRAIN only. Test metrics are reported once on holdout.
-    candidate_specs = []
-    if "ADX" in df:
-        candidate_specs += [("ADX minimum", "ADX", threshold, ">=") for threshold in (15, 20, 25)]
-    if "RSI" in df:
-        candidate_specs += [("BUY RSI minimum", "RSI_BUY", threshold, "side-aware") for threshold in (50, 55, 60)]
-        candidate_specs += [("SELL RSI maximum", "RSI_SELL", threshold, "side-aware") for threshold in (50, 45, 40)]
-    for name, feature, threshold, rule in candidate_specs:
-        def apply_rule(frame):
-            if feature == "ADX":
-                v = pd.to_numeric(frame.get("ADX"), errors="coerce")
-                return frame[v >= threshold]
-            side = frame.get("Signal", pd.Series("", index=frame.index)).astype(str).str.upper()
-            rsi = pd.to_numeric(frame.get("RSI"), errors="coerce")
-            mask = ((side == "BUY") & (rsi >= threshold)) if feature == "RSI_BUY" else ((side == "SELL") & (rsi <= threshold))
-            # Keep opposite-side trades unchanged; candidate is a selective gate for one side.
-            return frame[mask | (~side.isin(["BUY"] if feature == "RSI_BUY" else ["SELL"]))]
-        tr = apply_rule(train)
-        hm = apply_rule(holdout)
-        tm, testm = _trainer_metrics(tr), _trainer_metrics(hm)
-        if tm["trades"] >= 15 and hm.shape[0] >= 8 and tm["expectancy"] is not None:
-            candidates.append({"Rule": name, "Threshold": threshold, "Train Trades": tm["trades"],
-                               "Train Win Rate %": tm["win_rate"], "Train Expectancy": tm["expectancy"],
-                               "Holdout Trades": testm["trades"], "Holdout Win Rate %": testm["win_rate"],
-                               "Holdout Expectancy": testm["expectancy"], "Holdout Profit Factor": testm["profit_factor"]})
-    cand_df = pd.DataFrame(candidates)
-    best = None
-    if not cand_df.empty:
-        # Rank using training expectancy only, never holdout performance.
-        ranked = cand_df.sort_values(["Train Expectancy", "Train Win Rate %"], ascending=False)
-        best_row = ranked.iloc[0].to_dict()
-        best = {"rule": str(best_row["Rule"]), "threshold": float(best_row["Threshold"]),
-                "holdout": {"trades": int(best_row["Holdout Trades"]), "win_rate": float(best_row["Holdout Win Rate %"]),
-                            "expectancy": float(best_row["Holdout Expectancy"]), "profit_factor": float(best_row["Holdout Profit Factor"])},
-                "baseline_holdout": base_test}
-        if best["holdout"]["expectancy"] is not None and base_test["expectancy"] is not None and best["holdout"]["expectancy"] > base_test["expectancy"]:
-            alerts.append({"Priority": "Candidate", "Finding": f"{best['rule']} = {best['threshold']:g} improved holdout expectancy", "Evidence": f"Baseline {base_test['expectancy']:.3f}; filtered {best['holdout']['expectancy']:.3f} over {best['holdout']['trades']} trades", "Suggestion": "Review and approve for paper-only testing. This is not proof of future performance."})
-        else:
-            alerts.append({"Priority": "No improvement", "Finding": "No tested filter improved holdout expectancy", "Evidence": f"Baseline holdout expectancy {base_test['expectancy']}", "Suggestion": "Keep the existing scoring and entry rules unchanged."})
-    else:
-        alerts.append({"Priority": "Insufficient data", "Finding": "No candidate met minimum sample requirements", "Evidence": "Need at least 15 training and 8 holdout trades per candidate", "Suggestion": "Collect more completed backtest trades; do not optimize from a small sample."})
-    return {"ready": True, "message": "Chronological trainer review complete. Candidate selection used training trades only; holdout was kept separate.",
-            "baseline": baseline, "alerts": alerts, "candidates": cand_df, "best_candidate": best,
-            "holdout": {"baseline": base_test, "split_train": len(train), "split_holdout": len(holdout)}}
-
-
-def trainer_filter_allows(analysis, profile):
-    """Apply an explicitly approved trainer filter to paper eligibility only; never edits scores."""
-    if not isinstance(profile, dict) or not profile.get("approved"):
-        return True, ""
-    rule, threshold = profile.get("rule"), float(profile.get("threshold", 0))
-    side = str(analysis.get("signal_type", "")).lower()
-    rsi = _safe_num(analysis.get("rsi"), np.nan)
-    adx = _safe_num(analysis.get("adx"), np.nan)
-    if rule == "ADX minimum" and (not np.isfinite(adx) or adx < threshold):
-        return False, f"Approved AI Trainer paper filter: ADX {adx if np.isfinite(adx) else 'N/A'} is below {threshold:g}."
-    if rule == "BUY RSI minimum" and side == "buy" and (not np.isfinite(rsi) or rsi < threshold):
-        return False, f"Approved AI Trainer paper filter: BUY RSI {rsi if np.isfinite(rsi) else 'N/A'} is below {threshold:g}."
-    if rule == "SELL RSI maximum" and side == "sell" and (not np.isfinite(rsi) or rsi > threshold):
-        return False, f"Approved AI Trainer paper filter: SELL RSI {rsi if np.isfinite(rsi) else 'N/A'} is above {threshold:g}."
-    return True, ""
-
-
 # BACKTEST / WALK FORWARD / SHARPE
 # =========================================================
 
@@ -5007,10 +4716,7 @@ def fallback_ema_backtest(df, symbol="", timeframe_label="", cost_bps=5.0):
             "T1": round(tp, 2), "T2": np.nan, "T3": np.nan,
             "Exit": round(exit_price, 2), "Result": result, "PnL": pnl,
             "T1_Hit": result == "WIN", "T2_Hit": False, "T3_Hit": False,
-            "Method": "EMA trend/pullback fallback",
-            "RSI": round(float(cur.get("RSI", np.nan)), 2),
-            "ADX": round(float(cur.get("ADX", np.nan)), 2) if pd.notna(cur.get("ADX", np.nan)) else np.nan,
-            "EMA_Aligned": bool((cur.get("EMA20", 0) > cur.get("EMA50", 0)) if side == "BUY" else (cur.get("EMA20", 0) < cur.get("EMA50", 0)))
+            "Method": "EMA trend/pullback fallback"
         })
         i = max(i + 1, exit_i + 1)
     return pd.DataFrame(trades)
@@ -5069,8 +4775,11 @@ def simple_backtest(df, symbol="", timeframe_label="", option_metrics=None, news
             news_info=historical_news,
             backtest_trade_count=0,
             backtest_is_comparable=False,
+            use_institutional=True,
+            benchmark_df=None,
         )
-        if analysis["signal_text"] not in ("STRONG BUY", "STRONG SELL"):
+        if analysis["signal_text"] not in ("STRONG BUY", "STRONG SELL") and not (
+                not STRICT_TRADE_ONLY_STRONG and analysis["signal_text"] in ("BUY", "SELL")):
             continue
 
         future = work.iloc[i + 1:i + 11]
@@ -5089,7 +4798,7 @@ def simple_backtest(df, symbol="", timeframe_label="", option_metrics=None, news
         t2 = entry + 3*risk if is_long else entry - 3*risk
         t3 = entry + 4*risk if is_long else entry - 4*risk
         trail = sl
-        trail_gap = max(0.5 * atr_value, entry * 0.0005, 0.01)
+        trail_gap = max(1.0 * atr_value, entry * 0.0005, 0.01)
         remaining = 1.0
         realized_points = 0.0
         t1_hit = t2_hit = t3_hit = False
@@ -5145,8 +4854,9 @@ def simple_backtest(df, symbol="", timeframe_label="", option_metrics=None, news
 
             # Close-based dynamic trailing is applied for the NEXT bar, avoiding
             # using a bar's final close to stop out earlier inside that same bar.
-            dynamic_trail = cl - trail_gap if is_long else cl + trail_gap
-            trail = max(trail, dynamic_trail) if is_long else min(trail, dynamic_trail)
+            if t1_hit:   # trail only after T1, consistent with the live paper engine
+                dynamic_trail = cl - trail_gap if is_long else cl + trail_gap
+                trail = max(trail, dynamic_trail) if is_long else min(trail, dynamic_trail)
 
         if remaining > 0:
             last_bar = future.iloc[-1]
@@ -5167,14 +4877,7 @@ def simple_backtest(df, symbol="", timeframe_label="", option_metrics=None, news
             "Exit": round(float(final_exit_price), 2),
             "Result": result, "PnL": round(realized_points, 2),
             "T1_Hit": t1_hit, "T2_Hit": t2_hit, "T3_Hit": t3_hit,
-            "ExitReason": exit_reason, "ExitModel": "Next-open fill; 34/33/remainder scale-out; conservative stop-first OHLC",
-            # Entry-bar diagnostics are retained for the AI trainer. These are
-            # historical features known at signal time, not post-entry values.
-            "RSI": round(float(latest.get("RSI", np.nan)), 2),
-            "ADX": round(float(latest.get("ADX", np.nan)), 2),
-            "EMA_Aligned": bool((latest.get("EMA20", 0) > latest.get("EMA50", 0)) if side == "BUY" else (latest.get("EMA20", 0) < latest.get("EMA50", 0))),
-            "MACD_Hist": round(float(latest.get("MACD", 0) - latest.get("SignalLine", 0)), 5),
-            "Volume_Spike": bool(latest.get("Volume_Spike", False))
+            "ExitReason": exit_reason, "ExitModel": "Next-open fill; 34/33/remainder scale-out; conservative stop-first OHLC"
         })
 
     trades_df = pd.DataFrame(trades)
@@ -5259,19 +4962,18 @@ def walk_forward_validation(df, symbol="", timeframe_label="", option_metrics=No
 def update_daily_summary():
     init_daily_summary()
     journal = load_journal()
-    closed = journal[journal["Status"] == "CLOSED"].copy()
+    closed = _closed_with_exit_dt(journal)
     if closed.empty:
         return
 
-    closed["DateOnly"] = pd.to_datetime(closed["DateTime"], format="%d-%m-%Y %H:%M:%S", errors="coerce").dt.date
-    today = datetime.now().date()
-    day_df = closed[closed["DateOnly"] == today]
+    today = ist_now().date()
+    day_df = closed[closed["ExitDT"].dt.date == today]
     if day_df.empty:
         return
 
     total = len(day_df)
     wins = (pd.to_numeric(day_df["PnL"], errors="coerce").fillna(0) > 0).sum()
-    losses = total - wins
+    losses = (pd.to_numeric(day_df["PnL"], errors="coerce").fillna(0) < 0).sum()
     pnl = pd.to_numeric(day_df["PnL"], errors="coerce").fillna(0).sum()
     win_rate = (wins / total * 100) if total > 0 else 0
 
@@ -5292,13 +4994,13 @@ def update_daily_summary():
 def update_weekly_summary():
     init_weekly_summary()
     journal = load_journal()
-    closed = journal[journal["Status"] == "CLOSED"].copy()
+    closed = _closed_with_exit_dt(journal)
     if closed.empty:
         return
 
-    closed["DT"] = pd.to_datetime(closed["DateTime"], format="%d-%m-%Y %H:%M:%S", errors="coerce")
-    current_week = datetime.now().strftime("%Y-W%U")
-    start_week = datetime.now() - timedelta(days=datetime.now().weekday())
+    closed["DT"] = closed["ExitDT"]
+    current_week = ist_now().strftime("%G-W%V")
+    start_week = ist_now() - timedelta(days=ist_now().weekday())
     start_week = datetime(start_week.year, start_week.month, start_week.day)
     week_df = closed[closed["DT"] >= start_week]
     if week_df.empty:
@@ -5306,7 +5008,7 @@ def update_weekly_summary():
 
     total = len(week_df)
     wins = (pd.to_numeric(week_df["PnL"], errors="coerce").fillna(0) > 0).sum()
-    losses = total - wins
+    losses = (pd.to_numeric(week_df["PnL"], errors="coerce").fillna(0) < 0).sum()
     pnl = pd.to_numeric(week_df["PnL"], errors="coerce").fillna(0).sum()
     win_rate = (wins / total * 100) if total else 0
 
@@ -5327,20 +5029,20 @@ def update_weekly_summary():
 def update_monthly_summary():
     init_monthly_summary()
     journal = load_journal()
-    closed = journal[journal["Status"] == "CLOSED"].copy()
+    closed = _closed_with_exit_dt(journal)
     if closed.empty:
         return
 
-    closed["DT"] = pd.to_datetime(closed["DateTime"], format="%d-%m-%Y %H:%M:%S", errors="coerce")
-    current_month = datetime.now().strftime("%Y-%m")
-    start_month = datetime(datetime.now().year, datetime.now().month, 1)
+    closed["DT"] = closed["ExitDT"]
+    current_month = ist_now().strftime("%Y-%m")
+    start_month = datetime(ist_now().year, ist_now().month, 1)
     month_df = closed[closed["DT"] >= start_month]
     if month_df.empty:
         return
 
     total = len(month_df)
     wins = (pd.to_numeric(month_df["PnL"], errors="coerce").fillna(0) > 0).sum()
-    losses = total - wins
+    losses = (pd.to_numeric(month_df["PnL"], errors="coerce").fillna(0) < 0).sum()
     pnl = pd.to_numeric(month_df["PnL"], errors="coerce").fillna(0).sum()
     win_rate = (wins / total * 100) if total else 0
 
@@ -5407,184 +5109,6 @@ def best_worst_time_of_day(backtest_trades_df):
 
 
 # =========================================================
-# UPSTOX MARKET-DATA PROVIDER (OAuth + V3 REST; no order placement)
-# =========================================================
-UPSTOX_API_BASE = "https://api.upstox.com"
-UPSTOX_INSTRUMENT_MASTER_URL = "https://assets.upstox.com/market-quote/instruments/exchange/complete.json.gz"
-
-
-def upstox_exchange_authorization_code(client_id, client_secret, redirect_uri, auth_code):
-    """Exchange a single-use Upstox OAuth authorization code for a session token."""
-    payload = {
-        "code": str(auth_code or "").strip(),
-        "client_id": str(client_id or "").strip(),
-        "client_secret": str(client_secret or "").strip(),
-        "redirect_uri": str(redirect_uri or "").strip(),
-        "grant_type": "authorization_code",
-    }
-    if not all(payload.values()):
-        return None, "Client ID, Client Secret, Redirect URI and authorization code are required."
-    try:
-        response = requests.post(
-            f"{UPSTOX_API_BASE}/v2/login/authorization/token",
-            headers={"accept": "application/json", "Content-Type": "application/x-www-form-urlencoded"},
-            data=payload, timeout=15,
-        )
-        body = response.json() if response.content else {}
-        if response.status_code != 200 or not body.get("access_token"):
-            message = body.get("errors") or body.get("message") or f"HTTP {response.status_code}"
-            return None, f"Upstox token exchange failed: {message}"
-        return str(body["access_token"]), "Upstox authorization successful. Token is held in this app session only."
-    except Exception as exc:
-        return None, f"Upstox authorization request failed: {type(exc).__name__}: {exc}"
-
-
-@st.cache_data(ttl=86400, show_spinner=False)
-def fetch_upstox_instrument_master():
-    """Load Upstox's official daily BOD JSON instrument master; no manual upload."""
-    response = requests.get(UPSTOX_INSTRUMENT_MASTER_URL, timeout=25)
-    response.raise_for_status()
-    raw = response.content
-    if raw[:2] == bytes((0x1f, 0x8b)):
-        raw = gzip.decompress(raw)
-    rows = json.loads(raw.decode("utf-8"))
-    if not isinstance(rows, list) or not rows:
-        raise ValueError("Upstox instrument master was empty or had an unexpected format")
-    return rows
-
-
-def resolve_upstox_instrument_key(symbol_name):
-    """Resolve selected dashboard symbol against Upstox instrument_key master."""
-    symbol = str(symbol_name or "").strip().upper()
-    index_aliases = {
-        "NIFTY": ("NSE_INDEX", {"NIFTY 50", "NIFTY"}),
-        "BANKNIFTY": ("NSE_INDEX", {"NIFTY BANK", "BANK NIFTY"}),
-        "SENSEX": ("BSE_INDEX", {"SENSEX", "S&P BSE SENSEX"}),
-    }
-    try:
-        rows = fetch_upstox_instrument_master()
-        if symbol in index_aliases:
-            segment, aliases = index_aliases[symbol]
-            for row in rows:
-                if str(row.get("segment", "")).upper() == segment and str(row.get("instrument_type", "")).upper() == "INDEX":
-                    candidates = {str(row.get(k, "")).strip().upper() for k in ("trading_symbol", "short_name", "name")}
-                    if candidates & aliases:
-                        return str(row.get("instrument_key") or "") or None
-        else:
-            for row in rows:
-                if (str(row.get("segment", "")).upper() == "NSE_EQ"
-                        and str(row.get("instrument_type", "")).upper() == "EQ"
-                        and str(row.get("trading_symbol", "")).strip().upper() == symbol):
-                    return str(row.get("instrument_key") or "") or None
-    except Exception as exc:
-        log_app_error("upstox_instrument_master", f"{type(exc).__name__}: {exc}")
-    return None
-
-
-def upstox_headers(access_token):
-    return {"Accept": "application/json", "Content-Type": "application/json",
-            "Authorization": f"Bearer {str(access_token or '').strip()}"}
-
-
-def _upstox_candles_to_frame(candles):
-    """Normalize Upstox V3 candle arrays into the dashboard's OHLCV schema."""
-    if not candles:
-        return pd.DataFrame()
-    frame = pd.DataFrame(candles)
-    if frame.shape[1] < 6:
-        return pd.DataFrame()
-    frame = frame.iloc[:, :7]
-    frame.columns = ["Datetime", "Open", "High", "Low", "Close", "Volume", "OpenInterest"][:frame.shape[1]]
-    frame["Datetime"] = pd.to_datetime(frame["Datetime"], errors="coerce")
-    if getattr(frame["Datetime"].dt, "tz", None) is not None:
-        frame["Datetime"] = frame["Datetime"].dt.tz_convert("Asia/Kolkata").dt.tz_localize(None)
-    frame = frame.dropna(subset=["Datetime"]).set_index("Datetime").sort_index()
-    for col in ("Open", "High", "Low", "Close", "Volume"):
-        frame[col] = pd.to_numeric(frame[col], errors="coerce")
-    frame = frame.dropna(subset=["Open", "High", "Low", "Close"])
-    frame["Volume"] = frame["Volume"].fillna(0)
-    if "OpenInterest" in frame.columns:
-        frame["OpenInterest"] = pd.to_numeric(frame["OpenInterest"], errors="coerce")
-    return frame[~frame.index.duplicated(keep="last")]
-
-
-def fetch_upstox_candles(access_token, instrument_key, timeframe):
-    """Fetch prior history plus today's candles using Upstox Historical/Intraday V3."""
-    if not str(access_token or "").strip() or not str(instrument_key or "").strip():
-        return pd.DataFrame()
-    tf = str(timeframe).lower()
-    if tf in ("1m", "3m", "5m", "10m", "15m", "30m"):
-        unit, interval = "minutes", {"1m": 1, "3m": 3, "5m": 5, "10m": 10, "15m": 15, "30m": 30}[tf]
-        days = 28 if interval <= 15 else 85
-    elif tf == "1h":
-        unit, interval, days = "hours", 1, 85
-    else:
-        unit, interval, days = "days", 1, 365
-    today = pd.Timestamp.now(tz="Asia/Kolkata").date()
-    yesterday = today - pd.Timedelta(days=1)
-    from_date = today - pd.Timedelta(days=days)
-    encoded_key = quote(str(instrument_key), safe="")
-    headers = upstox_headers(access_token)
-    frames = []
-    # Historical endpoint supplies completed prior sessions. The V3 docs specify
-    # the separate intraday endpoint for the current trading day.
-    historical_url = (f"{UPSTOX_API_BASE}/v3/historical-candle/{encoded_key}/"
-                      f"{unit}/{interval}/{yesterday.isoformat()}/{from_date.isoformat()}")
-    try:
-        hist_response = requests.get(historical_url, headers=headers, timeout=18)
-        if hist_response.status_code == 200:
-            hist_candles = (hist_response.json().get("data") or {}).get("candles") or []
-            hist_frame = _upstox_candles_to_frame(hist_candles)
-            if not hist_frame.empty:
-                frames.append(hist_frame)
-        else:
-            log_app_error("upstox_historical_candles", f"HTTP {hist_response.status_code}: {hist_response.text[:300]}")
-    except Exception as exc:
-        log_app_error("upstox_historical_candles", f"{type(exc).__name__}: {exc}")
-
-    intraday_url = (f"{UPSTOX_API_BASE}/v3/historical-candle/intraday/{encoded_key}/"
-                    f"{unit}/{interval}")
-    try:
-        live_response = requests.get(intraday_url, headers=headers, timeout=12)
-        if live_response.status_code == 200:
-            live_candles = (live_response.json().get("data") or {}).get("candles") or []
-            live_frame = _upstox_candles_to_frame(live_candles)
-            if not live_frame.empty:
-                frames.append(live_frame)
-        else:
-            log_app_error("upstox_intraday_candles", f"HTTP {live_response.status_code}: {live_response.text[:300]}")
-    except Exception as exc:
-        log_app_error("upstox_intraday_candles", f"{type(exc).__name__}: {exc}")
-
-    if not frames:
-        return pd.DataFrame()
-    combined = pd.concat(frames).sort_index()
-    return combined[~combined.index.duplicated(keep="last")]
-
-
-def fetch_upstox_ltp(access_token, instrument_key):
-    """Fetch current LTP snapshot from Upstox Market Quote V3."""
-    if not str(access_token or "").strip() or not str(instrument_key or "").strip():
-        return None
-    try:
-        response = requests.get(
-            f"{UPSTOX_API_BASE}/v3/market-quote/ltp",
-            headers=upstox_headers(access_token), params={"instrument_key": instrument_key}, timeout=8,
-        )
-        if response.status_code != 200:
-            log_app_error("upstox_ltp", f"HTTP {response.status_code}: {response.text[:250]}")
-            return None
-        data = (response.json().get("data") or {})
-        for item in data.values():
-            value = item.get("last_price") if isinstance(item, dict) else None
-            if value is not None and float(value) > 0:
-                return float(value)
-    except Exception as exc:
-        log_app_error("upstox_ltp", f"{type(exc).__name__}: {exc}")
-    return None
-
-
-# =========================================================
 # TELEGRAM
 # =========================================================
 def send_telegram_alert(token, chat_id, message):
@@ -5602,12 +5126,6 @@ def send_telegram_alert(token, chat_id, message):
 # MTF HELPERS
 # =========================================================
 def get_data_for_timeframe(data_source, selected, ticker, tf, angel_creds):
-    if data_source == "Upstox":
-        token = st.session_state.get("upstox_access_token", "")
-        instrument_key = resolve_upstox_instrument_key(selected)
-        if not instrument_key:
-            return pd.DataFrame()
-        return fetch_upstox_candles(token, instrument_key, tf)
     if data_source == "Yahoo":
         if tf == "1m":
             data = fetch_data(ticker, "1m", "7d")
@@ -5823,39 +5341,12 @@ ANGEL_NAME_ALIASES = {
 }
 
 st.title("Elite Trading Dashboard Final Ultimate")
-st.caption("WebSocket Primary | Upstox V3 | REST Fallback | Walk Forward | Auto Exit | News Filter | Dynamic Option Chain")
+st.caption("WebSocket Primary | REST Polling Fallback | Walk Forward | Auto Exit | News Filter | Dynamic Option Chain")
 st.sidebar.caption(f"App build: {APP_BUILD_ID}")
 
 selected = st.selectbox("Select Stock / Index", list(stocks.keys()))
-data_source = st.radio("Data Source", ["Yahoo", "Angel", "Upstox"], horizontal=True)
+data_source = st.radio("Data Source", ["Yahoo", "Angel"], horizontal=True)
 timeframe = st.selectbox("Select Time Frame", ["1m", "3m", "5m", "10m", "15m", "30m", "1h", "1d"])
-
-with st.expander("Upstox API Settings — market data only", expanded=(data_source == "Upstox")):
-    st.caption("OAuth 2.0 connection for Upstox market-data APIs. Access token stays in this Streamlit session; this application does not place broker orders.")
-    upstox_client_id = st.text_input("Upstox API Key / Client ID", key="upstox_client_id_input")
-    upstox_client_secret = st.text_input("Upstox API Secret", type="password", key="upstox_client_secret_input")
-    upstox_redirect_uri = st.text_input("Registered Redirect URI", key="upstox_redirect_uri_input")
-    if upstox_client_id.strip() and upstox_redirect_uri.strip():
-        _upstox_auth_params = urlencode({"response_type": "code", "client_id": upstox_client_id.strip(), "redirect_uri": upstox_redirect_uri.strip()})
-        st.markdown(f"[Open Upstox secure login](https://api.upstox.com/v2/login/authorization/dialog?{_upstox_auth_params})")
-    upstox_auth_code = st.text_input("Authorization code returned by Upstox", type="password", key="upstox_auth_code_input")
-    if st.button("Connect / Exchange Upstox Authorization Code", key="connect_upstox_button"):
-        _token, _message = upstox_exchange_authorization_code(
-            upstox_client_id, upstox_client_secret, upstox_redirect_uri, upstox_auth_code
-        )
-        if _token:
-            st.session_state["upstox_access_token"] = _token
-            st.session_state["upstox_connected_at"] = now_str()
-            st.success(_message)
-        else:
-            st.error(_message)
-    if st.session_state.get("upstox_access_token"):
-        st.success("Upstox market-data session token is present in this app session.")
-        st.caption("Upstox access tokens expire daily (typically at 3:30 AM IST); reconnect when expired.")
-        if st.button("Disconnect Upstox", key="disconnect_upstox_button"):
-            st.session_state.pop("upstox_access_token", None)
-            st.session_state.pop("upstox_connected_at", None)
-            st.rerun()
 
 st.subheader("Market Data Refresh Controls")
 refresh_col1, refresh_col2, refresh_col3 = st.columns([1.25, 1.0, 1.0])
@@ -5867,19 +5358,19 @@ with refresh_col1:
     )
 with refresh_col2:
     auto_refresh = st.toggle(
-        "Enable Auto Refresh", value=True, key="auto_refresh_enabled",
+        "Enable Auto Refresh", value=False, key="auto_refresh_enabled",
         help="Turn automatic page refresh ON or OFF. Manual refresh remains available either way."
     )
 with refresh_col3:
     refresh_seconds = st.selectbox(
-        "Auto interval (seconds)", [5, 10, 15, 30, 60], index=2,
+        "Auto interval (seconds)", [5, 10, 15, 30, 60], index=1,
         key="auto_refresh_interval_seconds", disabled=not auto_refresh
     )
 
 if refresh_market_now:
     # Flush every market-data cache used by the board, scanner, chart and context panels.
     for _cached_fn in (
-        fetch_data, fetch_yahoo_ltp, fetch_yahoo_batch, build_nifty_top30_scanner,
+        fetch_data, fetch_yahoo_batch, build_nifty_top30_scanner,
         get_news_events, get_option_chain_snapshot
     ):
         try:
@@ -5905,6 +5396,17 @@ else:
 # boards must continue to refresh even if the selected primary chart feed fails.
 if auto_refresh and AUTO_REFRESH_AVAILABLE:
     st_autorefresh(interval=refresh_seconds * 1000, key="elite_live_market_board_refresh")
+
+with st.expander("Signal Engine Weights (configurable)"):
+    st.caption("Multipliers applied to each scoring group before the BUY/SELL decision. 1.0 = default. Mandatory thresholds (ADX 20, MTF 2, min R:R 2.0) are applied separately and are not weight-dependent.")
+    _wcols = st.columns(3)
+    _cur_w = dict(st.session_state.get("signal_weights") or SIGNAL_WEIGHTS)
+    _new_w = {}
+    for _i, _g in enumerate(SIGNAL_WEIGHTS):
+        with _wcols[_i % 3]:
+            _new_w[_g] = st.number_input(f"{_g} weight", 0.0, 3.0, float(_cur_w.get(_g, 1.0)), 0.1, key=f"weight_{_g}")
+    st.session_state["signal_weights"] = _new_w
+    st.caption(f"Settings: MANDATORY_ADX={MANDATORY_ADX} | MANDATORY_MTF_ALIGN_COUNT={MANDATORY_MTF_ALIGN_COUNT} | MIN_RR_REQUIRED={MIN_RR_REQUIRED} | STRICT_TRADE_ONLY_STRONG={STRICT_TRADE_ONLY_STRONG}")
 
 with st.expander("Telegram Alert Settings"):
     telegram_enabled = st.checkbox("Enable Telegram Alerts", value=False)
@@ -6158,8 +5660,6 @@ angel_candle_diagnostics = {"status": "not_requested"}
 angel_ltp_value = None
 angel_ltp_status = "not_requested"
 angel_ltp_source = "Not requested"
-upstox_ltp_value = None
-upstox_instrument_key = None
 angel_session_ready = False
 
 if "last_good_candles_by_key" not in st.session_state:
@@ -6189,14 +5689,15 @@ if not _angel_session_ready:
         _angel_missing_fields.append("PIN")
     if not str(angel_totp_secret).strip():
         _angel_missing_fields.append("TOTP Secret")
-# Credentials typed into widgets are NOT proof of authentication. Only a
-# successful SmartAPI session for this exact client/API key counts as logged in.
-# Until Test Angel Login succeeds, use Yahoo rather than attempting broker data.
-_angel_credentials_ready = bool(_angel_session_ready)
+_angel_credentials_ready = bool(
+    str(angel_api_key).strip()
+    and str(angel_client_code).strip()
+    and (_angel_session_ready or (str(angel_pin).strip() and str(angel_totp_secret).strip()))
+)
 
 st.info(
     f"Market data request: {data_source} | {selected} | {timeframe}. "
-    "Angel live LTP priority: WebSocket primary with REST polling fallback. Upstox uses V3 LTP and Historical Candle REST APIs. "
+    "Angel live LTP priority: WebSocket primary with REST polling fallback. Historical OHLC remains REST candle data. "
     "Network requests use bounded timeouts; optional market-board and walk-forward jobs no longer block initial page load."
 )
 
@@ -6205,35 +5706,7 @@ if data_source != "Angel":
     if _ws_snapshot.get("should_run"):
         stop_angel_websocket()
 
-if data_source == "Upstox":
-    _upstox_token = str(st.session_state.get("upstox_access_token", "")).strip()
-    if not _upstox_token:
-        st.warning("Upstox is not logged in. Automatically switching to Yahoo Finance for market data.")
-        with st.spinner(f"Yahoo Finance fallback: loading {ticker} ({yf_interval})…"):
-            data = fetch_data(ticker, yf_interval, yf_period)
-        yahoo_fallback_rows = int(len(data))
-        if not data.empty:
-            active_data_source = "Yahoo"
-    else:
-        with st.spinner(f"Upstox: resolving {selected} and loading {timeframe} candles…"):
-            upstox_instrument_key = resolve_upstox_instrument_key(selected)
-            if upstox_instrument_key:
-                data = fetch_upstox_candles(_upstox_token, upstox_instrument_key, timeframe)
-                upstox_ltp_value = fetch_upstox_ltp(_upstox_token, upstox_instrument_key)
-            else:
-                data = pd.DataFrame()
-                st.error(f"Upstox instrument master could not resolve {selected}. No candles or quote were fabricated.")
-        if data.empty:
-            with st.spinner(f"Upstox candles unavailable; trying Yahoo Finance fallback for {selected}…"):
-                _upstox_yahoo_fallback = fetch_data(ticker, yf_interval, yf_period)
-            if not _upstox_yahoo_fallback.empty:
-                data = _upstox_yahoo_fallback
-                active_data_source = "Yahoo"
-                st.warning("Upstox historical candles unavailable. Using clearly-labelled Yahoo Finance OHLC fallback; Upstox LTP remains separate if available.")
-        else:
-            st.caption(f"Upstox instrument: {upstox_instrument_key} | Historical candles: Upstox V3")
-
-elif data_source == "Angel":
+if data_source == "Angel":
     if not _angel_credentials_ready:
         _ws_snapshot = ws_get_state()
         if _ws_snapshot.get("should_run"):
@@ -6244,14 +5717,10 @@ elif data_source == "Angel":
             "status": "not_requested",
             "reason": f"Required fields/session missing: {missing_text}",
         }
-        st.warning(
-            f"Angel One is not logged in (missing: {missing_text}). Automatically switching to Yahoo Finance for market data."
+        st.error(
+            f"Angel One data requests were NOT sent. Missing: {missing_text}. "
+            "Re-enter credentials and click Test Angel Login in this deployed app session."
         )
-        with st.spinner(f"Yahoo Finance fallback: loading {ticker} ({yf_interval})…"):
-            data = fetch_data(ticker, yf_interval, yf_period)
-        yahoo_fallback_rows = int(len(data))
-        if not data.empty:
-            active_data_source = "Yahoo"
     else:
         # WebSocket is the primary live-LTP source. REST polling is requested
         # only when the socket is not connected, has no tick yet, or its tick is stale.
@@ -6330,20 +5799,6 @@ else:
     with st.spinner(f"Yahoo Finance: loading {ticker} ({yf_interval})…"):
         data = fetch_data(ticker, yf_interval, yf_period)
     yahoo_primary_rows = int(len(data))
-    _yahoo_diag = dict(_YAHOO_FETCH_DIAGNOSTICS)
-    if data.empty:
-        st.error(
-            f"Yahoo OHLC fetch failed for {ticker} / {yf_interval}. "
-            f"Status: {_yahoo_diag.get('status', 'unknown')}. "
-            f"Reason: {_yahoo_diag.get('error') or 'No candles returned'}. "
-            "Check Streamlit Cloud network access and Yahoo availability; no candles are fabricated."
-        )
-    else:
-        st.caption(
-            f"Yahoo data: {_yahoo_diag.get('source', 'Yahoo')} | "
-            f"{_yahoo_diag.get('rows', len(data))} candles | "
-            f"Last candle: {_yahoo_diag.get('last_candle', str(data.index[-1]))}"
-        )
     if data.empty and _angel_credentials_ready:
         # Optional failover if Yahoo is temporarily unavailable but the user has
         # already connected Angel One in this same session.
@@ -6361,22 +5816,6 @@ else:
             st.warning("Yahoo Finance returned no OHLC rows. Using connected Angel One candle history as a clearly-labelled fallback.")
 
 if data.empty:
-    # Quote retrieval is independent of OHLC history: even if Yahoo candles fail,
-    # show a clearly-labelled latest quote/bar when Yahoo can provide one.
-    if data_source == "Yahoo":
-        _yahoo_empty_quote = fetch_yahoo_ltp(ticker)
-        if _yahoo_empty_quote.get("price") is not None:
-            st.metric(
-                f"Yahoo latest available price — {_yahoo_empty_quote.get('source', 'Yahoo')}",
-                f"{float(_yahoo_empty_quote['price']):,.2f}",
-            )
-            st.caption(
-                f"Yahoo quote/bar timestamp: {_yahoo_empty_quote.get('timestamp') or 'N/A'} | "
-                f"Status: {_yahoo_empty_quote.get('status')} | "
-                "This is not guaranteed exchange-real-time LTP."
-            )
-        else:
-            st.warning("Yahoo quote and intraday candles are both unavailable. Check the Yahoo fetch diagnostic above and the deployment network/logs.")
     if data_source == "Angel" and (polling_mode or ws_enable):
         if angel_ltp_value is not None:
             st.metric(f"Angel One Latest Traded Price — {angel_ltp_source}", f"{angel_ltp_value:,.2f}")
@@ -6550,6 +5989,17 @@ backtest_is_comparable = bool(
     not backtest_trades_df.empty and
     "Method" not in backtest_trades_df.columns
 )
+# Relative strength needs a benchmark on the same timeframe as the instrument.
+# NIFTY is not compared with itself; a missing benchmark leaves RS neutral (contributes 0).
+benchmark_df = None
+if selected != "NIFTY":
+    try:
+        _bm = get_data_for_timeframe("Yahoo", "NIFTY", "^NSEI", timeframe, angel_creds)
+        if _bm is not None and not _bm.empty:
+            benchmark_df = _bm
+    except Exception as _bm_err:
+        log_app_error("benchmark_fetch", _bm_err)
+
 analysis = analyze_signal(
     data,
     htf_bias=htf_bias,
@@ -6562,6 +6012,9 @@ analysis = analyze_signal(
     news_info=news_info,
     backtest_trade_count=total_trades,
     backtest_is_comparable=backtest_is_comparable,
+    use_institutional=True,
+    benchmark_df=benchmark_df,
+    signal_weights=st.session_state.get("signal_weights"),
 )
 analysis = apply_adaptive_signal_intelligence(
     data, analysis, selected, timeframe,
@@ -6569,36 +6022,12 @@ analysis = apply_adaptive_signal_intelligence(
     mtf_available_count=mtf_available_count
 )
 analysis = apply_tiered_early_alerts(analysis, tiered_tf_metrics)
-# An approved trainer profile can gate paper eligibility only. Original score values
-# and BUY/SELL scoring weights remain untouched.
-_trainer_profile = st.session_state.get("approved_ai_trainer_profile")
-_trainer_allowed, _trainer_block_reason = trainer_filter_allows(analysis, _trainer_profile)
-if not _trainer_allowed:
-    analysis["trade_allowed"] = False
-    analysis["ai_trainer_paper_block_reason"] = _trainer_block_reason
 
 stats = compute_trade_statistics(backtest_trades_df, initial_capital=DEFAULT_INITIAL_BALANCE)
 equity_curve_df, max_drawdown = compute_equity_curve_from_trades(backtest_trades_df, initial_capital=DEFAULT_INITIAL_BALANCE)
 
-with st.expander("🏛️ Institutional Signal Participation Audit", expanded=False):
-    _inst_audit = analysis.get("institutional_participation_audit", {})
-    if _inst_audit:
-        _audit_rows = []
-        for _feature, _details in _inst_audit.items():
-            _details = _details if isinstance(_details, dict) else {}
-            _audit_rows.append({"Feature": _feature.replace("_", " ").title(), "Status": _details.get("status", "N/A"), "Score": _details.get("score", _details.get("raw_score", 0)), "Reason": _details.get("reason", "")})
-        st.dataframe(pd.DataFrame(_audit_rows), use_container_width=True, hide_index=True)
-        st.caption("Existing aggregate cap +/-8 is retained. Raw score and cap-applied status are shown in the aggregate row. Missing benchmark, sector or independent OI inputs remain neutral.")
-    else:
-        st.info("Institutional audit unavailable for this analysis run.")
-
 with st.expander("🧠 Loss Intelligence & Similar Historical Setups", expanded=True):
-    if _trainer_profile and _trainer_profile.get("approved"):
-        st.info(f"AI Trainer approved paper filter active: {_trainer_profile.get('rule')} = {_trainer_profile.get('threshold')}. Signal scores are unchanged; only paper eligibility is gated.")
-    if analysis.get("ai_trainer_paper_block_reason"):
-        st.warning(analysis["ai_trainer_paper_block_reason"])
-    _ui_side = "BUY" if analysis.get("signal_type") == "buy" else "SELL" if analysis.get("signal_type") == "sell" else None
-    intel = get_similar_trade_intelligence(analysis.get("feature_snapshot", {}), _ui_side)
+    intel = get_similar_trade_intelligence(analysis.get("feature_snapshot", {}), "BUY" if analysis.get("signal_type") == "buy" else "SELL")
     i1, i2, i3, i4, i5 = st.columns(5)
     i1.metric("Signal Stage", analysis.get("signal_stage", "N/A"))
     i2.metric("Similar Trades", intel.get("count", 0))
@@ -6617,7 +6046,7 @@ with st.expander("🧠 Loss Intelligence & Similar Historical Setups", expanded=
         else:
             col.metric(f"{tf} Trend", "N/A")
             col.caption("Insufficient or unavailable timeframe data; alert tier not confirmed.")
-    st.caption(f"Adaptive confidence: {analysis.get('confidence', 'N/A')} / 100 | {analysis.get('adaptive_confidence_label', '')} | {intel.get('reason', 'Similarity unavailable')} Matching is heuristic and requires at least five comparable stored numeric features.")
+    st.caption(f"Adaptive confidence: {analysis.get('confidence', 'N/A')} / 100 | {analysis.get('adaptive_confidence_label', '')} | Similarity matching is heuristic and only uses stored, available fields.")
     block_repeat_losers = st.toggle("Block signals matching repeated historical losing setups", value=False, key="block_repeat_loser_setups")
     repeat_loss_block_active = bool(block_repeat_losers and analysis.get("similar_trade_block_suggested"))
     if analysis.get("repeat_loss_warning"):
@@ -6637,14 +6066,6 @@ with st.expander("🧠 Loss Intelligence & Similar Historical Setups", expanded=
         col.metric(key, f"{value:.2f}" if isinstance(value, (int, float)) and np.isfinite(value) else "N/A")
     st.caption("Loss labels are probable diagnostic categories, not proof of causation. News reversal and execution/slippage causes require reliable event and fill data.")
     _ml_journal = load_journal()
-    if not _ml_journal.empty and "Status" in _ml_journal.columns:
-        _closed_review = _ml_journal[_ml_journal["Status"].astype(str).str.upper().eq("CLOSED")].copy()
-        _closed_review["PnL"] = pd.to_numeric(_closed_review.get("PnL", 0), errors="coerce")
-        _loss_review = _closed_review[_closed_review["PnL"] < 0].copy()
-        st.caption(f"Journal integrity: {_closed_review.shape[0]} closed trades | {_loss_review.shape[0]} losses | {int(_loss_review.get('LossReason', pd.Series('', index=_loss_review.index)).astype(str).str.strip().ne('').sum())} classified losses")
-        if not _loss_review.empty:
-            _loss_cols = [c for c in ["DateTime", "Symbol", "Side", "PnL", "LossReason"] if c in _loss_review.columns]
-            st.dataframe(_loss_review[_loss_cols].tail(20), use_container_width=True, hide_index=True)
     closed_count_ml = int((_ml_journal.get("Status", pd.Series(dtype=str)).astype(str).str.upper() == "CLOSED").sum()) if not _ml_journal.empty else 0
     st.caption(f"Optional ML layer: {closed_count_ml}/30 completed trades collected. Dataset evaluation is available now; model fitting unlocks after 30 usable trades with at least 5 wins and 5 losses.")
     if st.button("Evaluate Dataset / Train ML Model", key="train_loss_intelligence_ml"):
@@ -6717,17 +6138,7 @@ else:
 
 live_price = None
 live_price_source = "OHLC candle close"
-yahoo_ltp_result = {"price": None, "source": "Yahoo quote not requested", "timestamp": None, "status": "not_requested"}
-if active_data_source == "Yahoo":
-    # A distinct quote request prevents the dashboard from labelling the last candle close as a live price.
-    yahoo_ltp_result = fetch_yahoo_ltp(ticker)
-    if yahoo_ltp_result.get("price") is not None:
-        live_price = float(yahoo_ltp_result["price"])
-        live_price_source = yahoo_ltp_result.get("source", "Yahoo Finance latest available quote")
-if data_source == "Upstox" and upstox_ltp_value is not None and upstox_ltp_value > 0:
-    live_price = float(upstox_ltp_value)
-    live_price_source = "Upstox Market Quote V3 (REST snapshot)"
-elif data_source == "Angel":
+if data_source == "Angel":
     _fresh_ws_quote = ws_live_quote(
         max_age_seconds=max(20, int(refresh_seconds) * 2 if auto_refresh else 20),
         symbol_name=selected
@@ -6740,17 +6151,6 @@ elif data_source == "Angel":
         live_price = float(angel_ltp_value)
         live_price_source = angel_ltp_source or "Angel REST Polling (Fallback)"
     sync_ws_state_to_session()
-
-# Even an authenticated broker may temporarily fail to return a usable quote
-# (expired token, permissions, stale socket, rate limit). Try Yahoo as the
-# secondary price source instead of silently presenting an old candle as LTP.
-if live_price is None or not np.isfinite(float(live_price)) or float(live_price) <= 0:
-    yahoo_ltp_result = fetch_yahoo_ltp(ticker)
-    if yahoo_ltp_result.get("price") is not None:
-        live_price = float(yahoo_ltp_result["price"])
-        live_price_source = yahoo_ltp_result.get("source", "Yahoo Finance latest available price")
-    elif active_data_source == "Yahoo":
-        live_price_source = "Yahoo quote unavailable — showing last OHLC close separately"
 
 current_display_price = live_price if live_price is not None and live_price > 0 else analysis["close_price"]
 
@@ -6770,13 +6170,17 @@ alert_text = (
     f"RR: {analysis['rr_ratio'] if analysis['rr_ratio'] is not None else 'N/A'} | OC: {dynamic_oc_symbol} | {option_suggestion['text']}"
 )
 
-current_signal_key = f"{selected}|{timeframe}|{analysis['signal_text']}|{round(analysis['close_price'], 2)}"
+# Key excludes price so one signal is not re-alerted on every tick.
+current_signal_key = f"{selected}|{timeframe}|{analysis['signal_text']}"
 last_signal_key = ""
 if os.path.exists(SIGNAL_STATE_FILE):
     with open(SIGNAL_STATE_FILE, "r") as f:
         last_signal_key = f.read().strip()
 
-if analysis["signal_type"] in ["buy", "sell"] and not is_duplicate_signal(selected, timeframe, analysis):
+# Evaluate duplication ONCE, before the audit row is written; checking afterwards
+# always finds the row we just added and silently suppressed every alert.
+signal_is_duplicate = is_duplicate_signal(selected, timeframe, analysis)
+if analysis["signal_type"] in ["buy", "sell"] and not signal_is_duplicate:
     add_signal_audit(selected, timeframe, analysis)
 
 if telegram_enabled and telegram_bot_token and telegram_chat_id:
@@ -6793,7 +6197,7 @@ if telegram_enabled and telegram_bot_token and telegram_chat_id:
         analysis["signal_type"] != "neutral" and
         analysis["trade_quality_score"] >= HIGH_QUALITY_SIGNAL_MIN_SCORE and
         analysis["validation_score"] >= MIN_VALIDATION_SCORE_FOR_ALERT and
-        not is_duplicate_signal(selected, timeframe, analysis)
+        not signal_is_duplicate
     ):
         sent = send_telegram_alert(telegram_bot_token, telegram_chat_id, alert_text)
         if sent:
@@ -6838,28 +6242,6 @@ with st.expander("Candlestick Pattern Library — latest detected patterns"):
     st.write(", ".join(active_patterns) if active_patterns else "No recognized pattern on the latest completed candle.")
 
 st.subheader("Live Signal Analytics")
-price_col1, price_col2, price_col3 = st.columns(3)
-with price_col1:
-    st.metric("Latest Available Price", f"{live_price:,.2f}" if live_price is not None else "Unavailable")
-with price_col2:
-    st.metric("Price Source", live_price_source)
-with price_col3:
-    st.metric("Quote Status", yahoo_ltp_result.get("status", "broker_quote" if live_price is not None else "unavailable"))
-if yahoo_ltp_result.get("timestamp"):
-    st.caption(f"Yahoo price timestamp: {yahoo_ltp_result['timestamp']} | Status: {yahoo_ltp_result.get('status')}")
-
-if active_data_source == "Yahoo":
-    q1, q2 = st.columns(2)
-    with q1:
-        st.metric("Yahoo Latest Available Price", f"{live_price:,.2f}" if live_price is not None else "Unavailable")
-    with q2:
-        st.metric("Yahoo Quote Status", yahoo_ltp_result.get("status", "not_requested"))
-    st.caption(
-        f"Status: {yahoo_ltp_result.get('status', 'unknown')} | "
-        f"Price timestamp: {yahoo_ltp_result.get('timestamp') or 'Unavailable'}. "
-        "Yahoo may be delayed. If FastInfo has no quote, the app may show the latest real 1m/5m candle close, explicitly labelled as a candle close—not exchange-real-time LTP. "
-        "If both are unavailable, the OHLC close remains a separate fallback."
-    )
 
 if data_source == "Angel":
     p1, p2, p3, p4 = st.columns(4)
@@ -6901,6 +6283,29 @@ with st.expander("Signal scoring breakdown and entry blockers", expanded=(analys
     st.write(f"Directional bias: **{analysis.get('directional_bias', 'Neutral')}** | Bullish score: **{analysis.get('bullish_score', 0)}** | Bearish score: **{analysis.get('bearish_score', 0)}** | Edge: **{analysis.get('directional_edge', 0)}**")
     st.write(f"Trend structure: **BUY {analysis.get('buy_trend_votes', 0)}/{analysis.get('trend_vote_count', 3)}** | **SELL {analysis.get('sell_trend_votes', 0)}/{analysis.get('trend_vote_count', 3)}**")
     st.write(f"MTF data available: **{analysis.get('mtf_available_count', 0)}/4** | Volume data reliable: **{'Yes' if analysis.get('volume_data_available') else 'No'}** | PCR: **{analysis.get('pcr') if analysis.get('pcr') is not None else 'N/A'}**")
+    st.markdown("**Signal participation audit (computed from the actual scoring run)**")
+    _audit_rows = list(analysis.get("score_audit", []))
+    for _c in analysis.get("institutional_components", []):
+        _audit_rows.append({"Indicator": f"  ↳ Institutional: {_c['name']}", "Group": "institutional", "Weight": "-",
+                            "Bullish": round(_c["bullish"], 2), "Bearish": round(_c["bearish"], 2),
+                            "Net": round(_c["net"], 2), "Data available": "Yes" if _c["available"] else "No",
+                            "Status": "Bullish" if _c["net"] > 0 else "Bearish" if _c["net"] < 0 else "Neutral",
+                            "Reason": _c["reason"]})
+    _audit_rows.append({"Indicator": "Liquidity blocker (BUY / SELL)", "Group": "blocker", "Weight": "-",
+                        "Bullish": 0, "Bearish": 0, "Net": 0, "Data available": "Yes",
+                        "Status": f"BUY blocked: {analysis.get('liquidity_block_buy')} | SELL blocked: {analysis.get('liquidity_block_sell')}",
+                        "Reason": "Hard entry blocker, independent of score"})
+    _audit_rows.append({"Indicator": "News filter", "Group": "blocker", "Weight": "-", "Bullish": 0, "Bearish": 0, "Net": 0,
+                        "Data available": "Yes" if news_filter_enabled and news_info.get("status") == "ok" else "No",
+                        "Status": "Blocked" if not news_info.get("allow_trade", True) else "Clear/Off",
+                        "Reason": str(news_info.get("message", ""))[:160]})
+    _audit_rows.append({"Indicator": "Learning layer (similar trades / historical loss rate)", "Group": "validation", "Weight": "-",
+                        "Bullish": 0, "Bearish": 0, "Net": 0,
+                        "Data available": "Yes" if analysis.get("similar_trades_found", 0) else "No",
+                        "Status": "Can only tighten, never relax a blocker",
+                        "Reason": f"{analysis.get('similar_trades_found', 0)} similar closed trades"})
+    st.dataframe(pd.DataFrame(_audit_rows), use_container_width=True, hide_index=True)
+    st.write(f"Net score (bullish − bearish): **{analysis.get('net_score', 0)}** | Institutional net: **{analysis.get('institutional_score', 0)}** ({analysis.get('institutional_status', 'n/a')})")
     if analysis.get("no_trade_reasons"):
         st.markdown("**Why no trade:**")
         for _reason in analysis["no_trade_reasons"]:
@@ -6948,7 +6353,6 @@ else:
 top1, top2, top3, top4 = st.columns(4)
 with top1:
     st.metric("Current Price", round(current_display_price, 2))
-    st.caption(f"Displayed price source: {live_price_source}. If no provider quote is available, this value is the latest OHLC candle close—not a live tick.")
 with top2:
 
     st.metric("Signal", analysis["signal_text"])
@@ -7038,10 +6442,6 @@ with mac3:
     st.metric("MACD Histogram", round(float(analysis["macd_hist"]), 4))
 with mac4:
     st.metric("Candle Pattern Score", analysis["candle_pattern_score"])
-# DEBUG
-st.write("Institutional Score =", analysis.get("institutional_score", "N/A"))
-st.write("Bullish =", analysis["bullish_score"])
-st.write("Bearish =", analysis["bearish_score"])
 score1, score2, score3, score4 = st.columns(4)
 with score1:
     st.metric("Bullish Score", analysis["bullish_score"])
@@ -7087,6 +6487,26 @@ with rk4:
     st.metric("Monthly Lock", "Yes" if bool(monthly_risk.loc[0, "MonthlyLock"]) else "No")
 with rk5:
     st.metric("Risk Status", risk_msg)
+with st.expander("Edit risk limits (paper trading)"):
+    _rs = load_risk_state()
+    _r1, _r2, _r3 = st.columns(3)
+    _risk_pct = _r1.number_input("Risk per trade %", 0.1, 10.0, float(_rs.loc[0, "RiskPerTradePct"]), 0.1, key="edit_risk_pct")
+    _dloss = _r2.number_input("Max daily loss (₹)", 100.0, 10000000.0, float(_rs.loc[0, "DailyLossLimit"]), 100.0, key="edit_daily_loss")
+    _maxtr = _r3.number_input("Max trades per day", 1, 100, int(_rs.loc[0, "MaxTradesPerDay"]), 1, key="edit_max_trades")
+    _r4, _r5, _r6 = st.columns(3)
+    _maxopen = _r4.number_input("Max open positions", 1, 50, int(_rs.loc[0, "MaxOpenPositions"]), 1, key="edit_max_open")
+    _capprot = _r5.number_input("Capital protection % (floor below initial)", 1.0, 90.0, float(_rs.loc[0, "CapitalProtectionPct"]), 1.0, key="edit_cap_prot")
+    _tren = _r6.checkbox("Trading enabled", bool(_rs.loc[0, "TradingEnabled"]), key="edit_trading_enabled")
+    if st.button("Save risk limits", key="save_risk_limits"):
+        _rs.loc[0, "RiskPerTradePct"] = _risk_pct
+        _rs.loc[0, "DailyLossLimit"] = _dloss
+        _rs.loc[0, "MaxTradesPerDay"] = int(_maxtr)
+        _rs.loc[0, "MaxOpenPositions"] = int(_maxopen)
+        _rs.loc[0, "CapitalProtectionPct"] = _capprot
+        _rs.loc[0, "TradingEnabled"] = bool(_tren)
+        save_risk_state(_rs)
+        st.success("Risk limits saved.")
+        st.rerun()
 
 st.subheader("Paper Trading — BUY / SELL / CLOSE | Virtual Orders Only")
 st.caption("No broker orders are sent. Suggested levels are analytical estimates, not guaranteed outcomes. Short positions reserve full notional as virtual margin.")
@@ -7399,64 +6819,6 @@ with bb6:
 setup_cols = st.columns(2)
 setup_cols[0].metric("Best Performing Setup", best_setup_label)
 setup_cols[1].metric("Worst Performing Setup", worst_setup_label)
-
-st.subheader("🧠 AI Backtest Trainer & Strategy Optimizer")
-st.caption("Evidence-based diagnostics and chronological parameter testing. It does not rewrite your scoring formula; approved filters can only gate paper-trade eligibility.")
-trainer_col1, trainer_col2 = st.columns([1, 2])
-with trainer_col1:
-    trainer_run = st.button("Run AI Trainer Analysis", type="primary", use_container_width=True, key="run_ai_backtest_trainer_v1")
-with trainer_col2:
-    active_profile = st.session_state.get("approved_ai_trainer_profile")
-    if active_profile and active_profile.get("approved"):
-        st.caption(f"Approved paper filter: {active_profile.get('rule')} = {active_profile.get('threshold')}")
-        if st.button("Disable approved AI filter", key="disable_ai_trainer_filter_v1"):
-            st.session_state.pop("approved_ai_trainer_profile", None)
-            st.rerun()
-    else:
-        st.caption("No AI Trainer filter is active. Existing signal scoring and paper eligibility remain unchanged.")
-if trainer_run:
-    with st.spinner("Analysing completed backtest trades and testing candidate filters…"):
-        st.session_state["ai_backtest_trainer_result"] = analyze_backtest_for_training(backtest_trades_df)
-        st.session_state["ai_backtest_trainer_key"] = _backtest_cache_key
-        st.session_state["ai_backtest_trainer_run_at"] = now_str()
-trainer_result = st.session_state.get("ai_backtest_trainer_result")
-if trainer_result and st.session_state.get("ai_backtest_trainer_key") == _backtest_cache_key:
-    base_m = trainer_result.get("baseline", {})
-    t1, t2, t3, t4 = st.columns(4)
-    t1.metric("Trainer Sample", base_m.get("trades", 0))
-    t2.metric("Baseline Win Rate", f"{base_m['win_rate']:.1f}%" if base_m.get("win_rate") is not None else "N/A")
-    t3.metric("Baseline Profit Factor", base_m.get("profit_factor", "N/A"))
-    t4.metric("Baseline Expectancy", base_m.get("expectancy", "N/A"))
-    st.caption(trainer_result.get("message", ""))
-    if trainer_result.get("alerts"):
-        st.markdown("**AI improvement alerts**")
-        st.dataframe(pd.DataFrame(trainer_result["alerts"]), use_container_width=True, hide_index=True)
-    if not trainer_result.get("ready"):
-        st.warning(trainer_result.get("message", "More completed trades are required."))
-    else:
-        if not trainer_result.get("candidates", pd.DataFrame()).empty:
-            st.markdown("**Candidate filter comparison (train-selected; chronological holdout shown separately)**")
-            st.dataframe(trainer_result["candidates"], use_container_width=True, hide_index=True)
-        best = trainer_result.get("best_candidate")
-        if best:
-            hold = best["holdout"]
-            base_hold = best["baseline_holdout"]
-            st.markdown("**Recommended candidate for review**")
-            st.write(f"{best['rule']} = {best['threshold']:g}")
-            st.write(f"Holdout baseline: {base_hold['trades']} trades | Win rate {base_hold['win_rate']}% | Expectancy {base_hold['expectancy']} | PF {base_hold['profit_factor']}")
-            st.write(f"Candidate holdout: {hold['trades']} trades | Win rate {hold['win_rate']}% | Expectancy {hold['expectancy']} | PF {hold['profit_factor']}")
-            st.warning("Approval activates this filter for paper-trade eligibility only. It does not alter bullish/bearish scores, weights, backtest history, or broker orders. Re-run walk-forward and paper-test before relying on it.")
-            if st.button("Approve candidate for PAPER mode only", key="approve_ai_trainer_candidate_v1", disabled=hold["trades"] < 8):
-                st.session_state["approved_ai_trainer_profile"] = {"approved": True, "rule": best["rule"], "threshold": best["threshold"], "approved_at": now_str(), "symbol": selected, "timeframe": timeframe}
-                st.success("Approved. The filter is now applied to paper eligibility only; existing signal scores remain unchanged.")
-        else:
-            st.info("No safe candidate to approve. Existing scoring remains unchanged.")
-    if st.session_state.get("ai_backtest_trainer_run_at"):
-        st.caption("Last trainer run: " + str(st.session_state["ai_backtest_trainer_run_at"]))
-elif trainer_result:
-    st.info("Backtest data changed since the previous trainer run. Run AI Trainer Analysis again for the current symbol/timeframe.")
-else:
-    st.info("Press Run AI Trainer Analysis. At least 30 completed trades are required before optimization candidates are generated.")
 
 bc1, bc2, bc3, bc4 = st.columns(4)
 with bc1:
@@ -7946,14 +7308,13 @@ with st.expander("📚 Educational Market Learning Lab — descriptive analysis 
                 st.warning("Install scikit-learn to enable the educational AI Trainer: pip install scikit-learn")
             except Exception as e:
                 st.error(f"AI Trainer could not complete: {e}")
-            
 
-            # Aapki existing script jahan stream render karti hai:
-            inst.render_institutional_dashboard(data, selected, fetch_data("^NSEI", "1d", "30d"), load_journal())
-            # Institutional Upgrades Dashboard Integration
-            st.divider()
-            st.header("Institutional Upgrades & Advanced Analytics Suite")
-            
-            # Benchmark data fetch karke dashboard render karein
-            nifty_bm = fetch_data("^NSEI", "1d", "30d")
-            inst.render_institutional_dashboard(data, selected, nifty_bm, load_journal())
+
+# =========================================================
+# INSTITUTIONAL ANALYSIS (rendered once; these components already feed the signal score)
+# =========================================================
+st.divider()
+st.header("Institutional Analysis")
+inst.render_institutional_dashboard(
+    data, selected, benchmark_df, load_journal(), option_metrics=option_metrics
+)
