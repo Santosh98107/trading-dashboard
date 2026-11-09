@@ -1,0 +1,36 @@
+# Final production build: what it is
+
+`app.py` = your `app (66)` (Upstox, Yahoo chart loader, AI Backtest Trainer) merged with all earlier fixes,
+plus production hardening. `institutional_upgrades.py` = the corrected module (replaces `institutional_upgrades (4)`).
+
+## Setup
+1. `pip install -r requirements.txt`
+2. Secrets / environment (never put these in code):
+   - `ADMIN_PASSWORD`  : your admin password. If unset, a random one-time password is shown on the login screen on first run.
+   - `ELITE_DATA_DIR`  : path of a PERSISTENT folder/volume. Without it, Streamlit Cloud erases the journal and paper account on restart.
+3. `streamlit run app.py`
+4. Upstox: Settings -> enter API key, secret, redirect URI -> open the login link -> paste the returned code. Tokens expire daily; the app now tells you and falls back to Yahoo (clearly labelled).
+
+## Production hardening added in this round
+- Passwords: salted PBKDF2 (240k iterations). Old SHA-256 hashes still log in and are upgraded automatically. No more default admin123; the sidebar warns if the old default is still active. Slow-down after 5 failed logins.
+- Backups: at most one per file per 10 minutes (previously one per write, which erased real history within minutes).
+- Error log capped at 500 rows. Data folder configurable. Upstox 401 -> token cleared + visible "reconnect" message (no silent empty data).
+
+## Merge decisions
+- One institutional block only (app66's duplicate removed; it would have double counted). Per-side liquidity blocker kept.
+- app66's "don't subtract the repeat-loss penalty twice" fix kept.
+- app66 compatibility keys kept (`liquidity_block_entry`, `institutional_participation_audit`).
+
+## Test report (pytest, 80 tests)
+Passed 80 / Failed 0. Behaviour scorecard (27 real bugs found across versions): 27/27.
+Covers: indicators and causality, candlesticks, BUY/SELL/NO TRADE, score audit, institutional participation, per-side liquidity
+blockers, benchmark RS, MTF, MIN_RR/STRICT gates, AI override, paper trading, risk limits (IST, exit-date), backtest no-look-ahead,
+password hashing/upgrade/first-run, backup throttle, Upstox 401 / candle parsing / LTP / OAuth failure (mocked HTTP), trainer holdout.
+
+## NOT verified (be aware before going live)
+- Streamlit UI start-up and rendering: not run (no network to install Streamlit here). Run it once and click through Institutional, Risk, Settings.
+- Real Upstox / Angel / Yahoo / Marketaux calls: tested only with mocked responses, never against live servers or credentials.
+- Upstox WebSocket streaming, GIFT Nifty genuine source: not present. Live prices come from REST polling.
+- Yahoo chart loader sends a browser User-Agent to an unofficial endpoint; Yahoo may block or change it. yfinance remains as fallback.
+- CSV storage is still single-account and file based. For real multi-user use, move to a database.
+- This is PAPER trading only. Signal scores are evidence, not probabilities; backtest results will differ from older versions.
