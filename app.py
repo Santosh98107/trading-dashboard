@@ -18,7 +18,7 @@ import streamlit as st
 import yfinance as yf
 import institutional_upgrades as inst
 # Visible deployment marker: confirms which source file Streamlit Cloud is running.
-APP_BUILD_ID = "2026-11-08-UPSTOX-INSTITUTIONAL-AI-TRAINER-02"
+APP_BUILD_ID = "2026-11-09-YAHOO-LTP-ANGEL-AUTH-FALLBACK-FIX-03"
 # Optional integrations: Yahoo mode must still start if Angel SDK/TOTP or
 # the auto-refresh helper is not installed.
 try:
@@ -610,6 +610,87 @@ def fetch_data(ticker, interval, period):
     except Exception as e:
         log_app_error("fetch_data", e)
         return pd.DataFrame()
+
+
+@st.cache_data(ttl=5, show_spinner=False)
+def fetch_yahoo_ltp(ticker):
+    """Return Yahoo's latest quote, or latest real intraday bar if quote metadata is absent.
+
+    A candle close is never described as exchange-real-time LTP. The result
+    includes source, timestamp and status so the UI can distinguish them.
+    """
+    try:
+        instrument = yf.Ticker(ticker)
+        try:
+            info = instrument.fast_info
+        except Exception:
+            info = None
+
+        # yfinance FastInfo differs across releases; support mapping and attributes.
+        for key in ("last_price", "regular_market_price", "lastPrice"):
+            try:
+                value = info.get(key) if hasattr(info, "get") else None
+                if value is None:
+                    value = getattr(info, key, None)
+                if value is None:
+                    try:
+                        value = info[key]
+                    except Exception:
+                        value = None
+                value = float(value)
+                if np.isfinite(value) and value > 0:
+                    return {
+                        "price": value,
+                        "source": "Yahoo Finance fast_info (latest available quote)",
+                        "timestamp": now_str(),
+                        "status": "quote_received",
+                        "age_seconds": None,
+                    }
+            except Exception:
+                continue
+
+        # Some symbols/releases omit last_price. Use a genuine latest intraday
+        # bar, but label it as a candle close—not a real-time exchange LTP.
+        for interval in ("1m", "5m"):
+            try:
+                history = instrument.history(
+                    period="1d", interval=interval, auto_adjust=False,
+                    prepost=True, timeout=8
+                )
+                if history is None or history.empty or "Close" not in history.columns:
+                    continue
+                closes = pd.to_numeric(history["Close"], errors="coerce").dropna()
+                if closes.empty:
+                    continue
+                stamp = pd.Timestamp(closes.index[-1])
+                age_seconds = None
+                try:
+                    now = pd.Timestamp.now(tz=stamp.tz) if stamp.tz is not None else pd.Timestamp.now()
+                    age_seconds = max(0, int((now - stamp).total_seconds()))
+                    stamp_text = stamp.strftime("%Y-%m-%d %H:%M:%S %Z").strip()
+                except Exception:
+                    stamp_text = str(stamp)
+                price = float(closes.iloc[-1])
+                if np.isfinite(price) and price > 0:
+                    return {
+                        "price": price,
+                        "source": f"Yahoo Finance latest {interval} candle close (not exchange LTP)",
+                        "timestamp": stamp_text,
+                        "status": "latest_intraday_bar",
+                        "age_seconds": age_seconds,
+                    }
+            except Exception:
+                continue
+    except Exception as exc:
+        log_app_error("fetch_yahoo_ltp", exc)
+
+    return {
+        "price": None,
+        "source": "Yahoo quote and intraday bar unavailable",
+        "timestamp": None,
+        "status": "no_quote",
+        "age_seconds": None,
+    }
 
 
 def resample_ohlcv(df, rule):
@@ -5594,19 +5675,19 @@ with refresh_col1:
     )
 with refresh_col2:
     auto_refresh = st.toggle(
-        "Enable Auto Refresh", value=False, key="auto_refresh_enabled",
+        "Enable Auto Refresh", value=True, key="auto_refresh_enabled",
         help="Turn automatic page refresh ON or OFF. Manual refresh remains available either way."
     )
 with refresh_col3:
     refresh_seconds = st.selectbox(
-        "Auto interval (seconds)", [5, 10, 15, 30, 60], index=1,
+        "Auto interval (seconds)", [5, 10, 15, 30, 60], index=2,
         key="auto_refresh_interval_seconds", disabled=not auto_refresh
     )
 
 if refresh_market_now:
     # Flush every market-data cache used by the board, scanner, chart and context panels.
     for _cached_fn in (
-        fetch_data, fetch_yahoo_batch, build_nifty_top30_scanner,
+        fetch_data, fetch_yahoo_ltp, fetch_yahoo_batch, build_nifty_top30_scanner,
         get_news_events, get_option_chain_snapshot
     ):
         try:
@@ -5916,11 +5997,10 @@ if not _angel_session_ready:
         _angel_missing_fields.append("PIN")
     if not str(angel_totp_secret).strip():
         _angel_missing_fields.append("TOTP Secret")
-_angel_credentials_ready = bool(
-    str(angel_api_key).strip()
-    and str(angel_client_code).strip()
-    and (_angel_session_ready or (str(angel_pin).strip() and str(angel_totp_secret).strip()))
-)
+# Credentials typed into widgets are NOT proof of authentication. Only a
+# successful SmartAPI session for this exact client/API key counts as logged in.
+# Until Test Angel Login succeeds, use Yahoo rather than attempting broker data.
+_angel_credentials_ready = bool(_angel_session_ready)
 
 st.info(
     f"Market data request: {data_source} | {selected} | {timeframe}. "
@@ -5936,8 +6016,12 @@ if data_source != "Angel":
 if data_source == "Upstox":
     _upstox_token = str(st.session_state.get("upstox_access_token", "")).strip()
     if not _upstox_token:
-        st.error("Upstox is selected, but no authenticated session token is present. Connect in Upstox API Settings first.")
-        data = pd.DataFrame()
+        st.warning("Upstox is not logged in. Automatically switching to Yahoo Finance for market data.")
+        with st.spinner(f"Yahoo Finance fallback: loading {ticker} ({yf_interval})…"):
+            data = fetch_data(ticker, yf_interval, yf_period)
+        yahoo_fallback_rows = int(len(data))
+        if not data.empty:
+            active_data_source = "Yahoo"
     else:
         with st.spinner(f"Upstox: resolving {selected} and loading {timeframe} candles…"):
             upstox_instrument_key = resolve_upstox_instrument_key(selected)
@@ -5968,10 +6052,14 @@ elif data_source == "Angel":
             "status": "not_requested",
             "reason": f"Required fields/session missing: {missing_text}",
         }
-        st.error(
-            f"Angel One data requests were NOT sent. Missing: {missing_text}. "
-            "Re-enter credentials and click Test Angel Login in this deployed app session."
+        st.warning(
+            f"Angel One is not logged in (missing: {missing_text}). Automatically switching to Yahoo Finance for market data."
         )
+        with st.spinner(f"Yahoo Finance fallback: loading {ticker} ({yf_interval})…"):
+            data = fetch_data(ticker, yf_interval, yf_period)
+        yahoo_fallback_rows = int(len(data))
+        if not data.empty:
+            active_data_source = "Yahoo"
     else:
         # WebSocket is the primary live-LTP source. REST polling is requested
         # only when the socket is not connected, has no tick yet, or its tick is stale.
@@ -6386,6 +6474,13 @@ else:
 
 live_price = None
 live_price_source = "OHLC candle close"
+yahoo_ltp_result = {"price": None, "source": "Yahoo quote not requested", "timestamp": None, "status": "not_requested"}
+if active_data_source == "Yahoo":
+    # A distinct quote request prevents the dashboard from labelling the last candle close as a live price.
+    yahoo_ltp_result = fetch_yahoo_ltp(ticker)
+    if yahoo_ltp_result.get("price") is not None:
+        live_price = float(yahoo_ltp_result["price"])
+        live_price_source = yahoo_ltp_result.get("source", "Yahoo Finance latest available quote")
 if data_source == "Upstox" and upstox_ltp_value is not None and upstox_ltp_value > 0:
     live_price = float(upstox_ltp_value)
     live_price_source = "Upstox Market Quote V3 (REST snapshot)"
@@ -6402,6 +6497,17 @@ elif data_source == "Angel":
         live_price = float(angel_ltp_value)
         live_price_source = angel_ltp_source or "Angel REST Polling (Fallback)"
     sync_ws_state_to_session()
+
+# Even an authenticated broker may temporarily fail to return a usable quote
+# (expired token, permissions, stale socket, rate limit). Try Yahoo as the
+# secondary price source instead of silently presenting an old candle as LTP.
+if live_price is None or not np.isfinite(float(live_price)) or float(live_price) <= 0:
+    yahoo_ltp_result = fetch_yahoo_ltp(ticker)
+    if yahoo_ltp_result.get("price") is not None:
+        live_price = float(yahoo_ltp_result["price"])
+        live_price_source = yahoo_ltp_result.get("source", "Yahoo Finance latest available price")
+    elif active_data_source == "Yahoo":
+        live_price_source = "Yahoo quote unavailable — showing last OHLC close separately"
 
 current_display_price = live_price if live_price is not None and live_price > 0 else analysis["close_price"]
 
@@ -6489,6 +6595,28 @@ with st.expander("Candlestick Pattern Library — latest detected patterns"):
     st.write(", ".join(active_patterns) if active_patterns else "No recognized pattern on the latest completed candle.")
 
 st.subheader("Live Signal Analytics")
+price_col1, price_col2, price_col3 = st.columns(3)
+with price_col1:
+    st.metric("Latest Available Price", f"{live_price:,.2f}" if live_price is not None else "Unavailable")
+with price_col2:
+    st.metric("Price Source", live_price_source)
+with price_col3:
+    st.metric("Quote Status", yahoo_ltp_result.get("status", "broker_quote" if live_price is not None else "unavailable"))
+if yahoo_ltp_result.get("timestamp"):
+    st.caption(f"Yahoo price timestamp: {yahoo_ltp_result['timestamp']} | Status: {yahoo_ltp_result.get('status')}")
+
+if active_data_source == "Yahoo":
+    q1, q2 = st.columns(2)
+    with q1:
+        st.metric("Yahoo Latest Available Price", f"{live_price:,.2f}" if live_price is not None else "Unavailable")
+    with q2:
+        st.metric("Yahoo Quote Status", yahoo_ltp_result.get("status", "not_requested"))
+    st.caption(
+        f"Status: {yahoo_ltp_result.get('status', 'unknown')} | "
+        f"Price timestamp: {yahoo_ltp_result.get('timestamp') or 'Unavailable'}. "
+        "Yahoo may be delayed. If FastInfo has no quote, the app may show the latest real 1m/5m candle close, explicitly labelled as a candle close—not exchange-real-time LTP. "
+        "If both are unavailable, the OHLC close remains a separate fallback."
+    )
 
 if data_source == "Angel":
     p1, p2, p3, p4 = st.columns(4)
@@ -6577,6 +6705,7 @@ else:
 top1, top2, top3, top4 = st.columns(4)
 with top1:
     st.metric("Current Price", round(current_display_price, 2))
+    st.caption(f"Displayed price source: {live_price_source}. If no provider quote is available, this value is the latest OHLC candle close—not a live tick.")
 with top2:
 
     st.metric("Signal", analysis["signal_text"])
