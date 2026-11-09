@@ -18,7 +18,7 @@ import streamlit as st
 import yfinance as yf
 import institutional_upgrades as inst
 # Visible deployment marker: confirms which source file Streamlit Cloud is running.
-APP_BUILD_ID = "2026-11-09-LOSS-INTELLIGENCE-SIMILARITY-FIX-04"
+APP_BUILD_ID = "2026-11-09-YAHOO-CHART-API-ROBUST-FIX-05"
 # Optional integrations: Yahoo mode must still start if Angel SDK/TOTP or
 # the auto-refresh helper is not installed.
 try:
@@ -557,61 +557,157 @@ def login_panel():
 # =========================================================
 # DATA FETCH
 # =========================================================
-@st.cache_data(ttl=10, show_spinner=False)
+_YAHOO_FETCH_DIAGNOSTICS = {"status": "not_requested", "source": None, "rows": 0, "error": None}
+
+
+def _yahoo_chart_api_frame(ticker, interval, period):
+    """Fetch actual Yahoo chart OHLCV directly, avoiding yfinance schema drift."""
+    range_value = str(period or "7d").lower()
+    allowed_ranges = {"1d", "5d", "7d", "1mo", "3mo", "6mo", "1y", "2y", "5d", "30d", "60d", "90d"}
+    if range_value not in allowed_ranges:
+        range_value = "7d"
+    # Yahoo chart API accepts common range tokens; normalize day-count aliases.
+    range_value = {"30d": "1mo", "60d": "3mo", "90d": "3mo"}.get(range_value, range_value)
+    params = {
+        "range": range_value,
+        "interval": str(interval),
+        "includePrePost": "true",
+        "events": "div,splits",
+    }
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0 Safari/537.36",
+        "Accept": "application/json,text/plain,*/*",
+    }
+    last_error = None
+    for host in ("query1.finance.yahoo.com", "query2.finance.yahoo.com"):
+        url = f"https://{host}/v8/finance/chart/{quote(str(ticker), safe='^.-')}"
+        try:
+            response = requests.get(url, params=params, headers=headers, timeout=(4, 9))
+            response.raise_for_status()
+            payload = response.json()
+            chart = payload.get("chart", {})
+            if chart.get("error"):
+                err = chart["error"]
+                raise RuntimeError(str(err.get("description") or err.get("code") or err))
+            results = chart.get("result") or []
+            if not results:
+                raise RuntimeError("Yahoo chart API returned no result")
+            item = results[0]
+            stamps = item.get("timestamp") or []
+            quote_rows = ((item.get("indicators") or {}).get("quote") or [{}])[0]
+            if not stamps or not quote_rows:
+                raise RuntimeError("Yahoo chart response has no timestamps or OHLCV quote")
+            frame = pd.DataFrame({
+                "Open": quote_rows.get("open", []),
+                "High": quote_rows.get("high", []),
+                "Low": quote_rows.get("low", []),
+                "Close": quote_rows.get("close", []),
+                "Volume": quote_rows.get("volume", []),
+            }, index=pd.to_datetime(stamps, unit="s", utc=True))
+            frame.index.name = "Datetime"
+            frame = frame.dropna(subset=["Open", "High", "Low", "Close"])
+            if frame.empty:
+                raise RuntimeError("Yahoo chart response contained no complete OHLC candles")
+            frame["Volume"] = pd.to_numeric(frame["Volume"], errors="coerce").fillna(0)
+            for col in ("Open", "High", "Low", "Close"):
+                frame[col] = pd.to_numeric(frame[col], errors="coerce")
+            frame = frame.dropna(subset=["Open", "High", "Low", "Close"])
+            return frame.loc[~frame.index.duplicated(keep="last")].sort_index(), None
+        except Exception as exc:
+            last_error = f"{host}: {type(exc).__name__}: {exc}"
+    return pd.DataFrame(), last_error
+
+
+@st.cache_data(ttl=8, show_spinner=False)
 def fetch_data(ticker, interval, period):
-    """Yahoo OHLCV loader tolerant of yfinance MultiIndex layout changes."""
+    """Reliable Yahoo OHLCV loader: chart endpoint first, yfinance as fallback."""
+    global _YAHOO_FETCH_DIAGNOSTICS
     needed = ["Open", "High", "Low", "Close", "Volume"]
     errors = []
-    df = pd.DataFrame()
     try:
+        frame, direct_error = _yahoo_chart_api_frame(ticker, interval, period)
+        if not frame.empty:
+            _YAHOO_FETCH_DIAGNOSTICS = {
+                "status": "success", "source": "Yahoo Chart API", "rows": int(len(frame)), "error": None,
+                "last_candle": str(frame.index[-1]),
+            }
+            return frame[needed].copy()
+        if direct_error:
+            errors.append("Yahoo Chart API: " + direct_error)
+
+        # Compatibility fallback for installations where Yahoo's chart host is blocked.
         try:
-            df = yf.download(ticker, interval=interval, period=period,
-                             progress=False, auto_adjust=False, threads=False, timeout=8,
-                             multi_level_index=False)
+            raw = yf.download(
+                ticker, interval=interval, period=period, progress=False,
+                auto_adjust=False, threads=False, timeout=10,
+                multi_level_index=False,
+            )
         except TypeError:
-            df = yf.download(ticker, interval=interval, period=period,
-                             progress=False, auto_adjust=False, threads=False, timeout=8)
-        except Exception as exc:
-            errors.append(f"download: {exc}")
-
-        # yfinance versions differ: columns may be (Price, Ticker) or (Ticker, Price).
-        if isinstance(df.columns, pd.MultiIndex):
-            best_level = None
-            best_count = -1
-            for level in range(df.columns.nlevels):
-                vals = [str(v) for v in df.columns.get_level_values(level)]
-                count = sum(col in vals for col in needed)
-                if count > best_count:
-                    best_count, best_level = count, level
-            if best_level is not None:
-                df.columns = df.columns.get_level_values(best_level)
-        if not df.empty and all(c in df.columns for c in needed):
-            df = df.loc[:, ~pd.Index(df.columns).duplicated()].copy()
-            df = df[needed].copy()
-        else:
-            # Ticker.history is a useful fallback when download returns a changed schema.
             try:
-                hist = yf.Ticker(ticker).history(period=period, interval=interval,
-                                                 auto_adjust=False, prepost=False, timeout=8)
-                if not hist.empty and all(c in hist.columns for c in needed):
-                    df = hist[needed].copy()
+                raw = yf.download(
+                    ticker, interval=interval, period=period, progress=False,
+                    auto_adjust=False, threads=False, timeout=10,
+                )
             except Exception as exc:
-                errors.append(f"history: {exc}")
+                raw = pd.DataFrame()
+                errors.append(f"yfinance download compatibility fallback: {type(exc).__name__}: {exc}")
+        except Exception as exc:
+            raw = pd.DataFrame()
+            errors.append(f"yfinance download: {type(exc).__name__}: {exc}")
 
-        if df.empty or not all(c in df.columns for c in needed):
-            if errors:
-                log_app_error("fetch_data", " | ".join(errors))
+        if isinstance(raw, pd.DataFrame) and isinstance(raw.columns, pd.MultiIndex):
+            selected_level = None
+            selected_count = -1
+            for level in range(raw.columns.nlevels):
+                values = [str(value) for value in raw.columns.get_level_values(level)]
+                count = sum(name in values for name in needed)
+                if count > selected_count:
+                    selected_level, selected_count = level, count
+            if selected_level is not None:
+                raw.columns = raw.columns.get_level_values(selected_level)
+        if isinstance(raw, pd.DataFrame):
+            raw = raw.loc[:, ~pd.Index(raw.columns).duplicated()].copy()
+            if all(name in raw.columns for name in needed):
+                frame = raw[needed].copy()
+            else:
+                frame = pd.DataFrame()
+        else:
+            frame = pd.DataFrame()
+
+        if frame.empty:
+            try:
+                hist = yf.Ticker(ticker).history(
+                    period=period, interval=interval, auto_adjust=False,
+                    prepost=True, timeout=10,
+                )
+                if isinstance(hist, pd.DataFrame) and all(name in hist.columns for name in needed):
+                    frame = hist[needed].copy()
+            except Exception as exc:
+                errors.append(f"yfinance history: {type(exc).__name__}: {exc}")
+
+        if frame.empty:
+            message = " | ".join(errors) or "Yahoo returned an empty OHLCV response"
+            _YAHOO_FETCH_DIAGNOSTICS = {"status": "failed", "source": None, "rows": 0, "error": message}
+            log_app_error("fetch_data", message)
             return pd.DataFrame()
-        df.index = pd.to_datetime(df.index, errors="coerce")
-        df = df[~df.index.isna()].copy()
+
+        frame.index = pd.to_datetime(frame.index, errors="coerce")
+        frame = frame[~frame.index.isna()].copy()
         for col in needed:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-        df = df.dropna(subset=["Open", "High", "Low", "Close"])
-        df["Volume"] = df["Volume"].fillna(0)
-        df = df[~df.index.duplicated(keep="last")].sort_index()
-        return df
-    except Exception as e:
-        log_app_error("fetch_data", e)
+            frame[col] = pd.to_numeric(frame[col], errors="coerce")
+        frame = frame.dropna(subset=["Open", "High", "Low", "Close"])
+        frame["Volume"] = frame["Volume"].fillna(0)
+        frame = frame[~frame.index.duplicated(keep="last")].sort_index()
+        _YAHOO_FETCH_DIAGNOSTICS = {
+            "status": "success", "source": "yfinance fallback", "rows": int(len(frame)),
+            "error": " | ".join(errors) if errors else None,
+            "last_candle": str(frame.index[-1]) if not frame.empty else None,
+        }
+        return frame
+    except Exception as exc:
+        message = f"{type(exc).__name__}: {exc}"
+        _YAHOO_FETCH_DIAGNOSTICS = {"status": "failed", "source": None, "rows": 0, "error": message}
+        log_app_error("fetch_data", message)
         return pd.DataFrame()
 
 
@@ -623,6 +719,22 @@ def fetch_yahoo_ltp(ticker):
     includes source, timestamp and status so the UI can distinguish them.
     """
     try:
+        # Prefer the direct Yahoo chart endpoint; fast_info may be empty or stale
+        # for index symbols such as ^NSEI in some yfinance releases.
+        for quote_interval, quote_period in (("1m", "1d"), ("5m", "5d")):
+            quote_frame, _quote_error = _yahoo_chart_api_frame(ticker, quote_interval, quote_period)
+            if quote_frame is not None and not quote_frame.empty:
+                last_stamp = pd.Timestamp(quote_frame.index[-1])
+                last_price = float(quote_frame["Close"].iloc[-1])
+                now = pd.Timestamp.now(tz=last_stamp.tz) if last_stamp.tz is not None else pd.Timestamp.now()
+                age = max(0, int((now - last_stamp).total_seconds()))
+                return {
+                    "price": last_price,
+                    "source": f"Yahoo Chart API latest {quote_interval} candle close (not exchange LTP)",
+                    "timestamp": last_stamp.strftime("%Y-%m-%d %H:%M:%S %Z").strip(),
+                    "status": "latest_intraday_bar",
+                    "age_seconds": age,
+                }
         instrument = yf.Ticker(ticker)
         try:
             info = instrument.fast_info
@@ -6218,6 +6330,20 @@ else:
     with st.spinner(f"Yahoo Finance: loading {ticker} ({yf_interval})…"):
         data = fetch_data(ticker, yf_interval, yf_period)
     yahoo_primary_rows = int(len(data))
+    _yahoo_diag = dict(_YAHOO_FETCH_DIAGNOSTICS)
+    if data.empty:
+        st.error(
+            f"Yahoo OHLC fetch failed for {ticker} / {yf_interval}. "
+            f"Status: {_yahoo_diag.get('status', 'unknown')}. "
+            f"Reason: {_yahoo_diag.get('error') or 'No candles returned'}. "
+            "Check Streamlit Cloud network access and Yahoo availability; no candles are fabricated."
+        )
+    else:
+        st.caption(
+            f"Yahoo data: {_yahoo_diag.get('source', 'Yahoo')} | "
+            f"{_yahoo_diag.get('rows', len(data))} candles | "
+            f"Last candle: {_yahoo_diag.get('last_candle', str(data.index[-1]))}"
+        )
     if data.empty and _angel_credentials_ready:
         # Optional failover if Yahoo is temporarily unavailable but the user has
         # already connected Angel One in this same session.
@@ -6235,6 +6361,22 @@ else:
             st.warning("Yahoo Finance returned no OHLC rows. Using connected Angel One candle history as a clearly-labelled fallback.")
 
 if data.empty:
+    # Quote retrieval is independent of OHLC history: even if Yahoo candles fail,
+    # show a clearly-labelled latest quote/bar when Yahoo can provide one.
+    if data_source == "Yahoo":
+        _yahoo_empty_quote = fetch_yahoo_ltp(ticker)
+        if _yahoo_empty_quote.get("price") is not None:
+            st.metric(
+                f"Yahoo latest available price — {_yahoo_empty_quote.get('source', 'Yahoo')}",
+                f"{float(_yahoo_empty_quote['price']):,.2f}",
+            )
+            st.caption(
+                f"Yahoo quote/bar timestamp: {_yahoo_empty_quote.get('timestamp') or 'N/A'} | "
+                f"Status: {_yahoo_empty_quote.get('status')} | "
+                "This is not guaranteed exchange-real-time LTP."
+            )
+        else:
+            st.warning("Yahoo quote and intraday candles are both unavailable. Check the Yahoo fetch diagnostic above and the deployment network/logs.")
     if data_source == "Angel" and (polling_mode or ws_enable):
         if angel_ltp_value is not None:
             st.metric(f"Angel One Latest Traded Price — {angel_ltp_source}", f"{angel_ltp_value:,.2f}")
