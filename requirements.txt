@@ -1,12 +1,14 @@
-streamlit>=1.40,<2.0
-streamlit-autorefresh>=1.0.1,<2.0
-yfinance>=0.2.54,<2.0
-pandas>=2.0,<3.0
-numpy>=1.26,<3.0
-plotly>=5.20,<7.0
-requests>=2.31,<3.0
-pyotp>=2.9,<3.0
-smartapi-python==1.5.5
-logzero>=1.7,<2.0
-websocket-client>=1.8,<2.0
-pycryptodome>=3.20,<4.0
+streamlit>=1.35
+pandas>=2.0
+numpy>=1.26
+plotly>=5.20
+yfinance>=0.2.40
+requests>=2.31
+scikit-learn>=1.4
+streamlit-autorefresh>=1.0
+smartapi-python>=1.4
+pyotp>=2.9
+logzero
+websocket-client
+# tests only
+pytest>=8
