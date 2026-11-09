@@ -18,7 +18,7 @@ import streamlit as st
 import yfinance as yf
 import institutional_upgrades as inst
 # Visible deployment marker: confirms which source file Streamlit Cloud is running.
-APP_BUILD_ID = "2026-11-09-YAHOO-LTP-ANGEL-AUTH-FALLBACK-FIX-03"
+APP_BUILD_ID = "2026-11-09-LOSS-INTELLIGENCE-SIMILARITY-FIX-04"
 # Optional integrations: Yahoo mode must still start if Angel SDK/TOTP or
 # the auto-refresh helper is not installed.
 try:
@@ -3551,6 +3551,8 @@ def build_trade_feature_snapshot(df, analysis, mtf_bull_count=0, mtf_bear_count=
         "HistoricalWinRateAtEntry": _safe_num(analysis.get("historical_win_rate")),
         "SimilarTradesAtEntry": int(analysis.get("similar_trades_found", 0) or 0),
         "SignalStage": str(analysis.get("signal_stage", "")),
+        "Symbol": str(analysis.get("symbol", "") or ""),
+        "Timeframe": str(analysis.get("timeframe", "") or ""),
     }
     return snap
 
@@ -3577,56 +3579,109 @@ def classify_trade_loss(snapshot, pnl, side="BUY", exit_price=None, entry_price=
     return "Unclassified Loss - Review News, Entry Timing and Execution"
 
 
-def _similarity_score(current, historical):
-    """Distance over available comparable numeric features; tolerates old/incomplete journal rows."""
+def _similarity_score(current, historical, min_features=5):
+    """Robust similarity using every captured numeric feature that is comparable.
+
+    Price/volume scale features are compared relatively; oscillator, ratio and
+    percentage-distance features use bounded absolute tolerances. Sparse rows
+    are rejected instead of being treated as convincing matches.
+    """
+    if not isinstance(current, dict) or not isinstance(historical, dict):
+        return 0.0
+    # Absolute tolerances for dimensionless indicators and percentage distances.
+    absolute_tolerances = {
+        "RSI": 12.0, "ADX": 12.0, "RelativeVolume": 0.9,
+        "RiskRewardRatio": 1.5, "TrendSlope": 0.15,
+        "SupportDistancePct": 1.0, "ResistanceDistancePct": 1.0,
+        "DistanceEMA20Pct": 0.8, "DistanceEMA50Pct": 1.2,
+        "DistanceVWAPPct": 0.8,
+    }
+    # Relative tolerances avoid raw price/volume levels dominating the score.
+    relative_tolerances = {
+        "EMA9": 0.015, "EMA21": 0.015, "EMA20": 0.015,
+        "EMA50": 0.02, "EMA200": 0.025, "VWAP": 0.015,
+        "ATR": 0.35, "MACD": 0.50, "Volume": 0.75,
+        "VolumeDelta": 1.0,
+    }
     pairs = []
-    tolerances = {"RSI": 12, "ADX": 12, "RelativeVolume": 0.9, "RiskRewardRatio": 1.5,
-                  "DistanceEMA20Pct": 0.8, "DistanceEMA50Pct": 1.2, "TrendSlope": max(abs(_safe_num(current.get("TrendSlope"), 0))*1.5, 0.05)}
-    for key in ("RSI", "ADX", "RelativeVolume", "RiskRewardRatio", "DistanceEMA20Pct", "DistanceEMA50Pct", "TrendSlope"):
+    for key in LOSS_FEATURE_COLUMNS:
         a, b = _safe_num(current.get(key)), _safe_num(historical.get(key))
-        if np.isfinite(a) and np.isfinite(b):
-            tol = tolerances.get(key, 1.0)
-            pairs.append(max(0.0, 1.0 - abs(a-b) / max(tol, 1e-6)))
-    if not pairs: return 0.0
+        if not (np.isfinite(a) and np.isfinite(b)):
+            continue
+        if key in absolute_tolerances:
+            distance = abs(a - b) / max(absolute_tolerances[key], 1e-9)
+        else:
+            scale = max(abs(a), abs(b), 1e-9)
+            distance = (abs(a - b) / scale) / relative_tolerances.get(key, 0.25)
+        pairs.append(max(0.0, 1.0 - min(distance, 1.0)))
+    if len(pairs) < min_features:
+        return 0.0
     score = float(np.mean(pairs))
-    if current.get("MarketRegime") and historical.get("MarketRegime") and str(current.get("MarketRegime")) == str(historical.get("MarketRegime")):
-        score = min(1.0, score + 0.08)
-    if current.get("MTFTrendStatus") and historical.get("MTFTrendStatus") and str(current.get("MTFTrendStatus")) == str(historical.get("MTFTrendStatus")):
-        score = min(1.0, score + 0.05)
+    # Context features add only a small tie-breaker after numeric coverage passes.
+    if current.get("MarketRegime") and historical.get("MarketRegime") and str(current.get("MarketRegime")).strip().lower() == str(historical.get("MarketRegime")).strip().lower():
+        score = min(1.0, score + 0.025)
+    if current.get("MTFTrendStatus") and historical.get("MTFTrendStatus") and str(current.get("MTFTrendStatus")).strip().lower() == str(historical.get("MTFTrendStatus")).strip().lower():
+        score = min(1.0, score + 0.025)
     return score
 
 
-def get_similar_trade_intelligence(snapshot, side, min_similarity=0.68):
+def get_similar_trade_intelligence(snapshot, side, min_similarity=0.68, min_features=5):
+    """Compare only closed trades with the same directional side and sufficient feature coverage."""
+    empty = {"matches": pd.DataFrame(), "count": 0, "win_rate": None, "loss_rate": None,
+             "avg_profit": None, "avg_loss": None, "expected_value": None,
+             "loser_match_rate": None, "reason": "No sufficiently comparable closed trades found.",
+             "min_features": min_features}
+    side = str(side or "").strip().upper()
+    if side not in ("BUY", "SELL"):
+        empty["reason"] = "Neutral / NO TRADE signal: directional similarity matching skipped."
+        return empty
+    if not isinstance(snapshot, dict) or not snapshot:
+        empty["reason"] = "Current feature snapshot is unavailable."
+        return empty
     journal = load_journal()
-    result = {"matches": pd.DataFrame(), "count": 0, "win_rate": None, "loss_rate": None,
-              "avg_profit": None, "avg_loss": None, "expected_value": None, "loser_match_rate": None}
-    if journal.empty or not {"Status", "Result"}.issubset(journal.columns): return result
+    if journal.empty or not {"Status", "Result"}.issubset(journal.columns):
+        empty["reason"] = "Journal is empty or lacks Status/Result fields."
+        return empty
     closed = journal[journal["Status"].astype(str).str.upper().eq("CLOSED")].copy()
-    if "Side" in closed.columns: closed = closed[closed["Side"].astype(str).str.upper().eq(str(side).upper())]
-    if closed.empty: return result
+    if "Side" in closed.columns:
+        closed = closed[closed["Side"].astype(str).str.upper().eq(side)]
+    # When timeframe metadata exists on both sides, do not mix unlike timeframes.
+    current_tf = str(snapshot.get("Timeframe", "") or "").strip().lower()
+    if current_tf and "Timeframe" in closed.columns:
+        hist_tf = closed["Timeframe"].astype(str).str.strip().str.lower()
+        closed = closed[hist_tf.eq(current_tf) | hist_tf.eq("") | hist_tf.eq("nan")]
+    if closed.empty:
+        empty["reason"] = f"No closed {side} journal trades available for this timeframe."
+        return empty
     scores = []
-    for _, row in closed.iterrows():
+    for idx, row in closed.iterrows():
         hist = {k: row.get(k) for k in LOSS_FEATURE_COLUMNS + ["MarketRegime", "MTFTrendStatus"]}
-        score = _similarity_score(snapshot, hist)
+        score = _similarity_score(snapshot, hist, min_features=min_features)
         if score >= min_similarity:
-            scores.append((row.name, score))
-    if not scores: return result
+            scores.append((idx, score))
+    if not scores:
+        empty["reason"] = f"No {side} trades met {min_features}-feature coverage and {min_similarity:.0%} similarity."
+        return empty
     matches = closed.loc[[x[0] for x in scores]].copy()
     matches["Similarity"] = [x[1] for x in scores]
     pnl = pd.to_numeric(matches.get("PnL", pd.Series(0, index=matches.index)), errors="coerce").fillna(0)
-    wins = pnl[pnl > 0]; losses = pnl[pnl < 0]
+    wins, losses = pnl[pnl > 0], pnl[pnl < 0]
     count = len(matches)
-    result.update({"matches": matches.sort_values("Similarity", ascending=False), "count": count,
-                   "win_rate": float((pnl > 0).mean() * 100), "loss_rate": float((pnl < 0).mean() * 100),
-                   "avg_profit": float(wins.mean()) if len(wins) else 0.0,
-                   "avg_loss": float(losses.mean()) if len(losses) else 0.0,
-                   "expected_value": float(pnl.mean()), "loser_match_rate": float((pnl < 0).mean() * 100)})
+    result = {"matches": matches.sort_values("Similarity", ascending=False), "count": count,
+              "win_rate": float((pnl > 0).mean() * 100), "loss_rate": float((pnl < 0).mean() * 100),
+              "avg_profit": float(wins.mean()) if len(wins) else 0.0,
+              "avg_loss": float(losses.mean()) if len(losses) else 0.0,
+              "expected_value": float(pnl.mean()), "loser_match_rate": float((pnl < 0).mean() * 100),
+              "reason": f"{count} closed {side} trades matched using at least {min_features} comparable features.",
+              "min_features": min_features}
     return result
 
 
 def apply_adaptive_signal_intelligence(df, analysis, symbol, timeframe, mtf_bull_count=0, mtf_bear_count=0, mtf_available_count=0):
     """Add similar-trade learning, conservative confidence adjustment and staged signal labels."""
-    side = "BUY" if analysis.get("signal_type") == "buy" else "SELL" if analysis.get("signal_type") == "sell" else "BUY"
+    side = "BUY" if analysis.get("signal_type") == "buy" else "SELL" if analysis.get("signal_type") == "sell" else None
+    analysis["symbol"] = symbol
+    analysis["timeframe"] = timeframe
     snapshot = build_trade_feature_snapshot(df, analysis, mtf_bull_count, mtf_bear_count, mtf_available_count)
     intelligence = get_similar_trade_intelligence(snapshot, side)
     analysis["similar_trades_found"] = intelligence["count"]
@@ -3729,14 +3784,11 @@ def apply_adaptive_signal_intelligence(df, analysis, symbol, timeframe, mtf_bull
                 int(analysis["confidence"] - 15)
             )
     
-    if repeat_loss_warning:
-    
-        analysis["confidence"] = max(
-            0,
-            int(analysis["confidence"] - 10)
-        )
-    
-    analysis["ai_override_applied"] = True
+    # The repeat-loss penalty was already included above; do not subtract it twice.
+    # Confidence can be None after a neutral override, so never perform arithmetic on None.
+    if analysis.get("confidence") is not None:
+        analysis["confidence"] = max(0, min(100, int(analysis["confidence"])))
+    analysis["ai_override_applied"] = bool(similar_trades >= 20 and historical_loss_rate is not None and historical_loss_rate >= 65)
     return analysis
 
 
@@ -6363,7 +6415,8 @@ with st.expander("🧠 Loss Intelligence & Similar Historical Setups", expanded=
         st.info(f"AI Trainer approved paper filter active: {_trainer_profile.get('rule')} = {_trainer_profile.get('threshold')}. Signal scores are unchanged; only paper eligibility is gated.")
     if analysis.get("ai_trainer_paper_block_reason"):
         st.warning(analysis["ai_trainer_paper_block_reason"])
-    intel = get_similar_trade_intelligence(analysis.get("feature_snapshot", {}), "BUY" if analysis.get("signal_type") == "buy" else "SELL")
+    _ui_side = "BUY" if analysis.get("signal_type") == "buy" else "SELL" if analysis.get("signal_type") == "sell" else None
+    intel = get_similar_trade_intelligence(analysis.get("feature_snapshot", {}), _ui_side)
     i1, i2, i3, i4, i5 = st.columns(5)
     i1.metric("Signal Stage", analysis.get("signal_stage", "N/A"))
     i2.metric("Similar Trades", intel.get("count", 0))
@@ -6382,7 +6435,7 @@ with st.expander("🧠 Loss Intelligence & Similar Historical Setups", expanded=
         else:
             col.metric(f"{tf} Trend", "N/A")
             col.caption("Insufficient or unavailable timeframe data; alert tier not confirmed.")
-    st.caption(f"Adaptive confidence: {analysis.get('confidence', 'N/A')} / 100 | {analysis.get('adaptive_confidence_label', '')} | Similarity matching is heuristic and only uses stored, available fields.")
+    st.caption(f"Adaptive confidence: {analysis.get('confidence', 'N/A')} / 100 | {analysis.get('adaptive_confidence_label', '')} | {intel.get('reason', 'Similarity unavailable')} Matching is heuristic and requires at least five comparable stored numeric features.")
     block_repeat_losers = st.toggle("Block signals matching repeated historical losing setups", value=False, key="block_repeat_loser_setups")
     repeat_loss_block_active = bool(block_repeat_losers and analysis.get("similar_trade_block_suggested"))
     if analysis.get("repeat_loss_warning"):
