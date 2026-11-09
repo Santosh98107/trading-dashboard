@@ -18,7 +18,7 @@ import streamlit as st
 import yfinance as yf
 import institutional_upgrades as inst
 # Visible deployment marker: confirms which source file Streamlit Cloud is running.
-APP_BUILD_ID = "2026-11-08-UPSTOX-INSTITUTIONAL-AI-TRAINER-02"
+APP_BUILD_ID = "2026-11-09-YAHOO-CHART-API-ROBUST-FIX-05"
 # Optional integrations: Yahoo mode must still start if Angel SDK/TOTP or
 # the auto-refresh helper is not installed.
 try:
@@ -350,7 +350,10 @@ def load_journal():
         "DistanceEMA20Pct": np.nan, "DistanceEMA50Pct": np.nan, "DistanceVWAPPct": np.nan,
         "RiskRewardRatio": np.nan, "ConfidenceAtEntry": np.nan,
         "HistoricalWinRateAtEntry": np.nan, "SimilarTradesAtEntry": 0,
-        "LossReason": "", "SignalStage": ""
+        "LossReason": "", "SignalStage": "", "MACD": np.nan, "ATR": np.nan,
+        "VolumeDelta": np.nan, "TrendSlope": np.nan, "SupportDistancePct": np.nan,
+        "ResistanceDistancePct": np.nan, "DistanceEMA20Pct": np.nan,
+        "DistanceEMA50Pct": np.nan, "DistanceVWAPPct": np.nan, "RiskRewardRatio": np.nan
     }
     for col, default in defaults.items():
         if col not in journal.columns:
@@ -554,62 +557,255 @@ def login_panel():
 # =========================================================
 # DATA FETCH
 # =========================================================
-@st.cache_data(ttl=10, show_spinner=False)
+_YAHOO_FETCH_DIAGNOSTICS = {"status": "not_requested", "source": None, "rows": 0, "error": None}
+
+
+def _yahoo_chart_api_frame(ticker, interval, period):
+    """Fetch actual Yahoo chart OHLCV directly, avoiding yfinance schema drift."""
+    range_value = str(period or "7d").lower()
+    allowed_ranges = {"1d", "5d", "7d", "1mo", "3mo", "6mo", "1y", "2y", "5d", "30d", "60d", "90d"}
+    if range_value not in allowed_ranges:
+        range_value = "7d"
+    # Yahoo chart API accepts common range tokens; normalize day-count aliases.
+    range_value = {"30d": "1mo", "60d": "3mo", "90d": "3mo"}.get(range_value, range_value)
+    params = {
+        "range": range_value,
+        "interval": str(interval),
+        "includePrePost": "true",
+        "events": "div,splits",
+    }
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0 Safari/537.36",
+        "Accept": "application/json,text/plain,*/*",
+    }
+    last_error = None
+    for host in ("query1.finance.yahoo.com", "query2.finance.yahoo.com"):
+        url = f"https://{host}/v8/finance/chart/{quote(str(ticker), safe='^.-')}"
+        try:
+            response = requests.get(url, params=params, headers=headers, timeout=(4, 9))
+            response.raise_for_status()
+            payload = response.json()
+            chart = payload.get("chart", {})
+            if chart.get("error"):
+                err = chart["error"]
+                raise RuntimeError(str(err.get("description") or err.get("code") or err))
+            results = chart.get("result") or []
+            if not results:
+                raise RuntimeError("Yahoo chart API returned no result")
+            item = results[0]
+            stamps = item.get("timestamp") or []
+            quote_rows = ((item.get("indicators") or {}).get("quote") or [{}])[0]
+            if not stamps or not quote_rows:
+                raise RuntimeError("Yahoo chart response has no timestamps or OHLCV quote")
+            frame = pd.DataFrame({
+                "Open": quote_rows.get("open", []),
+                "High": quote_rows.get("high", []),
+                "Low": quote_rows.get("low", []),
+                "Close": quote_rows.get("close", []),
+                "Volume": quote_rows.get("volume", []),
+            }, index=pd.to_datetime(stamps, unit="s", utc=True))
+            frame.index.name = "Datetime"
+            frame = frame.dropna(subset=["Open", "High", "Low", "Close"])
+            if frame.empty:
+                raise RuntimeError("Yahoo chart response contained no complete OHLC candles")
+            frame["Volume"] = pd.to_numeric(frame["Volume"], errors="coerce").fillna(0)
+            for col in ("Open", "High", "Low", "Close"):
+                frame[col] = pd.to_numeric(frame[col], errors="coerce")
+            frame = frame.dropna(subset=["Open", "High", "Low", "Close"])
+            return frame.loc[~frame.index.duplicated(keep="last")].sort_index(), None
+        except Exception as exc:
+            last_error = f"{host}: {type(exc).__name__}: {exc}"
+    return pd.DataFrame(), last_error
+
+
+@st.cache_data(ttl=8, show_spinner=False)
 def fetch_data(ticker, interval, period):
-    """Yahoo OHLCV loader tolerant of yfinance MultiIndex layout changes."""
+    """Reliable Yahoo OHLCV loader: chart endpoint first, yfinance as fallback."""
+    global _YAHOO_FETCH_DIAGNOSTICS
     needed = ["Open", "High", "Low", "Close", "Volume"]
     errors = []
-    df = pd.DataFrame()
     try:
+        frame, direct_error = _yahoo_chart_api_frame(ticker, interval, period)
+        if not frame.empty:
+            _YAHOO_FETCH_DIAGNOSTICS = {
+                "status": "success", "source": "Yahoo Chart API", "rows": int(len(frame)), "error": None,
+                "last_candle": str(frame.index[-1]),
+            }
+            return frame[needed].copy()
+        if direct_error:
+            errors.append("Yahoo Chart API: " + direct_error)
+
+        # Compatibility fallback for installations where Yahoo's chart host is blocked.
         try:
-            df = yf.download(ticker, interval=interval, period=period,
-                             progress=False, auto_adjust=False, threads=False, timeout=8,
-                             multi_level_index=False)
+            raw = yf.download(
+                ticker, interval=interval, period=period, progress=False,
+                auto_adjust=False, threads=False, timeout=10,
+                multi_level_index=False,
+            )
         except TypeError:
-            df = yf.download(ticker, interval=interval, period=period,
-                             progress=False, auto_adjust=False, threads=False, timeout=8)
-        except Exception as exc:
-            errors.append(f"download: {exc}")
-
-        # yfinance versions differ: columns may be (Price, Ticker) or (Ticker, Price).
-        if isinstance(df.columns, pd.MultiIndex):
-            best_level = None
-            best_count = -1
-            for level in range(df.columns.nlevels):
-                vals = [str(v) for v in df.columns.get_level_values(level)]
-                count = sum(col in vals for col in needed)
-                if count > best_count:
-                    best_count, best_level = count, level
-            if best_level is not None:
-                df.columns = df.columns.get_level_values(best_level)
-        if not df.empty and all(c in df.columns for c in needed):
-            df = df.loc[:, ~pd.Index(df.columns).duplicated()].copy()
-            df = df[needed].copy()
-        else:
-            # Ticker.history is a useful fallback when download returns a changed schema.
             try:
-                hist = yf.Ticker(ticker).history(period=period, interval=interval,
-                                                 auto_adjust=False, prepost=False, timeout=8)
-                if not hist.empty and all(c in hist.columns for c in needed):
-                    df = hist[needed].copy()
+                raw = yf.download(
+                    ticker, interval=interval, period=period, progress=False,
+                    auto_adjust=False, threads=False, timeout=10,
+                )
             except Exception as exc:
-                errors.append(f"history: {exc}")
+                raw = pd.DataFrame()
+                errors.append(f"yfinance download compatibility fallback: {type(exc).__name__}: {exc}")
+        except Exception as exc:
+            raw = pd.DataFrame()
+            errors.append(f"yfinance download: {type(exc).__name__}: {exc}")
 
-        if df.empty or not all(c in df.columns for c in needed):
-            if errors:
-                log_app_error("fetch_data", " | ".join(errors))
+        if isinstance(raw, pd.DataFrame) and isinstance(raw.columns, pd.MultiIndex):
+            selected_level = None
+            selected_count = -1
+            for level in range(raw.columns.nlevels):
+                values = [str(value) for value in raw.columns.get_level_values(level)]
+                count = sum(name in values for name in needed)
+                if count > selected_count:
+                    selected_level, selected_count = level, count
+            if selected_level is not None:
+                raw.columns = raw.columns.get_level_values(selected_level)
+        if isinstance(raw, pd.DataFrame):
+            raw = raw.loc[:, ~pd.Index(raw.columns).duplicated()].copy()
+            if all(name in raw.columns for name in needed):
+                frame = raw[needed].copy()
+            else:
+                frame = pd.DataFrame()
+        else:
+            frame = pd.DataFrame()
+
+        if frame.empty:
+            try:
+                hist = yf.Ticker(ticker).history(
+                    period=period, interval=interval, auto_adjust=False,
+                    prepost=True, timeout=10,
+                )
+                if isinstance(hist, pd.DataFrame) and all(name in hist.columns for name in needed):
+                    frame = hist[needed].copy()
+            except Exception as exc:
+                errors.append(f"yfinance history: {type(exc).__name__}: {exc}")
+
+        if frame.empty:
+            message = " | ".join(errors) or "Yahoo returned an empty OHLCV response"
+            _YAHOO_FETCH_DIAGNOSTICS = {"status": "failed", "source": None, "rows": 0, "error": message}
+            log_app_error("fetch_data", message)
             return pd.DataFrame()
-        df.index = pd.to_datetime(df.index, errors="coerce")
-        df = df[~df.index.isna()].copy()
+
+        frame.index = pd.to_datetime(frame.index, errors="coerce")
+        frame = frame[~frame.index.isna()].copy()
         for col in needed:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-        df = df.dropna(subset=["Open", "High", "Low", "Close"])
-        df["Volume"] = df["Volume"].fillna(0)
-        df = df[~df.index.duplicated(keep="last")].sort_index()
-        return df
-    except Exception as e:
-        log_app_error("fetch_data", e)
+            frame[col] = pd.to_numeric(frame[col], errors="coerce")
+        frame = frame.dropna(subset=["Open", "High", "Low", "Close"])
+        frame["Volume"] = frame["Volume"].fillna(0)
+        frame = frame[~frame.index.duplicated(keep="last")].sort_index()
+        _YAHOO_FETCH_DIAGNOSTICS = {
+            "status": "success", "source": "yfinance fallback", "rows": int(len(frame)),
+            "error": " | ".join(errors) if errors else None,
+            "last_candle": str(frame.index[-1]) if not frame.empty else None,
+        }
+        return frame
+    except Exception as exc:
+        message = f"{type(exc).__name__}: {exc}"
+        _YAHOO_FETCH_DIAGNOSTICS = {"status": "failed", "source": None, "rows": 0, "error": message}
+        log_app_error("fetch_data", message)
         return pd.DataFrame()
+
+
+@st.cache_data(ttl=5, show_spinner=False)
+def fetch_yahoo_ltp(ticker):
+    """Return Yahoo's latest quote, or latest real intraday bar if quote metadata is absent.
+
+    A candle close is never described as exchange-real-time LTP. The result
+    includes source, timestamp and status so the UI can distinguish them.
+    """
+    try:
+        # Prefer the direct Yahoo chart endpoint; fast_info may be empty or stale
+        # for index symbols such as ^NSEI in some yfinance releases.
+        for quote_interval, quote_period in (("1m", "1d"), ("5m", "5d")):
+            quote_frame, _quote_error = _yahoo_chart_api_frame(ticker, quote_interval, quote_period)
+            if quote_frame is not None and not quote_frame.empty:
+                last_stamp = pd.Timestamp(quote_frame.index[-1])
+                last_price = float(quote_frame["Close"].iloc[-1])
+                now = pd.Timestamp.now(tz=last_stamp.tz) if last_stamp.tz is not None else pd.Timestamp.now()
+                age = max(0, int((now - last_stamp).total_seconds()))
+                return {
+                    "price": last_price,
+                    "source": f"Yahoo Chart API latest {quote_interval} candle close (not exchange LTP)",
+                    "timestamp": last_stamp.strftime("%Y-%m-%d %H:%M:%S %Z").strip(),
+                    "status": "latest_intraday_bar",
+                    "age_seconds": age,
+                }
+        instrument = yf.Ticker(ticker)
+        try:
+            info = instrument.fast_info
+        except Exception:
+            info = None
+
+        # yfinance FastInfo differs across releases; support mapping and attributes.
+        for key in ("last_price", "regular_market_price", "lastPrice"):
+            try:
+                value = info.get(key) if hasattr(info, "get") else None
+                if value is None:
+                    value = getattr(info, key, None)
+                if value is None:
+                    try:
+                        value = info[key]
+                    except Exception:
+                        value = None
+                value = float(value)
+                if np.isfinite(value) and value > 0:
+                    return {
+                        "price": value,
+                        "source": "Yahoo Finance fast_info (latest available quote)",
+                        "timestamp": now_str(),
+                        "status": "quote_received",
+                        "age_seconds": None,
+                    }
+            except Exception:
+                continue
+
+        # Some symbols/releases omit last_price. Use a genuine latest intraday
+        # bar, but label it as a candle close—not a real-time exchange LTP.
+        for interval in ("1m", "5m"):
+            try:
+                history = instrument.history(
+                    period="1d", interval=interval, auto_adjust=False,
+                    prepost=True, timeout=8
+                )
+                if history is None or history.empty or "Close" not in history.columns:
+                    continue
+                closes = pd.to_numeric(history["Close"], errors="coerce").dropna()
+                if closes.empty:
+                    continue
+                stamp = pd.Timestamp(closes.index[-1])
+                age_seconds = None
+                try:
+                    now = pd.Timestamp.now(tz=stamp.tz) if stamp.tz is not None else pd.Timestamp.now()
+                    age_seconds = max(0, int((now - stamp).total_seconds()))
+                    stamp_text = stamp.strftime("%Y-%m-%d %H:%M:%S %Z").strip()
+                except Exception:
+                    stamp_text = str(stamp)
+                price = float(closes.iloc[-1])
+                if np.isfinite(price) and price > 0:
+                    return {
+                        "price": price,
+                        "source": f"Yahoo Finance latest {interval} candle close (not exchange LTP)",
+                        "timestamp": stamp_text,
+                        "status": "latest_intraday_bar",
+                        "age_seconds": age_seconds,
+                    }
+            except Exception:
+                continue
+    except Exception as exc:
+        log_app_error("fetch_yahoo_ltp", exc)
+
+    return {
+        "price": None,
+        "source": "Yahoo quote and intraday bar unavailable",
+        "timestamp": None,
+        "status": "no_quote",
+        "age_seconds": None,
+    }
 
 
 def resample_ohlcv(df, rule):
@@ -2932,6 +3128,7 @@ def analyze_signal(
     news_info=None,
     backtest_trade_count=0,
     backtest_is_comparable=False,
+    benchmark_df=None,
 ):
     """Explainable multi-factor signal engine.
 
@@ -3190,22 +3387,43 @@ def analyze_signal(
     institutional_diagnostics = {}
     institutional_score = 0.0
     try:
-        institutional_diagnostics = inst.collect_institutional_diagnostics(df, benchmark_df=None)
+        institutional_diagnostics = inst.collect_institutional_diagnostics(df, benchmark_df=benchmark_df)
+        institutional_participation = {}
+        raw_institutional_score = 0.0
         if isinstance(institutional_diagnostics, dict) and institutional_diagnostics.get("available", True):
             for component in ("market_structure", "liquidity", "order_blocks", "fvg", "volume_profile"):
-                item = institutional_diagnostics.get(component, {})
+                item = institutional_diagnostics.get(component)
                 if isinstance(item, dict):
-                    institutional_score += float(item.get("score", 0) or 0)
-            relative_strength = institutional_diagnostics.get("relative_strength", 5)
-            if isinstance(relative_strength, (int, float)) and np.isfinite(relative_strength):
-                institutional_score += (float(relative_strength) - 5.0) * 2.0
-            institutional_score = float(max(-8.0, min(8.0, institutional_score)))
+                    component_score = _safe_num(item.get("score"), 0.0)
+                    raw_institutional_score += component_score
+                    institutional_participation[component] = {"status": "ACTIVE", "score": component_score, "reason": str(item.get("structure", item.get("type", item.get("retest", item.get("signal", "Calculated")))))}
+                else:
+                    institutional_participation[component] = {"status": "UNAVAILABLE", "score": 0.0, "reason": "Insufficient source data"}
+            relative_strength = institutional_diagnostics.get("relative_strength")
+            if benchmark_df is not None and isinstance(relative_strength, (int, float)) and np.isfinite(relative_strength):
+                rs_component = (float(relative_strength) - 5.0) * 2.0
+                raw_institutional_score += rs_component
+                institutional_participation["relative_strength"] = {"status": "ACTIVE", "score": rs_component, "reason": f"Benchmark-relative score {relative_strength:.2f}/10"}
+            else:
+                institutional_participation["relative_strength"] = {"status": "UNAVAILABLE / NEUTRAL", "score": 0.0, "reason": "Real aligned benchmark candles not supplied; no synthetic RS score"}
+            institutional_participation["sector_strength"] = {"status": "UNAVAILABLE / NEUTRAL", "score": 0.0, "reason": "No verified symbol-to-sector OHLCV mapping supplied"}
+            institutional_participation["oi_positioning"] = {"status": "UNAVAILABLE / NEUTRAL", "score": 0.0, "reason": "Independent price/OI change series not supplied; PCR is not double-counted"}
+            institutional_score = float(max(-8.0, min(8.0, raw_institutional_score)))
+            institutional_participation["aggregate"] = {"status": "APPLIED", "raw_score": raw_institutional_score, "score": institutional_score, "cap": 8.0, "cap_applied": not np.isclose(raw_institutional_score, institutional_score), "reason": "Existing institutional aggregate cap preserved at +/-8"}
             if institutional_score > 0:
                 bullish += institutional_score
-                reasons.append(f"Institutional Confirmation (+{institutional_score:.1f})")
+                reasons.append(f"Institutional Confirmation (+{institutional_score:.1f}; raw {raw_institutional_score:.1f})")
             elif institutional_score < 0:
                 bearish += abs(institutional_score)
-                reasons.append(f"Institutional Bearish Confirmation ({abs(institutional_score):.1f})")
+                reasons.append(f"Institutional Bearish Confirmation ({abs(institutional_score):.1f}; raw {raw_institutional_score:.1f})")
+        else:
+            institutional_participation = {k: {"status": "UNAVAILABLE", "score": 0.0, "reason": institutional_diagnostics.get("message", "Diagnostics unavailable")} for k in ("market_structure", "liquidity", "order_blocks", "fvg", "volume_profile", "relative_strength", "sector_strength", "oi_positioning")}
+            institutional_participation["aggregate"] = {"status": "NOT APPLIED", "raw_score": 0.0, "score": 0.0, "cap": 8.0, "cap_applied": False, "reason": "No valid OHLCV diagnostics"}
+        institutional_diagnostics["participation_audit"] = institutional_participation
+        liquidity_item = institutional_diagnostics.get("liquidity") if isinstance(institutional_diagnostics, dict) else None
+        liquidity_block_entry = bool(isinstance(liquidity_item, dict) and liquidity_item.get("block_entry", False))
+        if liquidity_block_entry:
+            reasons.append(f"Liquidity sweep entry blocker active ({liquidity_item.get('type', 'sweep')}); review before entry")
     except Exception as institutional_error:
         institutional_diagnostics = {"error": str(institutional_error), "status": "UNAVAILABLE"}
         institutional_score = 0.0
@@ -3249,6 +3467,8 @@ def analyze_signal(
             momentum_ok = sell_momentum_ok
             conflict = mtf_sell_conflict or htf_sell_conflict
             near_level = sell_near_support
+        if liquidity_block_entry:
+            out.append(f"Liquidity sweep risk blocks {side} entry ({liquidity_item.get('type', 'sweep')}); wait for a fresh confirmed setup")
         if not score_ok:
             out.append("Directional score is not sufficiently separated (need score >= 7 and edge >= 3)")
         if votes < 2:
@@ -3389,7 +3609,10 @@ def analyze_signal(
         "target2": target2, "target3": target3, "trailing_stop": trailing_stop,
         "rr_ratio": rr_ratio, "reasons": reasons, "no_trade_reason": no_trade_reason,
         "no_trade_reasons": selected_blockers, "bullish_score": round(bullish, 1),
-        "bearish_score": round(bearish, 1),"institutional_score": round(institutional_score, 1), "directional_bias": directional_bias,
+        "bearish_score": round(bearish, 1), "institutional_score": round(institutional_score, 1),
+        "institutional_diagnostics": institutional_diagnostics,
+        "institutional_participation_audit": institutional_diagnostics.get("participation_audit", {}) if isinstance(institutional_diagnostics, dict) else {},
+        "liquidity_block_entry": bool(liquidity_block_entry), "directional_bias": directional_bias,
         "directional_edge": round(directional_edge, 1), "session_message": session_info["message"],
         "supertrend_direction": supertrend_dir, "ha_bullish": ha_bullish, "ha_bearish": ha_bearish,
         "ha_trend_up": ha_trend_up, "ha_trend_down": ha_trend_down,
@@ -3470,6 +3693,8 @@ def build_trade_feature_snapshot(df, analysis, mtf_bull_count=0, mtf_bear_count=
         "HistoricalWinRateAtEntry": _safe_num(analysis.get("historical_win_rate")),
         "SimilarTradesAtEntry": int(analysis.get("similar_trades_found", 0) or 0),
         "SignalStage": str(analysis.get("signal_stage", "")),
+        "Symbol": str(analysis.get("symbol", "") or ""),
+        "Timeframe": str(analysis.get("timeframe", "") or ""),
     }
     return snap
 
@@ -3496,56 +3721,109 @@ def classify_trade_loss(snapshot, pnl, side="BUY", exit_price=None, entry_price=
     return "Unclassified Loss - Review News, Entry Timing and Execution"
 
 
-def _similarity_score(current, historical):
-    """Distance over available comparable numeric features; tolerates old/incomplete journal rows."""
+def _similarity_score(current, historical, min_features=5):
+    """Robust similarity using every captured numeric feature that is comparable.
+
+    Price/volume scale features are compared relatively; oscillator, ratio and
+    percentage-distance features use bounded absolute tolerances. Sparse rows
+    are rejected instead of being treated as convincing matches.
+    """
+    if not isinstance(current, dict) or not isinstance(historical, dict):
+        return 0.0
+    # Absolute tolerances for dimensionless indicators and percentage distances.
+    absolute_tolerances = {
+        "RSI": 12.0, "ADX": 12.0, "RelativeVolume": 0.9,
+        "RiskRewardRatio": 1.5, "TrendSlope": 0.15,
+        "SupportDistancePct": 1.0, "ResistanceDistancePct": 1.0,
+        "DistanceEMA20Pct": 0.8, "DistanceEMA50Pct": 1.2,
+        "DistanceVWAPPct": 0.8,
+    }
+    # Relative tolerances avoid raw price/volume levels dominating the score.
+    relative_tolerances = {
+        "EMA9": 0.015, "EMA21": 0.015, "EMA20": 0.015,
+        "EMA50": 0.02, "EMA200": 0.025, "VWAP": 0.015,
+        "ATR": 0.35, "MACD": 0.50, "Volume": 0.75,
+        "VolumeDelta": 1.0,
+    }
     pairs = []
-    tolerances = {"RSI": 12, "ADX": 12, "RelativeVolume": 0.9, "RiskRewardRatio": 1.5,
-                  "DistanceEMA20Pct": 0.8, "DistanceEMA50Pct": 1.2, "TrendSlope": max(abs(_safe_num(current.get("TrendSlope"), 0))*1.5, 0.05)}
-    for key in ("RSI", "ADX", "RelativeVolume", "RiskRewardRatio", "DistanceEMA20Pct", "DistanceEMA50Pct", "TrendSlope"):
+    for key in LOSS_FEATURE_COLUMNS:
         a, b = _safe_num(current.get(key)), _safe_num(historical.get(key))
-        if np.isfinite(a) and np.isfinite(b):
-            tol = tolerances.get(key, 1.0)
-            pairs.append(max(0.0, 1.0 - abs(a-b) / max(tol, 1e-6)))
-    if not pairs: return 0.0
+        if not (np.isfinite(a) and np.isfinite(b)):
+            continue
+        if key in absolute_tolerances:
+            distance = abs(a - b) / max(absolute_tolerances[key], 1e-9)
+        else:
+            scale = max(abs(a), abs(b), 1e-9)
+            distance = (abs(a - b) / scale) / relative_tolerances.get(key, 0.25)
+        pairs.append(max(0.0, 1.0 - min(distance, 1.0)))
+    if len(pairs) < min_features:
+        return 0.0
     score = float(np.mean(pairs))
-    if current.get("MarketRegime") and historical.get("MarketRegime") and str(current.get("MarketRegime")) == str(historical.get("MarketRegime")):
-        score = min(1.0, score + 0.08)
-    if current.get("MTFTrendStatus") and historical.get("MTFTrendStatus") and str(current.get("MTFTrendStatus")) == str(historical.get("MTFTrendStatus")):
-        score = min(1.0, score + 0.05)
+    # Context features add only a small tie-breaker after numeric coverage passes.
+    if current.get("MarketRegime") and historical.get("MarketRegime") and str(current.get("MarketRegime")).strip().lower() == str(historical.get("MarketRegime")).strip().lower():
+        score = min(1.0, score + 0.025)
+    if current.get("MTFTrendStatus") and historical.get("MTFTrendStatus") and str(current.get("MTFTrendStatus")).strip().lower() == str(historical.get("MTFTrendStatus")).strip().lower():
+        score = min(1.0, score + 0.025)
     return score
 
 
-def get_similar_trade_intelligence(snapshot, side, min_similarity=0.68):
+def get_similar_trade_intelligence(snapshot, side, min_similarity=0.68, min_features=5):
+    """Compare only closed trades with the same directional side and sufficient feature coverage."""
+    empty = {"matches": pd.DataFrame(), "count": 0, "win_rate": None, "loss_rate": None,
+             "avg_profit": None, "avg_loss": None, "expected_value": None,
+             "loser_match_rate": None, "reason": "No sufficiently comparable closed trades found.",
+             "min_features": min_features}
+    side = str(side or "").strip().upper()
+    if side not in ("BUY", "SELL"):
+        empty["reason"] = "Neutral / NO TRADE signal: directional similarity matching skipped."
+        return empty
+    if not isinstance(snapshot, dict) or not snapshot:
+        empty["reason"] = "Current feature snapshot is unavailable."
+        return empty
     journal = load_journal()
-    result = {"matches": pd.DataFrame(), "count": 0, "win_rate": None, "loss_rate": None,
-              "avg_profit": None, "avg_loss": None, "expected_value": None, "loser_match_rate": None}
-    if journal.empty or not {"Status", "Result"}.issubset(journal.columns): return result
+    if journal.empty or not {"Status", "Result"}.issubset(journal.columns):
+        empty["reason"] = "Journal is empty or lacks Status/Result fields."
+        return empty
     closed = journal[journal["Status"].astype(str).str.upper().eq("CLOSED")].copy()
-    if "Side" in closed.columns: closed = closed[closed["Side"].astype(str).str.upper().eq(str(side).upper())]
-    if closed.empty: return result
+    if "Side" in closed.columns:
+        closed = closed[closed["Side"].astype(str).str.upper().eq(side)]
+    # When timeframe metadata exists on both sides, do not mix unlike timeframes.
+    current_tf = str(snapshot.get("Timeframe", "") or "").strip().lower()
+    if current_tf and "Timeframe" in closed.columns:
+        hist_tf = closed["Timeframe"].astype(str).str.strip().str.lower()
+        closed = closed[hist_tf.eq(current_tf) | hist_tf.eq("") | hist_tf.eq("nan")]
+    if closed.empty:
+        empty["reason"] = f"No closed {side} journal trades available for this timeframe."
+        return empty
     scores = []
-    for _, row in closed.iterrows():
+    for idx, row in closed.iterrows():
         hist = {k: row.get(k) for k in LOSS_FEATURE_COLUMNS + ["MarketRegime", "MTFTrendStatus"]}
-        score = _similarity_score(snapshot, hist)
+        score = _similarity_score(snapshot, hist, min_features=min_features)
         if score >= min_similarity:
-            scores.append((row.name, score))
-    if not scores: return result
+            scores.append((idx, score))
+    if not scores:
+        empty["reason"] = f"No {side} trades met {min_features}-feature coverage and {min_similarity:.0%} similarity."
+        return empty
     matches = closed.loc[[x[0] for x in scores]].copy()
     matches["Similarity"] = [x[1] for x in scores]
     pnl = pd.to_numeric(matches.get("PnL", pd.Series(0, index=matches.index)), errors="coerce").fillna(0)
-    wins = pnl[pnl > 0]; losses = pnl[pnl < 0]
+    wins, losses = pnl[pnl > 0], pnl[pnl < 0]
     count = len(matches)
-    result.update({"matches": matches.sort_values("Similarity", ascending=False), "count": count,
-                   "win_rate": float((pnl > 0).mean() * 100), "loss_rate": float((pnl < 0).mean() * 100),
-                   "avg_profit": float(wins.mean()) if len(wins) else 0.0,
-                   "avg_loss": float(losses.mean()) if len(losses) else 0.0,
-                   "expected_value": float(pnl.mean()), "loser_match_rate": float((pnl < 0).mean() * 100)})
+    result = {"matches": matches.sort_values("Similarity", ascending=False), "count": count,
+              "win_rate": float((pnl > 0).mean() * 100), "loss_rate": float((pnl < 0).mean() * 100),
+              "avg_profit": float(wins.mean()) if len(wins) else 0.0,
+              "avg_loss": float(losses.mean()) if len(losses) else 0.0,
+              "expected_value": float(pnl.mean()), "loser_match_rate": float((pnl < 0).mean() * 100),
+              "reason": f"{count} closed {side} trades matched using at least {min_features} comparable features.",
+              "min_features": min_features}
     return result
 
 
 def apply_adaptive_signal_intelligence(df, analysis, symbol, timeframe, mtf_bull_count=0, mtf_bear_count=0, mtf_available_count=0):
     """Add similar-trade learning, conservative confidence adjustment and staged signal labels."""
-    side = "BUY" if analysis.get("signal_type") == "buy" else "SELL" if analysis.get("signal_type") == "sell" else "BUY"
+    side = "BUY" if analysis.get("signal_type") == "buy" else "SELL" if analysis.get("signal_type") == "sell" else None
+    analysis["symbol"] = symbol
+    analysis["timeframe"] = timeframe
     snapshot = build_trade_feature_snapshot(df, analysis, mtf_bull_count, mtf_bear_count, mtf_available_count)
     intelligence = get_similar_trade_intelligence(snapshot, side)
     analysis["similar_trades_found"] = intelligence["count"]
@@ -3643,19 +3921,14 @@ def apply_adaptive_signal_intelligence(df, analysis, symbol, timeframe, mtf_bull
             elif analysis["signal_text"] == "STRONG SELL":
                 analysis["signal_text"] = "SELL"
     
-            analysis["confidence"] = max(
-                0,
-                int(analysis["confidence"] - 15)
-            )
+            _old_confidence = _safe_num(analysis.get("confidence"), 0.0)
+            analysis["confidence"] = max(0, int(_old_confidence - 15))
     
-    if repeat_loss_warning:
-    
-        analysis["confidence"] = max(
-            0,
-            int(analysis["confidence"] - 10)
-        )
-    
-    analysis["ai_override_applied"] = True
+    # The repeat-loss penalty was already included above; do not subtract it twice.
+    # Confidence can be None after a neutral override, so never perform arithmetic on None.
+    if analysis.get("confidence") is not None:
+        analysis["confidence"] = max(0, min(100, int(analysis["confidence"])))
+    analysis["ai_override_applied"] = bool(similar_trades >= 20 and historical_loss_rate is not None and historical_loss_rate >= 65)
     return analysis
 
 
@@ -5594,19 +5867,19 @@ with refresh_col1:
     )
 with refresh_col2:
     auto_refresh = st.toggle(
-        "Enable Auto Refresh", value=False, key="auto_refresh_enabled",
+        "Enable Auto Refresh", value=True, key="auto_refresh_enabled",
         help="Turn automatic page refresh ON or OFF. Manual refresh remains available either way."
     )
 with refresh_col3:
     refresh_seconds = st.selectbox(
-        "Auto interval (seconds)", [5, 10, 15, 30, 60], index=1,
+        "Auto interval (seconds)", [5, 10, 15, 30, 60], index=2,
         key="auto_refresh_interval_seconds", disabled=not auto_refresh
     )
 
 if refresh_market_now:
     # Flush every market-data cache used by the board, scanner, chart and context panels.
     for _cached_fn in (
-        fetch_data, fetch_yahoo_batch, build_nifty_top30_scanner,
+        fetch_data, fetch_yahoo_ltp, fetch_yahoo_batch, build_nifty_top30_scanner,
         get_news_events, get_option_chain_snapshot
     ):
         try:
@@ -5916,11 +6189,10 @@ if not _angel_session_ready:
         _angel_missing_fields.append("PIN")
     if not str(angel_totp_secret).strip():
         _angel_missing_fields.append("TOTP Secret")
-_angel_credentials_ready = bool(
-    str(angel_api_key).strip()
-    and str(angel_client_code).strip()
-    and (_angel_session_ready or (str(angel_pin).strip() and str(angel_totp_secret).strip()))
-)
+# Credentials typed into widgets are NOT proof of authentication. Only a
+# successful SmartAPI session for this exact client/API key counts as logged in.
+# Until Test Angel Login succeeds, use Yahoo rather than attempting broker data.
+_angel_credentials_ready = bool(_angel_session_ready)
 
 st.info(
     f"Market data request: {data_source} | {selected} | {timeframe}. "
@@ -5936,8 +6208,12 @@ if data_source != "Angel":
 if data_source == "Upstox":
     _upstox_token = str(st.session_state.get("upstox_access_token", "")).strip()
     if not _upstox_token:
-        st.error("Upstox is selected, but no authenticated session token is present. Connect in Upstox API Settings first.")
-        data = pd.DataFrame()
+        st.warning("Upstox is not logged in. Automatically switching to Yahoo Finance for market data.")
+        with st.spinner(f"Yahoo Finance fallback: loading {ticker} ({yf_interval})…"):
+            data = fetch_data(ticker, yf_interval, yf_period)
+        yahoo_fallback_rows = int(len(data))
+        if not data.empty:
+            active_data_source = "Yahoo"
     else:
         with st.spinner(f"Upstox: resolving {selected} and loading {timeframe} candles…"):
             upstox_instrument_key = resolve_upstox_instrument_key(selected)
@@ -5968,10 +6244,14 @@ elif data_source == "Angel":
             "status": "not_requested",
             "reason": f"Required fields/session missing: {missing_text}",
         }
-        st.error(
-            f"Angel One data requests were NOT sent. Missing: {missing_text}. "
-            "Re-enter credentials and click Test Angel Login in this deployed app session."
+        st.warning(
+            f"Angel One is not logged in (missing: {missing_text}). Automatically switching to Yahoo Finance for market data."
         )
+        with st.spinner(f"Yahoo Finance fallback: loading {ticker} ({yf_interval})…"):
+            data = fetch_data(ticker, yf_interval, yf_period)
+        yahoo_fallback_rows = int(len(data))
+        if not data.empty:
+            active_data_source = "Yahoo"
     else:
         # WebSocket is the primary live-LTP source. REST polling is requested
         # only when the socket is not connected, has no tick yet, or its tick is stale.
@@ -6050,6 +6330,20 @@ else:
     with st.spinner(f"Yahoo Finance: loading {ticker} ({yf_interval})…"):
         data = fetch_data(ticker, yf_interval, yf_period)
     yahoo_primary_rows = int(len(data))
+    _yahoo_diag = dict(_YAHOO_FETCH_DIAGNOSTICS)
+    if data.empty:
+        st.error(
+            f"Yahoo OHLC fetch failed for {ticker} / {yf_interval}. "
+            f"Status: {_yahoo_diag.get('status', 'unknown')}. "
+            f"Reason: {_yahoo_diag.get('error') or 'No candles returned'}. "
+            "Check Streamlit Cloud network access and Yahoo availability; no candles are fabricated."
+        )
+    else:
+        st.caption(
+            f"Yahoo data: {_yahoo_diag.get('source', 'Yahoo')} | "
+            f"{_yahoo_diag.get('rows', len(data))} candles | "
+            f"Last candle: {_yahoo_diag.get('last_candle', str(data.index[-1]))}"
+        )
     if data.empty and _angel_credentials_ready:
         # Optional failover if Yahoo is temporarily unavailable but the user has
         # already connected Angel One in this same session.
@@ -6067,6 +6361,22 @@ else:
             st.warning("Yahoo Finance returned no OHLC rows. Using connected Angel One candle history as a clearly-labelled fallback.")
 
 if data.empty:
+    # Quote retrieval is independent of OHLC history: even if Yahoo candles fail,
+    # show a clearly-labelled latest quote/bar when Yahoo can provide one.
+    if data_source == "Yahoo":
+        _yahoo_empty_quote = fetch_yahoo_ltp(ticker)
+        if _yahoo_empty_quote.get("price") is not None:
+            st.metric(
+                f"Yahoo latest available price — {_yahoo_empty_quote.get('source', 'Yahoo')}",
+                f"{float(_yahoo_empty_quote['price']):,.2f}",
+            )
+            st.caption(
+                f"Yahoo quote/bar timestamp: {_yahoo_empty_quote.get('timestamp') or 'N/A'} | "
+                f"Status: {_yahoo_empty_quote.get('status')} | "
+                "This is not guaranteed exchange-real-time LTP."
+            )
+        else:
+            st.warning("Yahoo quote and intraday candles are both unavailable. Check the Yahoo fetch diagnostic above and the deployment network/logs.")
     if data_source == "Angel" and (polling_mode or ws_enable):
         if angel_ltp_value is not None:
             st.metric(f"Angel One Latest Traded Price — {angel_ltp_source}", f"{angel_ltp_value:,.2f}")
@@ -6270,12 +6580,25 @@ if not _trainer_allowed:
 stats = compute_trade_statistics(backtest_trades_df, initial_capital=DEFAULT_INITIAL_BALANCE)
 equity_curve_df, max_drawdown = compute_equity_curve_from_trades(backtest_trades_df, initial_capital=DEFAULT_INITIAL_BALANCE)
 
+with st.expander("🏛️ Institutional Signal Participation Audit", expanded=False):
+    _inst_audit = analysis.get("institutional_participation_audit", {})
+    if _inst_audit:
+        _audit_rows = []
+        for _feature, _details in _inst_audit.items():
+            _details = _details if isinstance(_details, dict) else {}
+            _audit_rows.append({"Feature": _feature.replace("_", " ").title(), "Status": _details.get("status", "N/A"), "Score": _details.get("score", _details.get("raw_score", 0)), "Reason": _details.get("reason", "")})
+        st.dataframe(pd.DataFrame(_audit_rows), use_container_width=True, hide_index=True)
+        st.caption("Existing aggregate cap +/-8 is retained. Raw score and cap-applied status are shown in the aggregate row. Missing benchmark, sector or independent OI inputs remain neutral.")
+    else:
+        st.info("Institutional audit unavailable for this analysis run.")
+
 with st.expander("🧠 Loss Intelligence & Similar Historical Setups", expanded=True):
     if _trainer_profile and _trainer_profile.get("approved"):
         st.info(f"AI Trainer approved paper filter active: {_trainer_profile.get('rule')} = {_trainer_profile.get('threshold')}. Signal scores are unchanged; only paper eligibility is gated.")
     if analysis.get("ai_trainer_paper_block_reason"):
         st.warning(analysis["ai_trainer_paper_block_reason"])
-    intel = get_similar_trade_intelligence(analysis.get("feature_snapshot", {}), "BUY" if analysis.get("signal_type") == "buy" else "SELL")
+    _ui_side = "BUY" if analysis.get("signal_type") == "buy" else "SELL" if analysis.get("signal_type") == "sell" else None
+    intel = get_similar_trade_intelligence(analysis.get("feature_snapshot", {}), _ui_side)
     i1, i2, i3, i4, i5 = st.columns(5)
     i1.metric("Signal Stage", analysis.get("signal_stage", "N/A"))
     i2.metric("Similar Trades", intel.get("count", 0))
@@ -6294,7 +6617,7 @@ with st.expander("🧠 Loss Intelligence & Similar Historical Setups", expanded=
         else:
             col.metric(f"{tf} Trend", "N/A")
             col.caption("Insufficient or unavailable timeframe data; alert tier not confirmed.")
-    st.caption(f"Adaptive confidence: {analysis.get('confidence', 'N/A')} / 100 | {analysis.get('adaptive_confidence_label', '')} | Similarity matching is heuristic and only uses stored, available fields.")
+    st.caption(f"Adaptive confidence: {analysis.get('confidence', 'N/A')} / 100 | {analysis.get('adaptive_confidence_label', '')} | {intel.get('reason', 'Similarity unavailable')} Matching is heuristic and requires at least five comparable stored numeric features.")
     block_repeat_losers = st.toggle("Block signals matching repeated historical losing setups", value=False, key="block_repeat_loser_setups")
     repeat_loss_block_active = bool(block_repeat_losers and analysis.get("similar_trade_block_suggested"))
     if analysis.get("repeat_loss_warning"):
@@ -6314,6 +6637,14 @@ with st.expander("🧠 Loss Intelligence & Similar Historical Setups", expanded=
         col.metric(key, f"{value:.2f}" if isinstance(value, (int, float)) and np.isfinite(value) else "N/A")
     st.caption("Loss labels are probable diagnostic categories, not proof of causation. News reversal and execution/slippage causes require reliable event and fill data.")
     _ml_journal = load_journal()
+    if not _ml_journal.empty and "Status" in _ml_journal.columns:
+        _closed_review = _ml_journal[_ml_journal["Status"].astype(str).str.upper().eq("CLOSED")].copy()
+        _closed_review["PnL"] = pd.to_numeric(_closed_review.get("PnL", 0), errors="coerce")
+        _loss_review = _closed_review[_closed_review["PnL"] < 0].copy()
+        st.caption(f"Journal integrity: {_closed_review.shape[0]} closed trades | {_loss_review.shape[0]} losses | {int(_loss_review.get('LossReason', pd.Series('', index=_loss_review.index)).astype(str).str.strip().ne('').sum())} classified losses")
+        if not _loss_review.empty:
+            _loss_cols = [c for c in ["DateTime", "Symbol", "Side", "PnL", "LossReason"] if c in _loss_review.columns]
+            st.dataframe(_loss_review[_loss_cols].tail(20), use_container_width=True, hide_index=True)
     closed_count_ml = int((_ml_journal.get("Status", pd.Series(dtype=str)).astype(str).str.upper() == "CLOSED").sum()) if not _ml_journal.empty else 0
     st.caption(f"Optional ML layer: {closed_count_ml}/30 completed trades collected. Dataset evaluation is available now; model fitting unlocks after 30 usable trades with at least 5 wins and 5 losses.")
     if st.button("Evaluate Dataset / Train ML Model", key="train_loss_intelligence_ml"):
@@ -6386,6 +6717,13 @@ else:
 
 live_price = None
 live_price_source = "OHLC candle close"
+yahoo_ltp_result = {"price": None, "source": "Yahoo quote not requested", "timestamp": None, "status": "not_requested"}
+if active_data_source == "Yahoo":
+    # A distinct quote request prevents the dashboard from labelling the last candle close as a live price.
+    yahoo_ltp_result = fetch_yahoo_ltp(ticker)
+    if yahoo_ltp_result.get("price") is not None:
+        live_price = float(yahoo_ltp_result["price"])
+        live_price_source = yahoo_ltp_result.get("source", "Yahoo Finance latest available quote")
 if data_source == "Upstox" and upstox_ltp_value is not None and upstox_ltp_value > 0:
     live_price = float(upstox_ltp_value)
     live_price_source = "Upstox Market Quote V3 (REST snapshot)"
@@ -6402,6 +6740,17 @@ elif data_source == "Angel":
         live_price = float(angel_ltp_value)
         live_price_source = angel_ltp_source or "Angel REST Polling (Fallback)"
     sync_ws_state_to_session()
+
+# Even an authenticated broker may temporarily fail to return a usable quote
+# (expired token, permissions, stale socket, rate limit). Try Yahoo as the
+# secondary price source instead of silently presenting an old candle as LTP.
+if live_price is None or not np.isfinite(float(live_price)) or float(live_price) <= 0:
+    yahoo_ltp_result = fetch_yahoo_ltp(ticker)
+    if yahoo_ltp_result.get("price") is not None:
+        live_price = float(yahoo_ltp_result["price"])
+        live_price_source = yahoo_ltp_result.get("source", "Yahoo Finance latest available price")
+    elif active_data_source == "Yahoo":
+        live_price_source = "Yahoo quote unavailable — showing last OHLC close separately"
 
 current_display_price = live_price if live_price is not None and live_price > 0 else analysis["close_price"]
 
@@ -6489,6 +6838,28 @@ with st.expander("Candlestick Pattern Library — latest detected patterns"):
     st.write(", ".join(active_patterns) if active_patterns else "No recognized pattern on the latest completed candle.")
 
 st.subheader("Live Signal Analytics")
+price_col1, price_col2, price_col3 = st.columns(3)
+with price_col1:
+    st.metric("Latest Available Price", f"{live_price:,.2f}" if live_price is not None else "Unavailable")
+with price_col2:
+    st.metric("Price Source", live_price_source)
+with price_col3:
+    st.metric("Quote Status", yahoo_ltp_result.get("status", "broker_quote" if live_price is not None else "unavailable"))
+if yahoo_ltp_result.get("timestamp"):
+    st.caption(f"Yahoo price timestamp: {yahoo_ltp_result['timestamp']} | Status: {yahoo_ltp_result.get('status')}")
+
+if active_data_source == "Yahoo":
+    q1, q2 = st.columns(2)
+    with q1:
+        st.metric("Yahoo Latest Available Price", f"{live_price:,.2f}" if live_price is not None else "Unavailable")
+    with q2:
+        st.metric("Yahoo Quote Status", yahoo_ltp_result.get("status", "not_requested"))
+    st.caption(
+        f"Status: {yahoo_ltp_result.get('status', 'unknown')} | "
+        f"Price timestamp: {yahoo_ltp_result.get('timestamp') or 'Unavailable'}. "
+        "Yahoo may be delayed. If FastInfo has no quote, the app may show the latest real 1m/5m candle close, explicitly labelled as a candle close—not exchange-real-time LTP. "
+        "If both are unavailable, the OHLC close remains a separate fallback."
+    )
 
 if data_source == "Angel":
     p1, p2, p3, p4 = st.columns(4)
@@ -6577,6 +6948,7 @@ else:
 top1, top2, top3, top4 = st.columns(4)
 with top1:
     st.metric("Current Price", round(current_display_price, 2))
+    st.caption(f"Displayed price source: {live_price_source}. If no provider quote is available, this value is the latest OHLC candle close—not a live tick.")
 with top2:
 
     st.metric("Signal", analysis["signal_text"])
