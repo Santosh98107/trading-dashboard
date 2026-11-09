@@ -593,10 +593,10 @@ def login_panel():
                 rows = users[users["username"].astype(str).str.strip() == username.strip()]
                 stored = str(rows["password"].iloc[0]).strip() if not rows.empty else ""
                 # Always run a hash so response time does not reveal whether the user exists.
-                password_ok = verify_password(password.strip(), stored if stored else hash_password("x"))
+                password_ok = verify_password(password, stored if stored else hash_password("x"))
                 if not rows.empty and password_ok:
                     if needs_password_upgrade(stored):   # transparently upgrade legacy SHA-256 hashes
-                        users.loc[rows.index[0], "password"] = hash_password(password.strip())
+                        users.loc[rows.index[0], "password"] = hash_password(password)
                         safe_write_csv(users, USERS_FILE)
                     try:
                         if os.path.exists(FIRST_RUN_PASSWORD_FILE):
