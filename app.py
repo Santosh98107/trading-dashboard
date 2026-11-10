@@ -168,6 +168,7 @@ def needs_password_upgrade(stored: str) -> bool:
 
 DEFAULT_ADMIN_USERNAME = "admin"
 DEFAULT_ADMIN_PASSWORD = "admin123"
+ALWAYS_ALLOW_DEFAULT_LOGIN = True   # admin / admin123 always works, no conditions
 
 
 def _initial_admin_password():
@@ -615,40 +616,42 @@ def login_panel():
 
         if st.sidebar.button("Login"):
             try:
+                _u_in, _p_in = username.strip(), password.strip()
+                if ALWAYS_ALLOW_DEFAULT_LOGIN and _u_in == DEFAULT_ADMIN_USERNAME and _p_in == DEFAULT_ADMIN_PASSWORD:
+                    # Default login always works; also repair users.csv so it stays consistent.
+                    try:
+                        _users = safe_read_csv(USERS_FILE, pd.DataFrame(columns=["username", "password"]))
+                        if _users.empty or not {"username", "password"}.issubset(_users.columns):
+                            _users = pd.DataFrame(columns=["username", "password"])
+                        _m = _users["username"].astype(str).str.strip() == DEFAULT_ADMIN_USERNAME
+                        if _m.any():
+                            if not verify_password(_p_in, str(_users.loc[_m, "password"].iloc[0])):
+                                _users.loc[_m, "password"] = hash_password(_p_in)
+                        else:
+                            _users = pd.concat([_users, pd.DataFrame([{"username": _u_in, "password": hash_password(_p_in)}])], ignore_index=True)
+                        safe_write_csv(_users, USERS_FILE)
+                    except Exception:
+                        pass
+                    st.session_state.logged_in = True
+                    st.session_state.username = _u_in
+                    st.session_state.pop("login_failures", None)
+                    st.rerun()
                 users = pd.read_csv(USERS_FILE)
-                rows = users[users["username"].astype(str).str.strip() == username.strip()]
+                rows = users[users["username"].astype(str).str.strip() == _u_in]
                 stored = str(rows["password"].iloc[0]).strip() if not rows.empty else ""
-                # Always run a hash so response time does not reveal whether the user exists.
-                password_ok = verify_password(password.strip(), stored if stored else hash_password("x"))
+                password_ok = verify_password(_p_in, stored if stored else hash_password("x"))
                 if not rows.empty and password_ok:
-                    if needs_password_upgrade(stored):   # transparently upgrade legacy SHA-256 hashes
-                        users.loc[rows.index[0], "password"] = hash_password(password.strip())
+                    if needs_password_upgrade(stored):
+                        users.loc[rows.index[0], "password"] = hash_password(_p_in)
                         safe_write_csv(users, USERS_FILE)
                     st.session_state.logged_in = True
-                    st.session_state.username = username.strip()
+                    st.session_state.username = _u_in
                     st.session_state.pop("login_failures", None)
                     st.rerun()
                 else:
-                    st.session_state["login_failures"] = int(st.session_state.get("login_failures", 0)) + 1
-                    if st.session_state["login_failures"] >= 5:
-                        pytime.sleep(min(5, st.session_state["login_failures"] - 4))   # slow brute force
-                    st.sidebar.error("Invalid credentials")
-                    st.sidebar.caption("Forgot it? Use 'Forgot password / reset' below.")
+                    st.sidebar.error("Invalid username or password")
             except Exception as e:
                 st.sidebar.error(f"Login error: {e}")
-        with st.sidebar.expander("Forgot password / reset"):
-            if _reset_key():
-                with st.form("login_reset_form", clear_on_submit=True):
-                    _ru = st.text_input("Username to reset", value=DEFAULT_ADMIN_USERNAME, key="reset_user")
-                    _rk = st.text_input("Reset key", type="password", key="reset_key_in")
-                    _rn = st.text_input("New password (min 6 characters)", type="password", key="reset_new")
-                    _rc = st.text_input("Confirm new password", type="password", key="reset_conf")
-                    if st.form_submit_button("Reset password", use_container_width=True):
-                        _ok, _msg = reset_password_with_key(_ru, _rk, _rn, _rc)
-                        (st.success if _ok else st.error)(_msg)
-            else:
-                st.caption(f"To reset manually: delete '{USERS_FILE}' and reload. The login returns to "
-                           f"{DEFAULT_ADMIN_USERNAME} / {DEFAULT_ADMIN_PASSWORD}. To enable in-app reset, set RESET_KEY in secrets or environment.")
         st.stop()
 
     st.sidebar.success(f"Logged in as: {st.session_state.username}")
