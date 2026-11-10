@@ -7094,8 +7094,7 @@ if not _angel_session_ready:
 # successful SmartAPI session for this exact client/API key counts as logged in.
 # Until Test Angel Login succeeds, use Yahoo rather than attempting broker data.
 _angel_credentials_ready = bool(_angel_session_ready)
-st.error(f"_angel_session_ready = {_angel_session_ready}")
-st.error(f"angel_credentials_ready = {angel_credentials_ready}")
+
 st.info(
     f"Market data request: {data_source} | {selected} | {timeframe}. "
     "Angel live LTP priority: WebSocket primary with REST polling fallback. Upstox uses V3 LTP and Historical Candle REST APIs. "
