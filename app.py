@@ -1574,7 +1574,7 @@ def get_angel_ltp_polling(api_key, client_code, pin, totp_secret, symbol_name):
         elif angel_is_rate_limited(response):
             pytime.sleep(1.2)
             response = ltp_method(exchange, trading_symbol, str(token))
-            st.error(f"LTP API Response = {response}")
+           
             st.error(f"Exchange={exchange} | Symbol={trading_symbol} | Token={token}")
         if not isinstance(response, dict):
             diagnostic.update(status="invalid_response", response_type=type(response).__name__, message=str(response)[:300])
