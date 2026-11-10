@@ -114,7 +114,7 @@ IDEAL_RR = 3.0
 STRICT_TRADE_ONLY_STRONG = False
 # Configurable group weights applied to the signal engine (1.0 = unchanged).
 SIGNAL_WEIGHTS = {"trend": 1.0, "momentum": 1.0, "price_action": 1.0,
-                  "mtf": 1.0, "options": 1.0, "institutional": 1.0}
+                  "mtf": 1.0, "options": 1.0, "institutional": 1.0, "macro": 1.0}
 DISABLE_BUY_BIAS_TRADING = False
 DISABLE_SELL_BIAS_TRADING = False
 MANDATORY_ADX = 20
@@ -165,6 +165,59 @@ def ist_now():
 
 def now_str():
     return ist_now().strftime("%d-%m-%Y %H:%M:%S")
+
+
+IST_TZ_NAME = "Asia/Kolkata"
+
+
+def to_ist_naive_index(frame):
+    """Return a copy of an OHLCV frame whose DatetimeIndex is naive Indian Standard Time.
+
+    Yahoo returns UTC (or exchange-local) timestamps; broker feeds (Angel/Upstox) are already
+    naive IST. Normalising everything to naive IST keeps charts, VWAP day-grouping, session
+    filters and 'last candle' labels consistent and correct for Indian users.
+    """
+    if frame is None or not isinstance(frame, pd.DataFrame) or frame.empty:
+        return frame
+    out = frame.copy()
+    idx = pd.to_datetime(out.index, errors="coerce")
+    try:
+        if getattr(idx, "tz", None) is not None:
+            idx = idx.tz_convert(IST_TZ_NAME).tz_localize(None)
+    except Exception:
+        pass
+    out.index = idx
+    out.index.name = frame.index.name
+    return out[~out.index.isna()]
+
+
+def ts_to_ist_text(ts, with_seconds=True):
+    """Format a timestamp as Indian time. tz-aware values are converted; naive values are assumed IST."""
+    try:
+        stamp = pd.Timestamp(ts)
+        if stamp.tzinfo is not None:
+            stamp = stamp.tz_convert(IST_TZ_NAME).tz_localize(None)
+        return stamp.strftime("%Y-%m-%d %H:%M:%S" if with_seconds else "%Y-%m-%d %H:%M") + " IST"
+    except Exception:
+        return str(ts)
+
+
+def market_session_status(now=None):
+    """NSE cash-market session in IST: pre-open 09:00-09:15, regular 09:15-15:30 (Mon-Fri).
+    Exchange holidays are not detected."""
+    now = now or ist_now()
+    t = now.time()
+    if now.weekday() >= 5:
+        return {"code": "closed", "label": "Market closed (weekend)"}
+    if t < time(9, 0):
+        return {"code": "closed", "label": "Market closed (before pre-open 09:00 IST)"}
+    if t < time(9, 8):
+        return {"code": "pre_open", "label": "NSE pre-open: order collection (09:00-09:08 IST)"}
+    if t < time(9, 15):
+        return {"code": "pre_open", "label": "NSE pre-open: matching / buffer (09:08-09:15 IST)"}
+    if t <= time(15, 30):
+        return {"code": "open", "label": "Market open (09:15-15:30 IST)"}
+    return {"code": "closed", "label": "Market closed (after 15:30 IST)"}
 
 
 _PBKDF2_ITERATIONS = 240_000
@@ -784,7 +837,8 @@ def _yahoo_chart_api_frame(ticker, interval, period):
             for col in ("Open", "High", "Low", "Close"):
                 frame[col] = pd.to_numeric(frame[col], errors="coerce")
             frame = frame.dropna(subset=["Open", "High", "Low", "Close"])
-            return frame.loc[~frame.index.duplicated(keep="last")].sort_index(), None
+            frame = frame.loc[~frame.index.duplicated(keep="last")].sort_index()
+            return to_ist_naive_index(frame), None
         except Exception as exc:
             last_error = f"{host}: {type(exc).__name__}: {exc}"
     return pd.DataFrame(), last_error
@@ -870,6 +924,7 @@ def _fetch_data_raw(ticker, interval, period):
         frame = frame.dropna(subset=["Open", "High", "Low", "Close"])
         frame["Volume"] = frame["Volume"].fillna(0)
         frame = frame[~frame.index.duplicated(keep="last")].sort_index()
+        frame = to_ist_naive_index(frame)
         _YAHOO_FETCH_DIAGNOSTICS = {
             "status": "success", "source": "yfinance fallback", "rows": int(len(frame)),
             "error": " | ".join(errors) if errors else None,
@@ -937,12 +992,12 @@ def fetch_yahoo_ltp(ticker):
             if quote_frame is not None and not quote_frame.empty:
                 last_stamp = pd.Timestamp(quote_frame.index[-1])
                 last_price = float(quote_frame["Close"].iloc[-1])
-                now = pd.Timestamp.now(tz=last_stamp.tz) if last_stamp.tz is not None else pd.Timestamp.now()
+                now = pd.Timestamp.now(tz=last_stamp.tz) if last_stamp.tz is not None else pd.Timestamp(ist_now())
                 age = max(0, int((now - last_stamp).total_seconds()))
                 return {
                     "price": last_price,
                     "source": f"Yahoo Chart API latest {quote_interval} candle close (not exchange LTP)",
-                    "timestamp": last_stamp.strftime("%Y-%m-%d %H:%M:%S %Z").strip(),
+                    "timestamp": ts_to_ist_text(last_stamp),
                     "status": "latest_intraday_bar",
                     "age_seconds": age,
                 }
@@ -993,7 +1048,7 @@ def fetch_yahoo_ltp(ticker):
                 try:
                     now = pd.Timestamp.now(tz=stamp.tz) if stamp.tz is not None else pd.Timestamp.now()
                     age_seconds = max(0, int((now - stamp).total_seconds()))
-                    stamp_text = stamp.strftime("%Y-%m-%d %H:%M:%S %Z").strip()
+                    stamp_text = ts_to_ist_text(stamp)
                 except Exception:
                     stamp_text = str(stamp)
                 price = float(closes.iloc[-1])
@@ -2291,7 +2346,7 @@ def _market_quote_from_frames(name, ticker_used, intraday_frame, daily_frame, fa
             change_pct = ((price - previous_close) / previous_close) * 100.0
 
         try:
-            as_of = quote_timestamp.strftime("%Y-%m-%d %H:%M %Z").strip()
+            as_of = ts_to_ist_text(quote_timestamp, with_seconds=False)
         except Exception:
             as_of = str(quote_timestamp)
         return {
@@ -2347,6 +2402,356 @@ def build_live_market_board_rows():
             )
         (global_rows if item in GLOBAL_MACRO_ASSETS else indian_rows).append(chosen_row)
     return global_rows, indian_rows
+
+
+# =========================================================
+# MACRO / GEO-POLITICAL BIAS + PRE-OPEN OUTLOOK
+# =========================================================
+# USD/INR, crude oil, dollar index, US yields, India VIX, overnight US/Asia cues and
+# geo-political headlines all move Indian indices. This block turns them into a transparent,
+# capped score that (a) is added to the live signal as its own audited group ("macro") and
+# (b) produces a model-based pre-open gap estimate. It is NOT replayed in backtests (no
+# historical macro/news archive), so backtest results keep strict parity with the base engine.
+MACRO_TICKERS = (
+    ("USDINR", "USD/INR", "INR=X"),
+    ("BRENT", "Brent Crude", "BZ=F"),
+    ("WTI", "WTI Crude", "CL=F"),
+    ("DXY", "Dollar Index", "DX-Y.NYB"),
+    ("US10Y", "US 10Y Yield", "^TNX"),
+    ("INDIAVIX", "India VIX", "^INDIAVIX"),
+    ("ES", "S&P 500 Futures", "ES=F"),
+    ("NQ", "Nasdaq Futures", "NQ=F"),
+    ("SPX", "S&P 500", "^GSPC"),
+    ("NIKKEI", "Nikkei 225", "^N225"),
+    ("HSI", "Hang Seng", "^HSI"),
+    ("GOLD", "Gold", "GC=F"),
+    ("NIFTY", "NIFTY 50", "^NSEI"),
+    ("BANKNIFTY", "BANK NIFTY", "^NSEBANK"),
+    ("SENSEX", "SENSEX", "^BSESN"),
+)
+MACRO_SIGNAL_POINT_CAP = 2.0      # max bullish/bearish points the macro group may add to the live score
+MACRO_HARD_BLOCK_RAW = 6.0        # raw macro score beyond which an opposite-direction entry can be blocked
+# (key, label, sign, moderate %, strong %, points moderate, points strong, why it matters)
+MACRO_RULES = (
+    ("USDINR", "USD/INR (rupee)", -1, 0.15, 0.40, 1.0, 2.0,
+     "Rupee weakness (USD/INR rising) signals FII outflow pressure; a firmer rupee is supportive."),
+    ("BRENT", "Brent crude", -1, 1.5, 3.0, 1.0, 2.0,
+     "India imports most of its oil: higher crude hurts inflation, the current-account deficit and margins."),
+    ("DXY", "Dollar index", -1, 0.30, 0.70, 0.5, 1.0,
+     "A stronger dollar drains emerging-market equity flows."),
+    ("US10Y", "US 10Y yield", -1, 1.5, 3.5, 0.5, 1.0,
+     "Rising US yields pull money out of emerging-market equities."),
+    ("INDIAVIX", "India VIX (fear gauge)", -1, 4.0, 9.0, 1.0, 1.5,
+     "A rising VIX means rising hedging demand and weaker upside follow-through."),
+    ("US", "US overnight (S&P futures)", 1, 0.40, 1.00, 1.0, 2.0,
+     "US equities lead global risk appetite and gap Indian markets at the open."),
+    ("ASIA", "Asia (Nikkei + Hang Seng)", 1, 0.50, 1.20, 0.5, 1.0,
+     "Asian markets trade before India opens and set the regional tone."),
+)
+# Pre-open gap model: expected NIFTY gap % per 1% move in each driver (heuristic betas, not a guarantee)
+PREOPEN_BETAS = {"ES": 0.25, "NQ": 0.10, "ASIA": 0.15, "USDINR": -0.40, "BRENT": -0.06, "DXY": -0.10, "INDIAVIX": -0.02}
+PREOPEN_INDEX_BETA = {"NIFTY": 1.0, "BANKNIFTY": 1.15, "SENSEX": 0.95}
+
+_GEO_NEG_TERMS = (
+    "war", "attack", "missile", "airstrike", "air strike", "invasion", "escalat", "sanction", "tariff", "blockade",
+    "tension", "crash", "plunge", "selloff", "sell-off", "tumble", "recession", "default", "rate hike", "hawkish",
+    "outflow", "downgrade", "crisis", "panic", "shutdown", "retaliat", "strike on", "conflict", "terror", "ban on",
+    "hormuz", "supply disruption", "inflation surge", "bank run", "slump",
+)
+_GEO_POS_TERMS = (
+    "ceasefire", "cease-fire", "truce", "peace talks", "peace deal", "de-escalat", "rate cut", "dovish", "stimulus",
+    "rally", "record high", "inflow", "upgrade", "easing", "trade deal", "optimism", "rebound", "recovers",
+    "eases", "relief", "soft landing", "boost",
+)
+
+
+def _headline_score(title):
+    """Keyword score for one headline from an Indian-equity viewpoint (-2..+2)."""
+    import re as _re
+    text = str(title or "").lower()
+    score = 0.0
+    for term in _GEO_NEG_TERMS:
+        if term in text:
+            score -= 1.0
+    for term in _GEO_POS_TERMS:
+        if term in text:
+            score += 1.0
+    # Oil direction matters more than the generic words: higher crude is negative for India.
+    if _re.search(r"(oil|crude|brent).{0,30}(rise|rises|jump|jumps|surge|surges|spike|spikes|soar|soars|climb|climbs|gain|gains|hit)", text):
+        score -= 1.0
+    if _re.search(r"(oil|crude|brent).{0,30}(fall|falls|drop|drops|slip|slips|slide|slides|tumble|tumbles|decline|declines|ease|eases|retreat|retreats)", text):
+        score += 1.0
+    return float(np.clip(score, -2.0, 2.0))
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_geo_news():
+    """Keyless geo-political / macro headline scan (Google News RSS, last 24h). Titles only."""
+    import xml.etree.ElementTree as _ET
+    from email.utils import parsedate_to_datetime as _pdt
+    queries = (
+        ("Geo-political", "war OR ceasefire OR sanctions OR Iran OR Israel OR Russia OR Ukraine OR Taiwan markets"),
+        ("Crude / energy", "crude oil prices OPEC Brent"),
+        ("Rates / central banks", "RBI OR Fed OR ECB interest rate decision"),
+        ("India markets", "Nifty Sensex FII DII flows"),
+    )
+    headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/rss+xml,application/xml,text/xml,*/*"}
+    seen, rows, errors = set(), [], []
+    for topic, query in queries:
+        try:
+            url = "https://news.google.com/rss/search?q=" + quote(query + " when:1d") + "&hl=en-IN&gl=IN&ceid=IN:en"
+            resp = requests.get(url, headers=headers, timeout=(4, 8))
+            resp.raise_for_status()
+            root = _ET.fromstring(resp.content)
+            for item in root.iter("item"):
+                title = (item.findtext("title") or "").strip()
+                if not title or title.lower() in seen:
+                    continue
+                seen.add(title.lower())
+                published = ""
+                try:
+                    published = ts_to_ist_text(_pdt(item.findtext("pubDate")), with_seconds=False)
+                except Exception:
+                    pass
+                rows.append({"Topic": topic, "Headline": title, "Published": published,
+                             "Source": (item.findtext("source") or "").strip(), "Score": _headline_score(title)})
+                if sum(1 for r in rows if r["Topic"] == topic) >= 8:
+                    break
+        except Exception as exc:
+            errors.append(f"{topic}: {type(exc).__name__}")
+    if not rows:
+        return {"available": False, "score": 0.0, "count": 0, "headlines": [], "error": "; ".join(errors) or "no headlines"}
+    total = sum(r["Score"] for r in rows)
+    score = float(np.clip(total / max(6.0, len(rows)) * 3.0, -3.0, 3.0))
+    return {"available": True, "score": round(score, 2), "count": len(rows), "headlines": rows, "error": "; ".join(errors) or None}
+
+
+@st.cache_data(ttl=20, show_spinner=False)
+def fetch_nse_preopen_nifty():
+    """Official NSE pre-open indicative NIFTY value when NSE serves it (best effort, often blocked on cloud IPs)."""
+    try:
+        headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json,text/plain,*/*",
+                   "Referer": "https://www.nseindia.com/market-data/pre-open-market-cm-and-emerge-market",
+                   "Accept-Language": "en-US,en;q=0.9"}
+        session = requests.Session()
+        session.get("https://www.nseindia.com", headers=headers, timeout=4)
+        resp = session.get("https://www.nseindia.com/api/market-data-pre-open?key=NIFTY", headers=headers, timeout=4)
+        if resp.status_code != 200:
+            return None
+        status = (resp.json() or {}).get("niftyPreopenStatus") or {}
+        price = float(status.get("lastPrice"))
+        if not np.isfinite(price) or price <= 0:
+            return None
+        pct = status.get("pChange")
+        return {"price": price, "change_pct": float(pct) if pct is not None else None,
+                "source": "NSE official pre-open indicative value"}
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_macro_snapshot():
+    """Latest quote + % change vs previous close for every macro driver (Yahoo, batched)."""
+    tickers = tuple(t for _, _, t in MACRO_TICKERS)
+    intraday = fetch_yahoo_batch(tickers, "5m", "5d")
+    daily = fetch_yahoo_batch(tickers, "1d", "10d")
+    out = {}
+    for key, label, tk in MACRO_TICKERS:
+        out[key] = _market_quote_from_frames(label, tk, intraday.get(tk, pd.DataFrame()), daily.get(tk, pd.DataFrame()))
+    return out
+
+
+def _macro_change(snapshot, key):
+    row = (snapshot or {}).get(key) or {}
+    try:
+        value = float(row.get("ChangePct"))
+        return value if np.isfinite(value) else None
+    except Exception:
+        return None
+
+
+def _macro_price(snapshot, key):
+    row = (snapshot or {}).get(key) or {}
+    try:
+        value = float(row.get("Price"))
+        return value if np.isfinite(value) else None
+    except Exception:
+        return None
+
+
+def _macro_driver_change(snapshot, key):
+    """Resolve a composite driver (US / ASIA) to one % change."""
+    if key == "US":
+        value = _macro_change(snapshot, "ES")
+        return value if value is not None else _macro_change(snapshot, "SPX")
+    if key == "ASIA":
+        vals = [v for v in (_macro_change(snapshot, "NIKKEI"), _macro_change(snapshot, "HSI")) if v is not None]
+        return float(np.mean(vals)) if vals else None
+    return _macro_change(snapshot, key)
+
+
+def score_macro_bias(snapshot, geo=None, news_info=None):
+    """Combine macro drivers into a bullish/bearish bias for Indian equities.
+
+    Returns raw_score (about -12..+12), signal_points (capped +/-MACRO_SIGNAL_POINT_CAP, what the
+    live signal engine receives), a label, per-factor audit rows and a pre-open estimate.
+    """
+    components, raw, used = [], 0.0, 0
+    for key, label, sign, mod, strong, pts_mod, pts_strong, why in MACRO_RULES:
+        change = _macro_driver_change(snapshot, key)
+        if change is None:
+            components.append({"Factor": label, "Move %": "N/A", "Reading": "No data", "Points": 0.0, "Why it matters": why})
+            continue
+        used += 1
+        move = abs(change)
+        pts = pts_strong if move >= strong else pts_mod if move >= mod else 0.0
+        points = float(np.sign(change) * sign * pts)
+        reading = "Neutral"
+        if points > 0:
+            reading = "Bullish for India"
+        elif points < 0:
+            reading = "Bearish for India"
+        note = why
+        if key == "INDIAVIX":
+            vix_level = _macro_price(snapshot, "INDIAVIX")
+            if vix_level is not None:
+                if vix_level >= 22:
+                    points -= 1.0
+                    reading = "Bearish for India"
+                    note = f"VIX level {vix_level:.1f} is elevated (>=22): fear regime. " + why
+                elif vix_level >= 18:
+                    points -= 0.5
+                    note = f"VIX level {vix_level:.1f} is above 18: caution. " + why
+        raw += points
+        components.append({"Factor": label, "Move %": f"{change:+.2f}", "Reading": reading, "Points": round(points, 2), "Why it matters": note})
+
+    if isinstance(geo, dict) and geo.get("available"):
+        used += 1
+        geo_points = float(np.clip(geo.get("score", 0.0) * 0.67, -2.0, 2.0))
+        raw += geo_points
+        components.append({"Factor": "Geo-political / macro headlines", "Move %": f"score {geo['score']:+.1f}/3",
+                           "Reading": "Bullish for India" if geo_points > 0.3 else "Bearish for India" if geo_points < -0.3 else "Neutral",
+                           "Points": round(geo_points, 2),
+                           "Why it matters": f"Keyword scan of {geo.get('count', 0)} recent headlines (titles only; war, sanctions, ceasefire, oil, rates)."})
+    if isinstance(news_info, dict) and news_info.get("status") == "ok" and int(news_info.get("article_count") or 0) >= 3 \
+            and news_info.get("average_sentiment") is not None:
+        avg = float(news_info["average_sentiment"])
+        news_points = 0.5 if avg >= 0.25 else -0.5 if avg <= -0.25 else 0.0
+        raw += news_points
+        components.append({"Factor": "Symbol news sentiment (your provider)", "Move %": f"avg {avg:+.2f}",
+                           "Reading": "Bullish for India" if news_points > 0 else "Bearish for India" if news_points < 0 else "Neutral",
+                           "Points": news_points, "Why it matters": "Average sentiment of the articles your news provider returned."})
+
+    raw = float(np.clip(raw, -12.0, 12.0))
+    signal_points = round(float(np.clip(raw / 3.0, -MACRO_SIGNAL_POINT_CAP, MACRO_SIGNAL_POINT_CAP)), 2)
+    if raw >= MACRO_HARD_BLOCK_RAW:
+        label = "Strongly Bullish"
+    elif raw >= 3.0:
+        label = "Bullish"
+    elif raw <= -MACRO_HARD_BLOCK_RAW:
+        label = "Strongly Bearish"
+    elif raw <= -3.0:
+        label = "Bearish"
+    else:
+        label = "Neutral / Mixed"
+
+    # ---- pre-open model ----
+    gap_inputs = {}
+    for key, beta in PREOPEN_BETAS.items():
+        change = _macro_driver_change(snapshot, "ASIA" if key == "ASIA" else key)
+        if change is not None:
+            gap_inputs[key] = (change, beta)
+    pre_open = {"available": False}
+    if len(gap_inputs) >= 3:
+        gap_pct = float(np.clip(sum(change * beta for change, beta in gap_inputs.values()), -2.0, 2.0))
+        session = market_session_status()
+        rows = []
+        for key, name in (("NIFTY", "NIFTY 50"), ("BANKNIFTY", "BANK NIFTY"), ("SENSEX", "SENSEX")):
+            row = (snapshot or {}).get(key) or {}
+            price, pct = row.get("Price"), row.get("ChangePct")
+            if price is None or not np.isfinite(price):
+                continue
+            if session["code"] == "open" and pct is not None and np.isfinite(pct) and (1 + pct / 100.0) != 0:
+                ref_close = float(price) / (1 + float(pct) / 100.0)   # previous session close
+                basis = "previous close"
+            else:
+                ref_close = float(price)                              # last completed close
+                basis = "last close"
+            idx_gap = gap_pct * PREOPEN_INDEX_BETA[key]
+            rows.append({"Index": name, "Reference close": round(ref_close, 2), "Basis": basis,
+                         "Expected gap %": round(idx_gap, 2), "Indicative open": round(ref_close * (1 + idx_gap / 100.0), 2)})
+        pre_open = {"available": bool(rows), "gap_pct": round(gap_pct, 2), "rows": rows, "inputs": len(gap_inputs),
+                    "direction": "Gap-up" if gap_pct >= 0.15 else "Gap-down" if gap_pct <= -0.15 else "Flat open"}
+
+    return {
+        "available": used >= 3, "raw_score": round(raw, 2), "signal_points": signal_points if used >= 3 else 0.0,
+        "label": label, "components": components, "pre_open": pre_open, "factors_used": used,
+        "block_buy": bool(raw <= -MACRO_HARD_BLOCK_RAW), "block_sell": bool(raw >= MACRO_HARD_BLOCK_RAW),
+        "as_of": now_str() + " IST",
+        "summary": f"{label} (score {raw:+.1f}, signal {signal_points:+.1f} pts from {used} factors)",
+    }
+
+
+def build_macro_context(news_info=None, use_geo_news=True):
+    """Fetch (cached) macro + geo news and return the scored macro context; never raises."""
+    try:
+        snapshot = fetch_macro_snapshot()
+        geo = fetch_geo_news() if use_geo_news else None
+        ctx = score_macro_bias(snapshot, geo, news_info)
+        ctx["snapshot"], ctx["geo"] = snapshot, geo
+        return ctx
+    except Exception as exc:
+        log_app_error("macro_context", exc)
+        return {"available": False, "raw_score": 0.0, "signal_points": 0.0, "label": "Unavailable", "components": [],
+                "pre_open": {"available": False}, "factors_used": 0, "block_buy": False, "block_sell": False,
+                "summary": f"Macro data unavailable ({type(exc).__name__})", "snapshot": {}, "geo": None}
+
+
+def render_macro_outlook(macro, show_headlines=True):
+    """UI: macro bias, pre-open estimate, per-factor audit and geo-political headlines (all IST)."""
+    st.divider()
+    st.header("Macro, Pre-Open & Geo-political Outlook")
+    session = market_session_status()
+    st.caption(f"Indian time now: {now_str()} IST | {session['label']}")
+    if not isinstance(macro, dict) or not macro.get("available"):
+        st.info("Macro data is not available right now (Yahoo/news request failed). The live signal is using its base score only.")
+        return
+    pre = macro.get("pre_open") or {}
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Macro bias", macro["label"], delta=f"{macro['raw_score']:+.1f} raw")
+    c2.metric("Points added to live signal", f"{macro['signal_points']:+.1f}", help=f"Capped at +/-{MACRO_SIGNAL_POINT_CAP}")
+    if pre.get("available"):
+        c3.metric("Expected NIFTY gap", f"{pre['gap_pct']:+.2f}%", delta=pre["direction"])
+        first = (pre.get("rows") or [{}])[0]
+        c4.metric("Indicative NIFTY open (model)", f"{first.get('Indicative open', 'N/A'):,}" if first.get("Indicative open") else "N/A")
+    else:
+        c3.metric("Expected NIFTY gap", "N/A")
+        c4.metric("Indicative NIFTY open (model)", "N/A")
+    if macro.get("block_buy"):
+        st.warning("Macro headwind is extreme: new BUY entries are blocked while 'Hard-block against extreme macro' is ON.")
+    if macro.get("block_sell"):
+        st.warning("Macro tailwind is extreme: new SELL entries are blocked while 'Hard-block against extreme macro' is ON.")
+    official = fetch_nse_preopen_nifty() if session["code"] == "pre_open" or (session["code"] == "open" and ist_now().time() < time(9, 30)) else None
+    if official:
+        st.success(f"{official['source']}: NIFTY {official['price']:,.2f}"
+                   + (f" ({official['change_pct']:+.2f}%)" if official.get("change_pct") is not None else ""))
+    if pre.get("available"):
+        st.markdown("**Pre-open estimate (model, not an exchange price)**")
+        st.dataframe(pd.DataFrame(pre["rows"]), use_container_width=True, hide_index=True)
+        st.caption(f"Estimated from {pre['inputs']} overnight drivers (US futures, Asia, USD/INR, crude, dollar index, VIX) with fixed heuristic "
+                   "sensitivities. The official NSE pre-open call-auction price (09:00-09:08 IST) can differ; when NSE serves it, it is shown above.")
+    st.markdown("**Factor audit**")
+    st.dataframe(pd.DataFrame(macro["components"]), use_container_width=True, hide_index=True)
+    geo = macro.get("geo")
+    if show_headlines and isinstance(geo, dict):
+        if geo.get("available"):
+            with st.expander(f"Geo-political / macro headlines ({geo.get('count', 0)}, last 24h)"):
+                st.dataframe(pd.DataFrame(geo["headlines"])[["Topic", "Headline", "Source", "Published", "Score"]],
+                             use_container_width=True, hide_index=True)
+                st.caption("Headlines are scored with a simple keyword model from the viewpoint of Indian equities. Treat it as a context signal, not a verdict.")
+        else:
+            st.caption(f"Geo-political headline feed unavailable ({geo.get('error')}). Macro score uses market data only.")
+    st.caption(f"As of {macro.get('as_of')}. Macro points are added to the live score only; backtests exclude them because historical macro/news is not replayed.")
 
 
 def _render_market_quote_grid(rows, columns_per_row=5):
@@ -3345,6 +3750,8 @@ def analyze_signal(
     use_institutional=True,
     benchmark_df=None,
     signal_weights=None,
+    macro_info=None,
+    macro_hard_block=False,
 ):
     """Explainable multi-factor signal engine.
 
@@ -3654,6 +4061,27 @@ def analyze_signal(
         reasons.append("Institutional analysis skipped (directional evidence below 4 points)")
         bullish, bearish = _mark("institutional", "Institutional", bullish, bearish, False, "Skipped: low pre-score")
 
+    # ================= MACRO / GEO-POLITICAL (USD-INR, crude, DXY, yields, VIX, global cues, headlines) =================
+    macro_points = 0.0
+    macro_block_buy = macro_block_sell = False
+    if isinstance(macro_info, dict) and macro_info.get("available"):
+        macro_points = float(macro_info.get("signal_points", 0.0) or 0.0)
+        if macro_points > 0:
+            bullish += macro_points
+            reasons.append(f"Macro/geo-political backdrop {macro_info.get('label')} (+{macro_points:.1f} bullish)")
+        elif macro_points < 0:
+            bearish += -macro_points
+            reasons.append(f"Macro/geo-political backdrop {macro_info.get('label')} (+{-macro_points:.1f} bearish)")
+        else:
+            reasons.append("Macro/geo-political backdrop neutral")
+        if macro_hard_block:
+            macro_block_buy = bool(macro_info.get("block_buy"))
+            macro_block_sell = bool(macro_info.get("block_sell"))
+        bullish, bearish = _mark("macro", "Macro / geo-political (USD-INR, crude, DXY, US yields, VIX, global cues, headlines)",
+                                  bullish, bearish, True, str(macro_info.get("summary", "")))
+    else:
+        bullish, bearish = _mark("macro", "Macro / geo-political", bullish, bearish, False, "Macro data unavailable or disabled; contributes 0")
+
     regime = detect_market_regime(df)
     _news_message_for_regime = str((news_info or {}).get("message", ""))
     if (news_info or {}).get("status") == "ok" and "News risk detected" in _news_message_for_regime:
@@ -3734,6 +4162,10 @@ def analyze_signal(
             out.append(f"Large session gap filter blocked entry ({gap_info.get('gap_pct', 0):.2f}%)")
         if not news_allowed:
             out.append(news_info.get("message", "News risk filter blocked entry"))
+        if side == "BUY" and macro_block_buy:
+            out.append("Extreme bearish macro backdrop (rupee/crude/global risk-off) blocks BUY")
+        if side == "SELL" and macro_block_sell:
+            out.append("Extreme bullish macro backdrop blocks SELL")
         if near_level:
             out.append("Price is too close to the prior resistance/support level")
         return out
@@ -3871,7 +4303,10 @@ def analyze_signal(
         "no_trade_reasons": selected_blockers, "bullish_score": round(bullish, 1),
         "bearish_score": round(bearish, 1),"institutional_score": round(institutional_score, 1), "directional_bias": directional_bias,
         "net_score": net_score, "score_audit": score_audit, "institutional_components": inst_components,
-        "institutional_status": inst_status, "liquidity_block_buy": liquidity_block_buy,
+        "institutional_status": inst_status, "macro_points": round(macro_points, 2),
+        "macro_label": (macro_info or {}).get("label", "N/A") if isinstance(macro_info, dict) else "N/A",
+        "macro_summary": (macro_info or {}).get("summary", "") if isinstance(macro_info, dict) else "",
+        "liquidity_block_buy": liquidity_block_buy,
         "liquidity_block_sell": liquidity_block_sell, "signal_weights": _w,
         "liquidity_block_entry": bool(liquidity_block_buy or liquidity_block_sell),
         "institutional_participation_audit": {c["name"]: {"status": "ACTIVE" if c["available"] else "UNAVAILABLE / NEUTRAL", "score": round(c["net"], 2), "reason": c["reason"]} for c in inst_components},
@@ -6198,6 +6633,12 @@ else:
 if auto_refresh and AUTO_REFRESH_AVAILABLE:
     st_autorefresh(interval=refresh_seconds * 1000, key="elite_live_market_board_refresh")
 
+with st.expander("Macro / Geo-political Bias Settings"):
+    st.checkbox("Use macro bias in live signals (USD/INR, crude, DXY, US yields, VIX, US/Asia cues)", value=True, key="use_macro_bias")
+    st.checkbox("Include geo-political headline scan (Google News RSS, no API key)", value=True, key="use_geo_news")
+    st.checkbox("Hard-block entries against an extreme macro backdrop", value=False, key="macro_hard_block")
+    st.caption("Macro adds at most +/-2 points to the live score. It is not replayed in backtests (no historical macro/news archive).")
+
 with st.expander("Signal Engine Weights (configurable)"):
     st.caption("Multipliers applied to each scoring group before the BUY/SELL decision. 1.0 = default. Mandatory thresholds (ADX 20, MTF 2, min R:R 2.0) are applied separately and are not weight-dependent.")
     _wcols = st.columns(3)
@@ -6431,6 +6872,11 @@ if all((angel_api_key, angel_client_code, angel_pin, angel_totp_secret)):
 # This board intentionally renders before the selected OHLC pipeline. It remains
 # visible if Angel/Yahoo chart candles are unavailable later in the script.
 render_live_global_india_market_board()
+try:
+    if st.session_state.get("use_macro_bias", True):
+        render_macro_outlook(build_macro_context(None, use_geo_news=st.session_state.get("use_geo_news", True)))
+except Exception as _macro_ui_err:
+    log_app_error("macro_outlook_render", _macro_ui_err)
 
 
 ticker = stocks[selected]
@@ -6867,6 +7313,11 @@ if selected != "NIFTY":
     except Exception as _bm_err:
         log_app_error("benchmark_fetch", _bm_err)
 
+macro_info = {"available": False}
+if st.session_state.get("use_macro_bias", True):
+    macro_info = build_macro_context(news_info, use_geo_news=st.session_state.get("use_geo_news", True))
+st.session_state["macro_info_latest"] = macro_info
+
 analysis = analyze_signal(
     data,
     htf_bias=htf_bias,
@@ -6882,6 +7333,8 @@ analysis = analyze_signal(
     use_institutional=True,
     benchmark_df=benchmark_df,
     signal_weights=st.session_state.get("signal_weights"),
+    macro_info=macro_info,
+    macro_hard_block=bool(st.session_state.get("macro_hard_block", False)),
 )
 analysis = apply_adaptive_signal_intelligence(
     data, analysis, selected, timeframe,
