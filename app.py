@@ -50,7 +50,7 @@ def _install_streamlit_compat():
 
 _install_streamlit_compat()
 # Visible deployment marker: confirms which source file Streamlit Cloud is running.
-APP_BUILD_ID = "2026-11-10-FINAL-FAST-09-PRICEFIX"
+APP_BUILD_ID = "2026-11-10-FINAL-FAST-08"
 # Optional integrations: Yahoo mode must still start if Angel SDK/TOTP or
 # the auto-refresh helper is not installed.
 try:
@@ -596,24 +596,8 @@ def load_risk_state():
     return df
 
 
-def _write_csv_if_changed(df, path):
-    """Skip the disk write when the file already holds identical content.
-
-    The risk-lock files were rewritten (and backed up) on every Streamlit rerun, i.e. every few
-    seconds with auto-refresh, which slowed the page and wore the disk for no reason."""
-    try:
-        if os.path.exists(path):
-            old = pd.read_csv(path)
-            if (list(old.columns) == list(df.columns) and len(old) == len(df)
-                    and old.astype(str).reset_index(drop=True).equals(df.astype(str).reset_index(drop=True))):
-                return True
-    except Exception:
-        pass
-    return safe_write_csv(df, path)
-
-
 def save_risk_state(df):
-    _write_csv_if_changed(df, RISK_STATE_FILE)
+    safe_write_csv(df, RISK_STATE_FILE)
 
 
 def load_weekly_risk():
@@ -632,7 +616,7 @@ def load_weekly_risk():
 
 
 def save_weekly_risk(df):
-    _write_csv_if_changed(df, WEEKLY_RISK_FILE)
+    safe_write_csv(df, WEEKLY_RISK_FILE)
 
 
 def load_monthly_risk():
@@ -651,7 +635,7 @@ def load_monthly_risk():
 
 
 def save_monthly_risk(df):
-    _write_csv_if_changed(df, MONTHLY_RISK_FILE)
+    safe_write_csv(df, MONTHLY_RISK_FILE)
 
 
 def load_signal_audit():
@@ -808,18 +792,15 @@ def _yahoo_chart_api_frame(ticker, interval, period):
     if pytime.time() < _YAHOO_NET_DOWN_UNTIL:
         return pd.DataFrame(), "Yahoo temporarily skipped after a recent network failure (retrying shortly)"
     range_value = str(period or "7d").lower()
-    allowed_ranges = {"1d", "5d", "7d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "ytd", "max",
-                      "30d", "60d", "90d", "180d", "3y"}
+    allowed_ranges = {"1d", "5d", "7d", "1mo", "3mo", "6mo", "1y", "2y", "5d", "30d", "60d", "90d"}
     if range_value not in allowed_ranges:
         range_value = "7d"
     # Yahoo chart API accepts common range tokens; normalize day-count aliases.
-    # (Previously "180d" and "3y" were not recognised and silently became "7d", so the 1h and 1d
-    #  charts received only a handful of candles and never produced a usable price/indicators.)
-    range_value = {"30d": "1mo", "60d": "3mo", "90d": "3mo", "180d": "6mo", "3y": "5y"}.get(range_value, range_value)
+    range_value = {"30d": "1mo", "60d": "3mo", "90d": "3mo"}.get(range_value, range_value)
     params = {
         "range": range_value,
         "interval": str(interval),
-        "includePrePost": "false" if str(interval) in ("1d", "5d", "1wk", "1mo") else "true",
+        "includePrePost": "true",
         "events": "div,splits",
     }
     headers = {
@@ -2030,47 +2011,43 @@ def compute_supertrend(df, period=10, multiplier=3):
     upperband = hl2 + (multiplier * atr)
     lowerband = hl2 - (multiplier * atr)
 
-    # Same algorithm as before, but run on plain Python lists instead of thousands of
-    # pandas .iloc reads/writes (that was one of the main causes of the slow page).
-    n = len(data)
-    c_l = close.to_numpy(dtype=float).tolist()
-    up_l = upperband.to_numpy(dtype=float).tolist()
-    lo_l = lowerband.to_numpy(dtype=float).tolist()
-    fu = list(up_l)
-    fl = list(lo_l)
+    final_upperband = upperband.copy()
+    final_lowerband = lowerband.copy()
 
-    for i in range(1, n):
-        c_prev = c_l[i - 1]
-        if c_prev == c_prev:  # not NaN
-            if fu[i - 1] == fu[i - 1]:
-                if c_prev <= fu[i - 1]:
-                    fu[i] = fu[i - 1] if fu[i - 1] < up_l[i] else up_l[i]
-                else:
-                    fu[i] = up_l[i]
-            if fl[i - 1] == fl[i - 1]:
-                if c_prev >= fl[i - 1]:
-                    fl[i] = fl[i - 1] if fl[i - 1] > lo_l[i] else lo_l[i]
-                else:
-                    fl[i] = lo_l[i]
+    for i in range(1, len(data)):
+        if pd.notna(close.iloc[i - 1]) and pd.notna(final_upperband.iloc[i - 1]):
+            if close.iloc[i - 1] <= final_upperband.iloc[i - 1]:
+                final_upperband.iloc[i] = min(upperband.iloc[i], final_upperband.iloc[i - 1])
+            else:
+                final_upperband.iloc[i] = upperband.iloc[i]
 
-    st_l = [float("nan")] * n
-    dir_l = [0.0] * n
-    st_l[0] = fu[0]
-    dir_l[0] = -1.0
-    for i in range(1, n):
-        prev_upper = fu[i - 1]
-        prev_lower = fl[i - 1]
-        curr_close = c_l[i]
-        if prev_upper == prev_upper and curr_close > prev_upper:
-            dir_l[i] = 1.0
-        elif prev_lower == prev_lower and curr_close < prev_lower:
-            dir_l[i] = -1.0
+        if pd.notna(close.iloc[i - 1]) and pd.notna(final_lowerband.iloc[i - 1]):
+            if close.iloc[i - 1] >= final_lowerband.iloc[i - 1]:
+                final_lowerband.iloc[i] = max(lowerband.iloc[i], final_lowerband.iloc[i - 1])
+            else:
+                final_lowerband.iloc[i] = lowerband.iloc[i]
+
+    supertrend = pd.Series(index=data.index, dtype=float)
+    direction = pd.Series(index=data.index, dtype=float)
+
+    for i in range(len(data)):
+        if i == 0:
+            supertrend.iloc[i] = final_upperband.iloc[i]
+            direction.iloc[i] = -1
+            continue
+
+        prev_upper = final_upperband.iloc[i - 1]
+        prev_lower = final_lowerband.iloc[i - 1]
+        curr_close = close.iloc[i]
+
+        if pd.notna(prev_upper) and curr_close > prev_upper:
+            direction.iloc[i] = 1
+        elif pd.notna(prev_lower) and curr_close < prev_lower:
+            direction.iloc[i] = -1
         else:
-            dir_l[i] = dir_l[i - 1]
-        st_l[i] = fl[i] if dir_l[i] == 1.0 else fu[i]
+            direction.iloc[i] = direction.iloc[i - 1]
 
-    supertrend = pd.Series(st_l, index=data.index, dtype=float)
-    direction = pd.Series(dir_l, index=data.index, dtype=float)
+        supertrend.iloc[i] = final_lowerband.iloc[i] if direction.iloc[i] == 1 else final_upperband.iloc[i]
 
     data["SuperTrend"] = supertrend
     data["SuperTrendDirection"] = direction.fillna(0).astype(int)
@@ -2137,15 +2114,14 @@ def detect_candlestick_patterns(df):
     for col in bullish_cols + bearish_cols + ["Doji", "SpinningTop", "InsideBar", "OutsideBar"]:
         out[col] = out[col].fillna(False).astype(bool)
 
-    # Vectorized: the old version did ~40 pandas .at lookups per candle (very slow on 1m data).
-    _all_pattern_cols = bullish_cols + bearish_cols + ["Doji", "SpinningTop", "InsideBar", "OutsideBar"]
-    _flags = out[_all_pattern_cols].to_numpy(dtype=bool)
-    _b_cnt = out[bullish_cols].to_numpy(dtype=bool).sum(axis=1)
-    _s_cnt = out[bearish_cols].to_numpy(dtype=bool).sum(axis=1)
-    _name_arr = np.array(_all_pattern_cols, dtype=object)
-    names = [", ".join(_name_arr[row]) if row.any() else "No clear pattern" for row in _flags]
-    directions = np.where(_b_cnt > _s_cnt, "Bullish", np.where(_s_cnt > _b_cnt, "Bearish", "Neutral")).tolist()
-    scores = np.clip((_b_cnt - _s_cnt) * 2, -6, 6).astype(int).tolist()
+    names=[]; directions=[]; scores=[]
+    for idx in out.index:
+        found=[name for name in bullish_cols + bearish_cols + ["Doji", "SpinningTop", "InsideBar", "OutsideBar"] if bool(out.at[idx, name])]
+        names.append(", ".join(found) if found else "No clear pattern")
+        b=sum(bool(out.at[idx, name]) for name in bullish_cols)
+        s=sum(bool(out.at[idx, name]) for name in bearish_cols)
+        directions.append("Bullish" if b>s else "Bearish" if s>b else "Neutral")
+        scores.append(int(np.clip((b-s)*2, -6, 6)))
     out["CandlePattern"] = names
     out["CandlePatternBias"] = directions
     out["CandlePatternScore"] = scores
@@ -3638,22 +3614,8 @@ def get_news_events(api_key, symbol, provider="Marketaux", lookback_hours=6, art
 # =========================================================
 # OPTION CHAIN / PCR / OI
 # =========================================================
-_NSE_DOWN_UNTIL = 0.0   # circuit breaker: NSE blocks most cloud IPs; do not re-wait on every cache miss
-
-
 @st.cache_data(ttl=120)
 def get_option_chain_snapshot(symbol="NIFTY"):
-    global _NSE_DOWN_UNTIL
-    if pytime.time() < _NSE_DOWN_UNTIL:
-        try:
-            if os.path.exists(OPTION_CHAIN_FILE):
-                with open(OPTION_CHAIN_FILE, "r") as f:
-                    cache = json.load(f)
-                    if cache.get("symbol") == symbol:
-                        return cache.get("data")
-        except Exception:
-            pass
-        return None
     try:
         url = f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}"
         headers = {
@@ -3663,17 +3625,15 @@ def get_option_chain_snapshot(symbol="NIFTY"):
             "Accept-Language": "en-US,en;q=0.9"
         }
         session = requests.Session()
-        session.get("https://www.nseindia.com", headers=headers, timeout=(2, 3))
-        resp = session.get(url, headers=headers, timeout=(2, 3))
+        session.get("https://www.nseindia.com", headers=headers, timeout=4)
+        resp = session.get(url, headers=headers, timeout=4)
         if resp.status_code != 200:
-            _NSE_DOWN_UNTIL = pytime.time() + 300
             return None
         data = resp.json()
         with open(OPTION_CHAIN_FILE, "w") as f:
             json.dump({"symbol": symbol, "data": data}, f)
         return data
     except Exception as e:
-        _NSE_DOWN_UNTIL = pytime.time() + 300
         log_app_error("get_option_chain_snapshot", e)
         try:
             if os.path.exists(OPTION_CHAIN_FILE):
@@ -6559,48 +6519,16 @@ def get_data_for_timeframe(data_source, selected, ticker, tf, angel_creds):
     return data
 
 
-_TF_FRAME_CACHE_TTL_SEC = 25
-
-
-def get_tf_indicator_frame(data_source, selected, ticker, tf, angel_creds):
-    """Fetch + add indicators for one timeframe, cached briefly in the session.
-
-    The same 1m/3m/5m/15m frames were previously downloaded and re-indicated up to twice per
-    refresh (once for the MTF table and again for the tiered alerts). One shared cached copy
-    removes that duplicated work. Failed/empty fetches are cached only for a few seconds."""
-    cache = st.session_state.get("tf_frame_cache")
-    if not isinstance(cache, dict):
-        cache = {}
-        st.session_state["tf_frame_cache"] = cache
-    key = (str(data_source), str(selected), str(tf), str(angel_creds[1]) if angel_creds else "")
-    entry = cache.get(key)
-    now_ts = pytime.time()
-    if entry is not None:
-        ttl = _TF_FRAME_CACHE_TTL_SEC if entry["frame"] is not None else 6
-        if now_ts - entry["t"] <= ttl:
-            return entry["frame"]
-    frame = get_data_for_timeframe(data_source, selected, ticker, tf, angel_creds)
-    if frame is None or frame.empty:
-        result = None
-    else:
-        result = add_indicators(frame)
-    cache[key] = {"t": now_ts, "frame": result}
-    if len(cache) > 40:
-        for old_key in sorted(cache, key=lambda k: cache[k]["t"])[:20]:
-            cache.pop(old_key, None)
-    return result
-
-
 def get_mtf_setup_metrics(data_source, selected, ticker, tf, angel_creds):
     """Return real timeframe-specific EMA/RSI/ADX/relative-volume metrics."""
     result = {"timeframe": tf, "available": False, "ema9": np.nan, "ema21": np.nan,
               "ema50": np.nan, "rsi": np.nan, "adx": np.nan, "relative_volume": np.nan,
               "trend": "Unavailable"}
     try:
-        frame = get_tf_indicator_frame(data_source, selected, ticker, tf, angel_creds)
+        frame = get_data_for_timeframe(data_source, selected, ticker, tf, angel_creds)
         if frame is None or frame.empty:
             return result
-        frame = frame.replace([np.inf, -np.inf], np.nan)
+        frame = add_indicators(frame).replace([np.inf, -np.inf], np.nan)
         if len(frame) < 25:
             return result
         row = frame.iloc[-1]
@@ -6656,10 +6584,10 @@ def apply_tiered_early_alerts(analysis, metrics_by_tf):
 
 
 def get_mtf_signal(data_source, selected, ticker, tf, angel_creds):
-    data = get_tf_indicator_frame(data_source, selected, ticker, tf, angel_creds)
-    if data is None or data.empty:
+    data = get_data_for_timeframe(data_source, selected, ticker, tf, angel_creds)
+    if data.empty:
         return "⚪ N/A"
-    data = data.replace([np.inf, -np.inf], np.nan).ffill()
+    data = add_indicators(data).replace([np.inf, -np.inf], np.nan).ffill()
     if len(data) < 55:
         return "⚪ N/A"
     latest = data.iloc[-1]
@@ -6834,7 +6762,6 @@ if refresh_market_now:
         except Exception as _cache_clear_error:
             log_app_error("manual_refresh_cache_clear", _cache_clear_error)
     st.session_state["angel_history_cache"] = {}
-    st.session_state["tf_frame_cache"] = {}
     st.session_state["last_manual_refresh_at"] = now_str()
     st.session_state["force_market_refresh"] = True
 else:
@@ -7445,7 +7372,7 @@ if not ok:
 data = add_indicators(data).replace([np.inf, -np.inf], np.nan).ffill()
 # Keep interactive backtests bounded. Indicator columns are already computed on
 # the full chart frame; 1,200 recent bars provide a responsive intraday sample.
-MAX_BACKTEST_BARS = 800   # was 1200: each bar runs the full signal engine, so this directly drives page speed
+MAX_BACKTEST_BARS = 1200
 backtest_data = data.tail(MAX_BACKTEST_BARS).copy()
 
 if len(data) < 35:
@@ -7453,12 +7380,10 @@ if len(data) < 35:
 
 htf_interval, _ = get_higher_timeframe(timeframe)
 angel_creds = (angel_api_key, angel_client_code, angel_pin, angel_totp_secret)
-htf_data = get_tf_indicator_frame(active_data_source, selected, ticker, htf_interval, angel_creds)
-if htf_data is None:
-    htf_data = pd.DataFrame()
+htf_data = get_data_for_timeframe(active_data_source, selected, ticker, htf_interval, angel_creds)
 
 if not htf_data.empty:
-    htf_data = htf_data.replace([np.inf, -np.inf], np.nan).ffill()
+    htf_data = add_indicators(htf_data).replace([np.inf, -np.inf], np.nan).ffill()
     if len(htf_data) >= 55:
         htf_latest = htf_data.iloc[-1]
         htf_bias = "bullish" if htf_latest["EMA20"] > htf_latest["EMA50"] else "bearish"
@@ -7516,11 +7441,7 @@ historical_news_context = {
 # auto-refresh can rerun the page every few seconds even when no new candle exists;
 # do not recompute the same 1,200-bar simulation on every browser repaint.
 try:
-    # Hash only COMPLETED candles. The last candle changes on every live tick, which used to
-    # invalidate this cache on every auto-refresh and re-run the whole simulation each time.
-    # (The final bar cannot start a trade anyway: each trade needs 10 later bars.)
-    _bt_hash_src = backtest_data.iloc[:-1] if len(backtest_data) > 1 else backtest_data
-    _bt_hash = int(pd.util.hash_pandas_object(_bt_hash_src[["Open", "High", "Low", "Close", "Volume"]], index=True).sum()) if not _bt_hash_src.empty else 0
+    _bt_hash = int(pd.util.hash_pandas_object(backtest_data, index=True).sum()) if not backtest_data.empty else 0
 except Exception:
     _bt_hash = len(backtest_data)
 _backtest_cache_key = f"{selected}|{timeframe}|{len(backtest_data)}|{_bt_hash}"
@@ -8596,11 +8517,9 @@ _wf_auto_tick_changed = bool(
 )
 _wf_auto_just_enabled = bool(wf_auto_refresh and not _wf_previous_auto)
 _wf_first_run_for_key = bool(_wf_cached is None or _wf_cached_key != _wf_data_key)
-# Walk-forward re-runs the full signal engine over several folds, which froze the page on every
-# first load / symbol / timeframe change. It now runs only on the button or when its own auto
-# refresh is ON (the report and all its widgets are still shown).
 _wf_should_run = bool(
     wf_manual_refresh
+    or _wf_first_run_for_key
     or (wf_auto_refresh and (_wf_auto_tick_changed or _wf_auto_just_enabled))
 )
 
@@ -8619,15 +8538,7 @@ else:
     st.session_state["walk_forward_auto_was_enabled"] = wf_auto_refresh
     if wf_auto_tick is not None:
         st.session_state["walk_forward_last_auto_tick"] = wf_auto_tick
-    if _wf_cached is not None and _wf_cached_key == _wf_data_key:
-        walk_forward_result = _wf_cached
-    else:
-        walk_forward_result = {
-            "folds": 0, "validated_folds": 0, "avg_win_rate": None, "avg_profit_factor": None,
-            "avg_expectancy": None, "table": pd.DataFrame(),
-            "message": f"Walk-forward has not been run for {selected} / {timeframe} yet. "
-                       "Press 'Run / Refresh Walk Forward Now' (it is not run automatically because it is slow).",
-        }
+    walk_forward_result = _wf_cached
 
 if st.session_state.get("walk_forward_last_run_at"):
     st.caption("Last walk-forward calculation: " + str(st.session_state["walk_forward_last_run_at"]))
@@ -9039,12 +8950,7 @@ with st.expander("📚 Educational Market Learning Lab — descriptive analysis 
                     feature_frame["Volume / 20-bar mean"] = edu_frame["Volume"] / vol_mean.replace(0, np.nan)
                 feature_frame = feature_frame.replace([np.inf, -np.inf], np.nan).dropna()
                 max_clusters = min(6, max(2, len(feature_frame) // 15))
-                if max_clusters > 2:
-                    cluster_count = st.slider("Pattern groups", 2, max_clusters, min(3, max_clusters), key="edu_ai_clusters")
-                else:
-                    # Streamlit sliders require min < max; with little history only 2 groups are possible.
-                    cluster_count = 2
-                    st.caption("Pattern groups: 2 (more history is needed before a larger number can be chosen).")
+                cluster_count = st.slider("Pattern groups", 2, max_clusters, min(3, max_clusters), key="edu_ai_clusters")
                 if len(feature_frame) >= cluster_count * 5:
                     scaler = StandardScaler()
                     scaled = scaler.fit_transform(feature_frame)
