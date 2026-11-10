@@ -1587,6 +1587,8 @@ def get_angel_ltp_polling(api_key, client_code, pin, totp_secret, symbol_name):
             log_app_error("get_angel_ltp_polling", diagnostic)
             return None
         quote_payload = response.get("data") or {}
+        st.error(f"QUOTE PAYLOAD = {quote_payload}")
+
         quote = None
         if isinstance(quote_payload, dict):
             # Some SDK/API responses wrap the quote inside data.fetched.
