@@ -7201,16 +7201,16 @@ elif data_source == "Angel":
             )
         angel_candle_diagnostics = summarize_angel_candle_response(angel_candles_response)
         data = candles_to_df(angel_candles_response)
-        st.subheader("ANGEL DEBUG")
+        
 
-        st.write("Raw Response Type")
-        st.write(type(angel_candles_response))
         
-        st.write("Raw Response")
-        st.json(angel_candles_response)
         
-        st.write("Diagnostics")
-        st.json(angel_candle_diagnostics)
+        
+        
+        
+        
+        
+        
         angel_history_key = f"{selected}|{angel_interval}"
         if not data.empty:
             last_good_map = st.session_state.get("last_good_candles_by_key", {})
