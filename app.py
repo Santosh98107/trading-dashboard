@@ -50,7 +50,7 @@ def _install_streamlit_compat():
 
 _install_streamlit_compat()
 # Visible deployment marker: confirms which source file Streamlit Cloud is running.
-APP_BUILD_ID = "2026-11-10-FINAL-FAST-08"
+APP_BUILD_ID = "2026-11-10-FINAL-ANGEL-MACRO-IST-07"
 # Optional integrations: Yahoo mode must still start if Angel SDK/TOTP or
 # the auto-refresh helper is not installed.
 try:
@@ -782,15 +782,8 @@ def login_panel():
 _YAHOO_FETCH_DIAGNOSTICS = {"status": "not_requested", "source": None, "rows": 0, "error": None}
 
 
-_YF_NET_DOWN_UNTIL = 0.0
-_YAHOO_NET_DOWN_UNTIL = 0.0   # circuit breaker: after a network-level failure, skip Yahoo briefly instead of re-waiting per call
-
-
 def _yahoo_chart_api_frame(ticker, interval, period):
     """Fetch actual Yahoo chart OHLCV directly, avoiding yfinance schema drift."""
-    global _YAHOO_NET_DOWN_UNTIL
-    if pytime.time() < _YAHOO_NET_DOWN_UNTIL:
-        return pd.DataFrame(), "Yahoo temporarily skipped after a recent network failure (retrying shortly)"
     range_value = str(period or "7d").lower()
     allowed_ranges = {"1d", "5d", "7d", "1mo", "3mo", "6mo", "1y", "2y", "5d", "30d", "60d", "90d"}
     if range_value not in allowed_ranges:
@@ -808,15 +801,13 @@ def _yahoo_chart_api_frame(ticker, interval, period):
         "Accept": "application/json,text/plain,*/*",
     }
     last_error = None
-    _net_failures = 0
     for host in ("query1.finance.yahoo.com", "query2.finance.yahoo.com"):
         url = f"https://{host}/v8/finance/chart/{quote(str(ticker), safe='^.-')}"
         try:
-            _t0 = pytime.time()
-            response = requests.get(url, params=params, headers=headers, timeout=(3, 6))
-            if response.status_code == 429 and (pytime.time() - _t0) < 3:   # rate limited: one quick retry
-                pytime.sleep(0.8)
-                response = requests.get(url, params=params, headers=headers, timeout=(3, 6))
+            response = requests.get(url, params=params, headers=headers, timeout=(4, 9))
+            if response.status_code == 429:   # rate limited: brief pause, retry once
+                pytime.sleep(1.2)
+                response = requests.get(url, params=params, headers=headers, timeout=(4, 9))
             response.raise_for_status()
             payload = response.json()
             chart = payload.get("chart", {})
@@ -850,10 +841,6 @@ def _yahoo_chart_api_frame(ticker, interval, period):
             return to_ist_naive_index(frame), None
         except Exception as exc:
             last_error = f"{host}: {type(exc).__name__}: {exc}"
-            if isinstance(exc, (requests.ConnectionError, requests.Timeout)):
-                _net_failures += 1
-    if _net_failures >= 2:
-        _YAHOO_NET_DOWN_UNTIL = pytime.time() + 15
     return pd.DataFrame(), last_error
 
 
@@ -875,32 +862,24 @@ def _fetch_data_raw(ticker, interval, period):
             errors.append("Yahoo Chart API: " + direct_error)
 
         # Compatibility fallback for installations where Yahoo's chart host is blocked.
-        raw = pd.DataFrame()
-        global _YF_NET_DOWN_UNTIL
-        _yf_t0 = pytime.time()
-        if pytime.time() < _YF_NET_DOWN_UNTIL:
-            errors.append("yfinance skipped: recent failure (retrying shortly)")
-        else:
+        try:
+            raw = yf.download(
+                ticker, interval=interval, period=period, progress=False,
+                auto_adjust=False, threads=False, timeout=10,
+                multi_level_index=False,
+            )
+        except TypeError:
             try:
                 raw = yf.download(
                     ticker, interval=interval, period=period, progress=False,
-                    auto_adjust=False, threads=False, timeout=6,
-                    multi_level_index=False,
+                    auto_adjust=False, threads=False, timeout=10,
                 )
-            except TypeError:
-                try:
-                    raw = yf.download(
-                        ticker, interval=interval, period=period, progress=False,
-                        auto_adjust=False, threads=False, timeout=6,
-                    )
-                except Exception as exc:
-                    raw = pd.DataFrame()
-                    errors.append(f"yfinance download compatibility fallback: {type(exc).__name__}: {exc}")
             except Exception as exc:
                 raw = pd.DataFrame()
-                errors.append(f"yfinance download: {type(exc).__name__}: {exc}")
-            if (raw is None or getattr(raw, "empty", True)) and (pytime.time() - _yf_t0) > 4.0:
-                _YF_NET_DOWN_UNTIL = pytime.time() + 15       # slow + empty = dead network: stop re-waiting
+                errors.append(f"yfinance download compatibility fallback: {type(exc).__name__}: {exc}")
+        except Exception as exc:
+            raw = pd.DataFrame()
+            errors.append(f"yfinance download: {type(exc).__name__}: {exc}")
 
         if isinstance(raw, pd.DataFrame) and isinstance(raw.columns, pd.MultiIndex):
             selected_level = None
@@ -967,11 +946,9 @@ def fetch_data(ticker, interval, period):
     """Resilient wrapper: retries wider ranges when Yahoo returns nothing, and falls back to the
     last good candles (clearly labelled stale) so the app never goes blank on a temporary Yahoo failure."""
     key = (str(ticker), str(interval), str(period))
-    _t_start = pytime.time()
     frame = _fetch_data_raw(ticker, interval, period)
     diag = dict(_YAHOO_FETCH_DIAGNOSTICS)
-    _fast_empty = (pytime.time() - _t_start) < 6.0     # a dead/blocked network is slow: do not multiply the wait
-    if (frame is None or frame.empty) and _fast_empty and str(interval) in ("1m", "2m", "5m"):
+    if (frame is None or frame.empty) and str(interval) in ("1m", "2m", "5m"):
         for alt_period in ("5d", "1mo"):
             if alt_period == str(period):
                 continue
@@ -1366,10 +1343,7 @@ def get_angel_candles(api_key, client_code, pin, totp_secret, symbol_name, inter
             "FIFTEEN_MINUTE": 120, "THIRTY_MINUTE": 120, "ONE_HOUR": 180, "ONE_DAY": 365,
         }.get(interval, 20)
         last_resp, relogged = None, False
-        _deadline = pytime.time() + 20          # never let broker retries stall the whole page
-        for attempt in range(1, 4):
-            if attempt > 1 and pytime.time() > _deadline:
-                break
+        for attempt in range(1, 5):
             to_date = datetime.now(IST_OFFSET)
             from_date = to_date - timedelta(days=lookback)
             params = {
@@ -1392,7 +1366,7 @@ def get_angel_candles(api_key, client_code, pin, totp_secret, symbol_name, inter
                             "message": st.session_state.get("angel_last_login_error") or "Angel session expired and re-login failed."}
                 continue
             if angel_is_rate_limited(resp):
-                pytime.sleep(min(1.2 * attempt, 2.0))
+                pytime.sleep(1.2 * attempt)
                 continue
             if isinstance(resp, dict) and resp.get("status") is False:
                 lookback = max(3, lookback // 2)      # range rejected: retry with a smaller window
@@ -1574,8 +1548,6 @@ def get_angel_ltp_polling(api_key, client_code, pin, totp_secret, symbol_name):
         elif angel_is_rate_limited(response):
             pytime.sleep(1.2)
             response = ltp_method(exchange, trading_symbol, str(token))
-           
-            st.error(f"Exchange={exchange} | Symbol={trading_symbol} | Token={token}")
         if not isinstance(response, dict):
             diagnostic.update(status="invalid_response", response_type=type(response).__name__, message=str(response)[:300])
             st.session_state["angel_last_ltp_diagnostic"] = diagnostic
@@ -1587,8 +1559,6 @@ def get_angel_ltp_polling(api_key, client_code, pin, totp_secret, symbol_name):
             log_app_error("get_angel_ltp_polling", diagnostic)
             return None
         quote_payload = response.get("data") or {}
-        
-
         quote = None
         if isinstance(quote_payload, dict):
             # Some SDK/API responses wrap the quote inside data.fetched.
@@ -2587,7 +2557,7 @@ def _headline_score(title):
     return float(np.clip(score, -2.0, 2.0))
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=600, show_spinner=False)
 def fetch_geo_news():
     """Keyless geo-political / macro headline scan (Google News RSS, last 24h). Titles only."""
     import xml.etree.ElementTree as _ET
@@ -2600,24 +2570,12 @@ def fetch_geo_news():
     )
     headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/rss+xml,application/xml,text/xml,*/*"}
     seen, rows, errors = set(), [], []
-
-    def _pull(topic_query):
-        topic, query = topic_query
-        url = "https://news.google.com/rss/search?q=" + quote(query + " when:1d") + "&hl=en-IN&gl=IN&ceid=IN:en"
-        resp = requests.get(url, headers=headers, timeout=(3, 4))
-        resp.raise_for_status()
-        return topic, _ET.fromstring(resp.content)
-
-    from concurrent.futures import ThreadPoolExecutor as _TPE
-    with _TPE(max_workers=4) as pool:
-        futures = [pool.submit(_pull, q) for q in queries]
-        for fut in futures:
-            try:
-                topic, root = fut.result(timeout=7)
-            except Exception as exc:
-                errors.append(type(exc).__name__)
-                continue
-            taken = 0
+    for topic, query in queries:
+        try:
+            url = "https://news.google.com/rss/search?q=" + quote(query + " when:1d") + "&hl=en-IN&gl=IN&ceid=IN:en"
+            resp = requests.get(url, headers=headers, timeout=(4, 8))
+            resp.raise_for_status()
+            root = _ET.fromstring(resp.content)
             for item in root.iter("item"):
                 title = (item.findtext("title") or "").strip()
                 if not title or title.lower() in seen:
@@ -2630,9 +2588,10 @@ def fetch_geo_news():
                     pass
                 rows.append({"Topic": topic, "Headline": title, "Published": published,
                              "Source": (item.findtext("source") or "").strip(), "Score": _headline_score(title)})
-                taken += 1
-                if taken >= 8:
+                if sum(1 for r in rows if r["Topic"] == topic) >= 8:
                     break
+        except Exception as exc:
+            errors.append(f"{topic}: {type(exc).__name__}")
     if not rows:
         return {"available": False, "score": 0.0, "count": 0, "headlines": [], "error": "; ".join(errors) or "no headlines"}
     total = sum(r["Score"] for r in rows)
@@ -2806,45 +2765,7 @@ def score_macro_bias(snapshot, geo=None, news_info=None):
     }
 
 
-_MACRO_BG = {"ctx": None, "ts": 0.0, "running": False, "geo": True}
-_MACRO_BG_LOCK = threading.Lock()
-
-
-def _macro_bg_worker(news_info, use_geo_news):
-    try:
-        ctx = _build_macro_context_blocking(news_info, use_geo_news)
-        with _MACRO_BG_LOCK:
-            _MACRO_BG.update(ctx=ctx, ts=pytime.time(), geo=use_geo_news)
-    finally:
-        with _MACRO_BG_LOCK:
-            _MACRO_BG["running"] = False
-
-
-def build_macro_context(news_info=None, use_geo_news=True, wait_seconds=2.5):
-    """Non-blocking macro context: refreshes in a background thread and returns the latest finished result.
-
-    Slow/blocked Yahoo or news requests can never freeze the chart; the first load waits at most
-    `wait_seconds`, later runs reuse the last good context (refreshed every ~60 s)."""
-    with _MACRO_BG_LOCK:
-        fresh = _MACRO_BG["ctx"] is not None and (pytime.time() - _MACRO_BG["ts"]) < 60 and _MACRO_BG["geo"] == use_geo_news
-        start = (not fresh) and (not _MACRO_BG["running"])
-        if start:
-            _MACRO_BG["running"] = True
-    if start:
-        worker = threading.Thread(target=_macro_bg_worker, args=(news_info, use_geo_news), daemon=True)
-        worker.start()
-        if _MACRO_BG["ctx"] is None:
-            worker.join(timeout=wait_seconds)
-    with _MACRO_BG_LOCK:
-        ctx = _MACRO_BG["ctx"]
-    if ctx is None:
-        return {"available": False, "raw_score": 0.0, "signal_points": 0.0, "label": "Loading", "components": [],
-                "pre_open": {"available": False}, "factors_used": 0, "block_buy": False, "block_sell": False,
-                "summary": "Macro data is loading in the background (refresh in a few seconds)", "snapshot": {}, "geo": None}
-    return ctx
-
-
-def _build_macro_context_blocking(news_info=None, use_geo_news=True):
+def build_macro_context(news_info=None, use_geo_news=True):
     """Fetch (cached) macro + geo news and return the scored macro context; never raises."""
     try:
         snapshot = fetch_macro_snapshot()
@@ -7205,16 +7126,7 @@ elif data_source == "Angel":
             )
         angel_candle_diagnostics = summarize_angel_candle_response(angel_candles_response)
         data = candles_to_df(angel_candles_response)
-        
 
-        
-        
-        
-        
-        
-        
-        
-        
         angel_history_key = f"{selected}|{angel_interval}"
         if not data.empty:
             last_good_map = st.session_state.get("last_good_candles_by_key", {})
