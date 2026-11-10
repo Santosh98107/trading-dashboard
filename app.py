@@ -50,7 +50,7 @@ def _install_streamlit_compat():
 
 _install_streamlit_compat()
 # Visible deployment marker: confirms which source file Streamlit Cloud is running.
-APP_BUILD_ID = "2026-11-10-LOGIN-DATA-COMPAT-FINAL-06"
+APP_BUILD_ID = "2026-11-10-FINAL-ANGEL-MACRO-IST-07"
 # Optional integrations: Yahoo mode must still start if Angel SDK/TOTP or
 # the auto-refresh helper is not installed.
 try:
@@ -1119,6 +1119,35 @@ def install_smartapi_http_timeout(api):
         return False
 
 
+_ANGEL_AUTH_CODES = {"AG8001", "AG8002", "AG8003", "AB8050", "AB8051", "AB1010", "AB1011", "AG8004"}
+
+
+def _angel_resp_text(resp):
+    if not isinstance(resp, dict):
+        return "", ""
+    code = str(resp.get("errorcode") or resp.get("errorCode") or "").upper()
+    msg = str(resp.get("message") or resp.get("error") or "")
+    return code, msg
+
+
+def angel_is_auth_error(resp):
+    """Expired / invalid Angel JWT (they expire daily): the cached session must be replaced by a fresh login."""
+    code, msg = _angel_resp_text(resp)
+    low = msg.lower()
+    return code in _ANGEL_AUTH_CODES or any(x in low for x in ("invalid token", "token expired", "token has expired", "session expired", "unauthor", "invalid session"))
+
+
+def angel_is_rate_limited(resp):
+    code, msg = _angel_resp_text(resp)
+    low = msg.lower()
+    return any(x in low for x in ("exceeding access rate", "access rate", "too many request", "rate limit", "try after sometime"))
+
+
+def angel_reset_session():
+    for key in ("angel_api", "angel_session", "angel_cache_key", "angel_connected"):
+        st.session_state.pop(key, None)
+
+
 def angel_login(api_key, client_code, pin, totp_secret, force_refresh=False):
     """Return a matching authenticated session; only request PIN/TOTP for fresh login."""
     try:
@@ -1157,13 +1186,18 @@ def angel_login(api_key, client_code, pin, totp_secret, force_refresh=False):
         session = smart_api.generateSession(client_code, pin, totp)
 
         if session and session.get("status") and session.get("data"):
+            st.session_state.pop("angel_last_login_error", None)
             st.session_state["angel_api"] = smart_api
             st.session_state["angel_session"] = session
             st.session_state["angel_cache_key"] = cache_key
             st.session_state["angel_connected"] = True
             return smart_api, session
+        _lm = str((session or {}).get("message") or "Angel rejected the login") if isinstance(session, dict) else "Angel rejected the login"
+        st.session_state["angel_last_login_error"] = f"Angel login failed: {_lm[:200]} (check client code, PIN, API key and TOTP secret)"
+        log_app_error("angel_login", st.session_state["angel_last_login_error"])
         return None, None
     except Exception as e:
+        st.session_state["angel_last_login_error"] = f"Angel login error: {type(e).__name__}: {str(e)[:160]}"
         log_app_error("angel_login", e)
         return None, None
 
@@ -1290,39 +1324,58 @@ def resolve_angel_instrument(symbol_name):
 
 
 def get_angel_candles(api_key, client_code, pin, totp_secret, symbol_name, interval="FIVE_MINUTE"):
+    """Angel historical candles with self-healing: re-login on expired tokens, back-off on rate limits,
+    smaller date windows when the broker rejects a range, and an explicit reason when nothing comes back."""
     try:
         angel, session = angel_login(api_key, client_code, pin, totp_secret)
         if angel is None or not session or not session.get("data"):
-            return None
+            return {"status": False, "errorcode": "LOGIN",
+                    "message": st.session_state.get("angel_last_login_error")
+                    or "Angel login unavailable: enter API key, client code, PIN and TOTP secret (and install smartapi-python + pyotp)."}
 
         instrument = resolve_angel_instrument(symbol_name)
         if not instrument:
             return {"status": False, "message": f"Angel instrument master did not resolve {symbol_name}; check master connectivity and symbol spelling"}
 
-        ist = timezone(timedelta(hours=5, minutes=30))
-        to_date = datetime.now(ist)
-        # Angel One's documented per-request maximum differs by interval.
-        # Use practical lookbacks that provide enough history without exceeding it.
-        lookback_days = {
-            "ONE_MINUTE": 20,
-            "THREE_MINUTE": 45,
-            "FIVE_MINUTE": 75,
-            "TEN_MINUTE": 75,
-            "FIFTEEN_MINUTE": 120,
-            "THIRTY_MINUTE": 120,
-            "ONE_HOUR": 180,
-            "ONE_DAY": 365,
+        # Angel's documented per-request maximums differ by interval; stay inside them.
+        lookback = {
+            "ONE_MINUTE": 20, "THREE_MINUTE": 45, "FIVE_MINUTE": 75, "TEN_MINUTE": 75,
+            "FIFTEEN_MINUTE": 120, "THIRTY_MINUTE": 120, "ONE_HOUR": 180, "ONE_DAY": 365,
         }.get(interval, 20)
-        from_date = to_date - timedelta(days=lookback_days)
-
-        params = {
-            "exchange": instrument["exchange"],
-            "symboltoken": instrument["token"],
-            "interval": interval,
-            "fromdate": from_date.strftime("%Y-%m-%d %H:%M"),
-            "todate": to_date.strftime("%Y-%m-%d %H:%M")
-        }
-        return angel.getCandleData(params)
+        last_resp, relogged = None, False
+        for attempt in range(1, 5):
+            to_date = datetime.now(IST_OFFSET)
+            from_date = to_date - timedelta(days=lookback)
+            params = {
+                "exchange": instrument["exchange"], "symboltoken": instrument["token"], "interval": interval,
+                "fromdate": from_date.strftime("%Y-%m-%d %H:%M"), "todate": to_date.strftime("%Y-%m-%d %H:%M"),
+            }
+            try:
+                resp = angel.getCandleData(params)
+            except Exception as call_err:
+                resp = {"status": False, "message": f"{type(call_err).__name__}: {str(call_err)[:200]}"}
+            last_resp = resp
+            if isinstance(resp, dict) and resp.get("status") and resp.get("data"):
+                return resp
+            if angel_is_auth_error(resp) and not relogged:
+                relogged = True
+                angel_reset_session()
+                angel, session = angel_login(api_key, client_code, pin, totp_secret, force_refresh=True)
+                if angel is None or not session or not session.get("data"):
+                    return {"status": False, "errorcode": "LOGIN",
+                            "message": st.session_state.get("angel_last_login_error") or "Angel session expired and re-login failed."}
+                continue
+            if angel_is_rate_limited(resp):
+                pytime.sleep(1.2 * attempt)
+                continue
+            if isinstance(resp, dict) and resp.get("status") is False:
+                lookback = max(3, lookback // 2)      # range rejected: retry with a smaller window
+                continue
+            if isinstance(resp, dict) and resp.get("status") and not resp.get("data"):
+                lookback = max(3, lookback // 2)
+                continue
+            break
+        return last_resp if last_resp is not None else {"status": False, "message": "Angel returned no response"}
     except Exception as e:
         log_app_error("get_angel_candles", e)
         return {"status": False, "message": str(e)}
@@ -1378,6 +1431,8 @@ def candles_to_df(candles):
             df = raw
         else:
             payload = candles.get("data") if isinstance(candles, dict) else candles
+            if isinstance(payload, dict):
+                payload = payload.get("candles") or payload.get("data")
             if not isinstance(payload, (list, tuple)) or len(payload) == 0:
                 return pd.DataFrame()
             if isinstance(payload[0], dict):
@@ -1395,7 +1450,15 @@ def candles_to_df(candles):
                 cols = ["Datetime", "Open", "High", "Low", "Close", "Volume"][:df.shape[1]]
                 df.columns = cols
                 df = df.set_index("Datetime")
-        df.index = pd.to_datetime(df.index, errors="coerce")
+        try:
+            _parsed = pd.to_datetime(df.index, errors="coerce")
+            if _parsed.isna().all() or _parsed.dtype == object:
+                _parsed = pd.to_datetime(df.index, errors="coerce", utc=True)
+        except Exception:
+            _parsed = pd.to_datetime(df.index, errors="coerce", utc=True)
+        if getattr(_parsed, "tz", None) is not None:      # Angel stamps carry +05:30; keep naive IST like every other feed
+            _parsed = _parsed.tz_convert(IST_TZ_NAME).tz_localize(None)
+        df.index = _parsed
         df = df[~df.index.isna()].copy()
         df.columns = [str(c).strip().title() for c in df.columns]
         required = ["Open", "High", "Low", "Close"]
@@ -1475,6 +1538,16 @@ def get_angel_ltp_polling(api_key, client_code, pin, totp_secret, symbol_name):
             log_app_error("get_angel_ltp_polling", diagnostic["message"])
             return None
         response = ltp_method(exchange, trading_symbol, str(token))
+        if angel_is_auth_error(response):
+            angel_reset_session()
+            angel, session = angel_login(api_key, client_code, pin, totp_secret, force_refresh=True)
+            if angel is not None and session and session.get("data"):
+                ltp_method = getattr(angel, "ltpData", None) or getattr(angel, "getLTPData", None)
+                if callable(ltp_method):
+                    response = ltp_method(exchange, trading_symbol, str(token))
+        elif angel_is_rate_limited(response):
+            pytime.sleep(1.2)
+            response = ltp_method(exchange, trading_symbol, str(token))
         if not isinstance(response, dict):
             diagnostic.update(status="invalid_response", response_type=type(response).__name__, message=str(response)[:300])
             st.session_state["angel_last_ltp_diagnostic"] = diagnostic
@@ -7075,7 +7148,11 @@ elif data_source == "Angel":
             if not yahoo_fallback.empty:
                 data = yahoo_fallback
                 active_data_source = "Yahoo"
-                st.warning("Angel One candle history is unavailable. Using Yahoo Finance OHLC as a clearly-labelled fallback; Angel LTP polling remains separate.")
+                _why = (angel_candle_diagnostics or {}).get("message") or "empty response"
+                _code = (angel_candle_diagnostics or {}).get("error_code")
+                st.warning("Angel One candle history is unavailable "
+                           f"(reason: {_why}{' | code ' + str(_code) if _code else ''}). "
+                           "Using Yahoo Finance OHLC as a clearly-labelled fallback; Angel LTP polling remains separate.")
 
 else:
     with st.spinner(f"Yahoo Finance: loading {ticker} ({yf_interval})…"):
