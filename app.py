@@ -7187,6 +7187,21 @@ if data.empty:
         st.caption("Auto-refresh remains active for the Global/Macro and Major Indian Stocks market board. The chart waits for valid OHLC candles.")
     elif auto_refresh and not AUTO_REFRESH_AVAILABLE:
         st.warning("Auto-refresh is enabled but streamlit-autorefresh is not installed. Install requirements.txt and redeploy.")
+    # Institutional Analysis, FVG, Relative Strength and the AI Trainer need candles, so they resume
+    # automatically once data returns. The journal-based AI Coach does not need candles, so keep it visible.
+    st.divider()
+    st.header("Institutional Analysis / AI Coach")
+    st.info("Institutional Analysis (structure, liquidity, order blocks, FVG, volume profile, relative strength), the ML view and the "
+            "AI Backtest Trainer need valid OHLC candles. They are not removed; they appear here again as soon as data loads.")
+    try:
+        _coach_df = inst.ai_loss_analysis(load_journal())
+        st.subheader("AI Coach (from your trade journal)")
+        if _coach_df is not None and not _coach_df.empty:
+            st.dataframe(_coach_df, use_container_width=True, hide_index=True)
+        else:
+            st.info("No losing trades found in the journal for coaching.")
+    except Exception as _coach_err:
+        log_app_error("ai_coach_no_data", _coach_err)
     st.stop()
 
 if active_data_source != data_source:
@@ -8809,6 +8824,10 @@ with st.expander("📚 Educational Market Learning Lab — descriptive analysis 
 # =========================================================
 st.divider()
 st.header("Institutional Analysis")
-inst.render_institutional_dashboard(
-    data, selected, benchmark_df, load_journal(), option_metrics=option_metrics
-)
+try:
+    inst.render_institutional_dashboard(
+        data, selected, benchmark_df, load_journal(), option_metrics=option_metrics
+    )
+except Exception as _inst_ui_err:
+    log_app_error("institutional_dashboard", _inst_ui_err)
+    st.error(f"Institutional dashboard error: {type(_inst_ui_err).__name__}: {_inst_ui_err}")
