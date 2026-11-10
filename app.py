@@ -9039,7 +9039,12 @@ with st.expander("📚 Educational Market Learning Lab — descriptive analysis 
                     feature_frame["Volume / 20-bar mean"] = edu_frame["Volume"] / vol_mean.replace(0, np.nan)
                 feature_frame = feature_frame.replace([np.inf, -np.inf], np.nan).dropna()
                 max_clusters = min(6, max(2, len(feature_frame) // 15))
-                cluster_count = st.slider("Pattern groups", 2, max_clusters, min(3, max_clusters), key="edu_ai_clusters")
+                if max_clusters > 2:
+                    cluster_count = st.slider("Pattern groups", 2, max_clusters, min(3, max_clusters), key="edu_ai_clusters")
+                else:
+                    # Streamlit sliders require min < max; with little history only 2 groups are possible.
+                    cluster_count = 2
+                    st.caption("Pattern groups: 2 (more history is needed before a larger number can be chosen).")
                 if len(feature_frame) >= cluster_count * 5:
                     scaler = StandardScaler()
                     scaled = scaler.fit_transform(feature_frame)
