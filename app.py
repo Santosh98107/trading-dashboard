@@ -800,16 +800,12 @@ _YAHOO_FETCH_DIAGNOSTICS = {"status": "not_requested", "source": None, "rows": 0
 
 _YF_NET_DOWN_UNTIL = 0.0
 _YAHOO_NET_DOWN_UNTIL = 0.0   # circuit breaker: after a network-level failure, skip Yahoo briefly instead of re-waiting per call
-_YAHOO_LAST_ERRORS = {}       # ticker -> last Yahoo error text (shown in the scanner diagnostics panel)
 
 
-def _yahoo_chart_api_frame(ticker, interval, period, use_breaker=True):
-    """Fetch actual Yahoo chart OHLCV directly, avoiding yfinance schema drift.
-
-    use_breaker=False is used by the parallel scanner so that a couple of slow requests cannot
-    make every remaining stock be skipped."""
+def _yahoo_chart_api_frame(ticker, interval, period):
+    """Fetch actual Yahoo chart OHLCV directly, avoiding yfinance schema drift."""
     global _YAHOO_NET_DOWN_UNTIL
-    if use_breaker and pytime.time() < _YAHOO_NET_DOWN_UNTIL:
+    if pytime.time() < _YAHOO_NET_DOWN_UNTIL:
         return pd.DataFrame(), "Yahoo temporarily skipped after a recent network failure (retrying shortly)"
     range_value = str(period or "7d").lower()
     allowed_ranges = {"1d", "5d", "7d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "ytd", "max",
@@ -870,15 +866,13 @@ def _yahoo_chart_api_frame(ticker, interval, period, use_breaker=True):
                 frame[col] = pd.to_numeric(frame[col], errors="coerce")
             frame = frame.dropna(subset=["Open", "High", "Low", "Close"])
             frame = frame.loc[~frame.index.duplicated(keep="last")].sort_index()
-            _YAHOO_LAST_ERRORS.pop(str(ticker), None)
             return to_ist_naive_index(frame), None
         except Exception as exc:
             last_error = f"{host}: {type(exc).__name__}: {exc}"
             if isinstance(exc, (requests.ConnectionError, requests.Timeout)):
                 _net_failures += 1
-    if _net_failures >= 2 and use_breaker:
+    if _net_failures >= 2:
         _YAHOO_NET_DOWN_UNTIL = pytime.time() + 15
-    _YAHOO_LAST_ERRORS[str(ticker)] = str(last_error)[:300]
     return pd.DataFrame(), last_error
 
 
@@ -2364,10 +2358,9 @@ def _normalize_yahoo_frame(frame):
     return df[needed + ["Volume"]].loc[~df.index.duplicated(keep="last")].sort_index()
 
 
-def _fetch_yahoo_batch_yfinance(tickers, interval, period):
-    """yfinance batch download (now only the FALLBACK path; see fetch_yahoo_batch below).
-
-    Fetch many Yahoo tickers in one HTTP batch and return {ticker: OHLCV}.
+@st.cache_data(ttl=30, show_spinner=False)
+def fetch_yahoo_batch(tickers, interval, period):
+    """Fetch many Yahoo tickers in one HTTP batch and return {ticker: OHLCV}.
 
     This replaces 60 serial downloads in the NIFTY-30 scanner with two batch
     requests (one intraday, one daily). Failed symbols stay empty; no values are
@@ -2419,154 +2412,6 @@ def _fetch_yahoo_batch_yfinance(tickers, interval, period):
     except Exception as exc:
         log_app_error("fetch_yahoo_batch", exc)
         return empty_result
-
-
-def _fetch_yahoo_batch_direct(tickers, interval, period, max_workers=4):
-    """Fetch each ticker from Yahoo's chart endpoint in parallel threads.
-
-    This is the same endpoint the main chart uses successfully. yfinance's batch download
-    often returns nothing on cloud hosts (cookie/crumb or rate-limit blocks), which is why the
-    scanner / market board / macro snapshot stayed empty even when single-symbol charts worked."""
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    ticker_list = [str(t).strip() for t in tickers if str(t).strip()]
-    results = {t: pd.DataFrame() for t in ticker_list}
-    if not ticker_list:
-        return results
-
-    def _one(tk):
-        frame, err = _yahoo_chart_api_frame(tk, interval, period, use_breaker=False)
-        attempt = 0
-        while (frame is None or frame.empty) and err and attempt < 2:
-            attempt += 1
-            # Back off longer when Yahoo says "too many requests"; short pause for other glitches.
-            pytime.sleep(1.5 * attempt if ("429" in str(err) or "Too Many" in str(err)) else 0.4)
-            frame, err = _yahoo_chart_api_frame(tk, interval, period, use_breaker=False)
-        return tk, frame
-
-    try:
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futures = [pool.submit(_one, tk) for tk in ticker_list]
-            for fut in as_completed(futures, timeout=40):
-                try:
-                    tk, frame = fut.result()
-                    if frame is not None and not frame.empty:
-                        results[tk] = _normalize_yahoo_frame(frame)
-                except Exception as exc:
-                    log_app_error("fetch_yahoo_batch_direct", f"{type(exc).__name__}: {exc}")
-    except Exception as exc:
-        log_app_error("fetch_yahoo_batch_direct", f"{type(exc).__name__}: {exc}")
-    return results
-
-
-@st.cache_data(ttl=30, show_spinner=False)
-def _fetch_yahoo_batch_cached(tickers, interval, period):
-    ticker_list = tuple(str(t).strip() for t in tickers if str(t).strip())
-    results = _fetch_yahoo_batch_direct(ticker_list, interval, period)
-    missing = tuple(t for t in ticker_list if results.get(t) is None or results[t].empty)
-    # yfinance only for symbols the direct endpoint could not supply (and only when the
-    # direct path is not completely down, to avoid doubling the wait on a dead network).
-    if missing and len(missing) < len(ticker_list):
-        fallback = _fetch_yahoo_batch_yfinance(missing, interval, period)
-        for t in missing:
-            if fallback.get(t) is not None and not fallback[t].empty:
-                results[t] = fallback[t]
-    elif missing and len(missing) == len(ticker_list):
-        results = _fetch_yahoo_batch_yfinance(ticker_list, interval, period)
-    return results
-
-
-def fetch_yahoo_batch(tickers, interval, period):
-    """Return {ticker: OHLCV}. Direct Yahoo chart API first, yfinance as fallback.
-
-    A completely empty result is NOT kept in the cache (it used to be cached for 30 s, so a
-    single blocked request made the scanner look dead even after pressing refresh)."""
-    ticker_list = tuple(str(t).strip() for t in tickers if str(t).strip())
-    result = _fetch_yahoo_batch_cached(ticker_list, str(interval), str(period))
-    if ticker_list and all((result.get(t) is None or result[t].empty) for t in ticker_list):
-        try:
-            _fetch_yahoo_batch_cached.clear()
-        except Exception:
-            pass
-    return result
-
-
-fetch_yahoo_batch.clear = _fetch_yahoo_batch_cached.clear
-
-
-def _yahoo_spark_quotes(tickers):
-    """Last-resort quotes for many symbols in ONE request (Yahoo 'spark' endpoint).
-
-    Returns {ticker: {"price": float, "prev": float|None}}. Gives CMP and % change even when the
-    per-symbol OHLC requests are rate-limited; no trend data (needs candles)."""
-    out = {}
-    tks = [str(t).strip() for t in tickers if str(t).strip()]
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0 Safari/537.36",
-               "Accept": "application/json,text/plain,*/*"}
-    for i in range(0, len(tks), 20):
-        chunk = tks[i:i + 20]
-        for host in ("query1.finance.yahoo.com", "query2.finance.yahoo.com"):
-            try:
-                resp = requests.get(f"https://{host}/v8/finance/spark",
-                                    params={"symbols": ",".join(chunk), "range": "5d", "interval": "1d"},
-                                    headers=headers, timeout=(3, 8))
-                resp.raise_for_status()
-                payload = resp.json()
-                items = []
-                spark = payload.get("spark") if isinstance(payload, dict) else None
-                if isinstance(spark, dict) and isinstance(spark.get("result"), list):
-                    for it in spark["result"]:
-                        r0 = ((it or {}).get("response") or [{}])[0] or {}
-                        closes = ((((r0.get("indicators") or {}).get("quote")) or [{}])[0] or {}).get("close") or []
-                        items.append(((it or {}).get("symbol"), closes, r0.get("meta") or {}))
-                elif isinstance(payload, dict):
-                    for sym, val in payload.items():
-                        if isinstance(val, dict) and "close" in val:
-                            items.append((sym, val.get("close") or [], {"previousClose": val.get("previousClose")}))
-                for sym, closes, meta in items:
-                    vals = [float(x) for x in closes if x is not None and np.isfinite(float(x))]
-                    if not sym or not vals:
-                        continue
-                    prev = meta.get("previousClose")
-                    if prev is None and len(vals) >= 2:
-                        prev = vals[-2]
-                    out[str(sym)] = {"price": vals[-1], "prev": float(prev) if prev else None}
-                _YAHOO_LAST_ERRORS.pop("spark", None)
-                break
-            except Exception as exc:
-                _YAHOO_LAST_ERRORS["spark"] = f"{host}: {type(exc).__name__}: {str(exc)[:200]}"
-    return out
-
-
-def render_scanner_diagnostics():
-    """Shows exactly what Yahoo returned for the scanner so a failure can be diagnosed in seconds."""
-    with st.expander("Scanner data diagnostics (open this if prices are N/A)", expanded=False):
-        st.caption("Press the test to see what Yahoo answers from THIS server. HTTP 200 = reachable; 429 = rate-limited; "
-                   "403 = server IP blocked; connection error = no outbound access to Yahoo.")
-        if st.button("Test Yahoo connection now", key="scanner_yahoo_diag_test"):
-            rows = []
-            hdr = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0 Safari/537.36",
-                   "Accept": "application/json,text/plain,*/*"}
-            for label, url, prm in (
-                ("Chart API (query1)", "https://query1.finance.yahoo.com/v8/finance/chart/RELIANCE.NS", {"range": "5d", "interval": "1d"}),
-                ("Chart API (query2)", "https://query2.finance.yahoo.com/v8/finance/chart/RELIANCE.NS", {"range": "5d", "interval": "1d"}),
-                ("Spark API", "https://query1.finance.yahoo.com/v8/finance/spark", {"symbols": "RELIANCE.NS,TCS.NS", "range": "5d", "interval": "1d"}),
-            ):
-                t0 = pytime.time()
-                try:
-                    r = requests.get(url, params=prm, headers=hdr, timeout=(4, 8))
-                    rows.append({"Test": label, "Result": f"HTTP {r.status_code}", "Seconds": round(pytime.time() - t0, 2),
-                                 "Response start": r.text[:160].replace("\n", " ")})
-                except Exception as exc:
-                    rows.append({"Test": label, "Result": f"{type(exc).__name__}", "Seconds": round(pytime.time() - t0, 2),
-                                 "Response start": str(exc)[:160]})
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-        errs = [{"Ticker": t, "Last Yahoo error": _YAHOO_LAST_ERRORS[t]} for t in list(NIFTY_TOP30.values()) + ["spark"]
-                if t in _YAHOO_LAST_ERRORS]
-        if errs:
-            st.markdown("**Last recorded errors**")
-            st.dataframe(pd.DataFrame(errs), use_container_width=True, hide_index=True)
-        else:
-            st.caption("No fetch errors recorded for the scanner symbols since the app started.")
 
 
 def _market_quote_from_frames(name, ticker_used, intraday_frame, daily_frame, fallback_label=None):
@@ -3161,20 +3006,8 @@ def render_live_global_india_market_board():
     st.caption("Source: Yahoo Finance. Yahoo latency varies by instrument. GIFT Nifty proxy is labelled separately and is not represented as a futures quote.")
 
 
-def build_nifty_top30_scanner():
-    """Cached scanner. A result with no prices at all is dropped from the cache so the next
-    press of the refresh button really re-fetches instead of replaying the failure."""
-    result = _build_nifty_top30_scanner_cached()
-    try:
-        if result is None or result.empty or result["CMP"].notna().sum() == 0:
-            _build_nifty_top30_scanner_cached.clear()
-    except Exception:
-        pass
-    return result
-
-
 @st.cache_data(ttl=60, show_spinner=False)
-def _build_nifty_top30_scanner_cached():
+def build_nifty_top30_scanner():
     rows = []
     intervals = {"3m": "3min", "5m": "5min", "10m": "10min", "15m": "15min"}
     symbols = tuple(NIFTY_TOP30.values())
@@ -3183,12 +3016,6 @@ def _build_nifty_top30_scanner_cached():
     intraday_data = fetch_yahoo_batch(symbols, "1m", "7d")
     daily_data = fetch_yahoo_batch(symbols, "1d", "5d")
 
-    # One-request quote fallback for symbols that have neither intraday nor daily candles.
-    _no_candles = [t for t in symbols
-                   if (intraday_data.get(t) is None or intraday_data[t].empty)
-                   and (daily_data.get(t) is None or daily_data[t].empty)]
-    spark_quotes = _yahoo_spark_quotes(_no_candles) if _no_candles else {}
-
     for company, ticker_symbol in NIFTY_TOP30.items():
         try:
             intraday = intraday_data.get(ticker_symbol, pd.DataFrame())
@@ -3196,12 +3023,6 @@ def _build_nifty_top30_scanner_cached():
             cmp = np.nan
             pct = np.nan
             status = "N/A"
-            if intraday.empty and daily.empty and ticker_symbol in spark_quotes:
-                _sq = spark_quotes[ticker_symbol]
-                cmp = float(_sq["price"])
-                if _sq.get("prev"):
-                    pct = (cmp - float(_sq["prev"])) / float(_sq["prev"]) * 100.0
-                status = "Quote only (Yahoo spark; no candles for trend)"
 
             if not intraday.empty:
                 cmp = float(intraday["Close"].iloc[-1])
@@ -3248,9 +3069,6 @@ def _build_nifty_top30_scanner_cached():
                 "Overall": "N/A", "Score": 0, "Data Status": f"Error: {str(exc)[:100]}"
             })
     return pd.DataFrame(rows)
-
-
-build_nifty_top30_scanner.clear = _build_nifty_top30_scanner_cached.clear
 
 
 def scanner_breadth_summary(scanner_df):
@@ -3341,9 +3159,7 @@ def render_nifty_scanner_result(scanner_df):
         else:
             st.info("No top bearish candidate currently.")
     if scanner_df["CMP"].notna().sum() == 0:
-        st.warning("Scanner ran, but Yahoo returned no valid prices for any constituent. The table shows N/A rather than invented values. "
-                   "Open 'Scanner data diagnostics' below and press 'Test Yahoo connection now' to see why.")
-    render_scanner_diagnostics()
+        st.warning("Scanner ran, but Yahoo returned no valid prices for any constituent. The table shows N/A rather than invented values.")
 
 
 # =========================================================
