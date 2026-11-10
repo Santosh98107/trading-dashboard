@@ -17,8 +17,40 @@ import requests
 import streamlit as st
 import yfinance as yf
 import institutional_upgrades as inst
+import inspect as _inspect
+
+
+def _install_streamlit_compat():
+    """Newer Streamlit releases removed `use_container_width`; translate it to width="stretch"
+    so the same code runs on old and new Streamlit versions."""
+    for _name in ("dataframe", "plotly_chart", "button", "form_submit_button", "download_button", "data_editor", "table"):
+        _fn = getattr(st, _name, None)
+        if _fn is None or getattr(_fn, "_compat_wrapped", False):
+            continue
+        try:
+            _params = _inspect.signature(_fn).parameters
+        except (TypeError, ValueError):
+            continue
+        if "use_container_width" in _params or "width" not in _params:
+            continue
+
+        def _make(fn):
+            def _wrapped(*args, **kwargs):
+                if "use_container_width" in kwargs:
+                    _stretch = kwargs.pop("use_container_width")
+                    kwargs.setdefault("width", "stretch" if _stretch else "content")
+                return fn(*args, **kwargs)
+            _wrapped._compat_wrapped = True
+            return _wrapped
+        try:
+            setattr(st, _name, _make(_fn))
+        except Exception:
+            pass
+
+
+_install_streamlit_compat()
 # Visible deployment marker: confirms which source file Streamlit Cloud is running.
-APP_BUILD_ID = "2026-11-09-YAHOO-CHART-API-ROBUST-FIX-05"
+APP_BUILD_ID = "2026-11-10-LOGIN-DATA-COMPAT-FINAL-06"
 # Optional integrations: Yahoo mode must still start if Angel SDK/TOTP or
 # the auto-refresh helper is not installed.
 try:
@@ -720,6 +752,9 @@ def _yahoo_chart_api_frame(ticker, interval, period):
         url = f"https://{host}/v8/finance/chart/{quote(str(ticker), safe='^.-')}"
         try:
             response = requests.get(url, params=params, headers=headers, timeout=(4, 9))
+            if response.status_code == 429:   # rate limited: brief pause, retry once
+                pytime.sleep(1.2)
+                response = requests.get(url, params=params, headers=headers, timeout=(4, 9))
             response.raise_for_status()
             payload = response.json()
             chart = payload.get("chart", {})
@@ -756,7 +791,7 @@ def _yahoo_chart_api_frame(ticker, interval, period):
 
 
 @st.cache_data(ttl=8, show_spinner=False)
-def fetch_data(ticker, interval, period):
+def _fetch_data_raw(ticker, interval, period):
     """Reliable Yahoo OHLCV loader: chart endpoint first, yfinance as fallback."""
     global _YAHOO_FETCH_DIAGNOSTICS
     needed = ["Open", "High", "Low", "Close", "Volume"]
@@ -846,6 +881,45 @@ def fetch_data(ticker, interval, period):
         _YAHOO_FETCH_DIAGNOSTICS = {"status": "failed", "source": None, "rows": 0, "error": message}
         log_app_error("fetch_data", message)
         return pd.DataFrame()
+
+
+_LAST_GOOD_FRAMES = {}
+_YAHOO_DIAG_BY_KEY = {}
+
+
+def fetch_data(ticker, interval, period):
+    """Resilient wrapper: retries wider ranges when Yahoo returns nothing, and falls back to the
+    last good candles (clearly labelled stale) so the app never goes blank on a temporary Yahoo failure."""
+    key = (str(ticker), str(interval), str(period))
+    frame = _fetch_data_raw(ticker, interval, period)
+    diag = dict(_YAHOO_FETCH_DIAGNOSTICS)
+    if (frame is None or frame.empty) and str(interval) in ("1m", "2m", "5m"):
+        for alt_period in ("5d", "1mo"):
+            if alt_period == str(period):
+                continue
+            alt = _fetch_data_raw(ticker, interval, alt_period)
+            if alt is not None and not alt.empty:
+                frame, diag = alt, dict(_YAHOO_FETCH_DIAGNOSTICS)
+                break
+    if frame is not None and not frame.empty:
+        _LAST_GOOD_FRAMES[key] = frame.copy()
+        diag["rows"] = int(len(frame))
+        diag["last_candle"] = str(frame.index[-1])
+        diag["source"] = diag.get("source") or "Yahoo Finance"
+        _YAHOO_DIAG_BY_KEY[key] = diag
+        return frame
+    stale = _LAST_GOOD_FRAMES.get(key)
+    if stale is not None and not stale.empty:
+        _YAHOO_DIAG_BY_KEY[key] = {
+            "status": "stale", "source": "Yahoo (last good data, live refresh failed)",
+            "rows": int(len(stale)), "last_candle": str(stale.index[-1]), "error": diag.get("error"),
+        }
+        return stale.copy()
+    _YAHOO_DIAG_BY_KEY[key] = diag
+    return pd.DataFrame()
+
+
+fetch_data.clear = _fetch_data_raw.clear
 
 
 @st.cache_data(ttl=5, show_spinner=False)
@@ -6561,7 +6635,7 @@ else:
     with st.spinner(f"Yahoo Finance: loading {ticker} ({yf_interval})…"):
         data = fetch_data(ticker, yf_interval, yf_period)
     yahoo_primary_rows = int(len(data))
-    _yahoo_diag = dict(_YAHOO_FETCH_DIAGNOSTICS)
+    _yahoo_diag = dict(_YAHOO_DIAG_BY_KEY.get((str(ticker), str(yf_interval), str(yf_period)), _YAHOO_FETCH_DIAGNOSTICS))
     if data.empty:
         st.error(
             f"Yahoo OHLC fetch failed for {ticker} / {yf_interval}. "
@@ -6571,9 +6645,10 @@ else:
         )
     else:
         st.caption(
-            f"Yahoo data: {_yahoo_diag.get('source', 'Yahoo')} | "
-            f"{_yahoo_diag.get('rows', len(data))} candles | "
-            f"Last candle: {_yahoo_diag.get('last_candle', str(data.index[-1]))}"
+            f"Yahoo data: {_yahoo_diag.get('source') or 'Yahoo Finance'} | "
+            f"{len(data)} candles | "
+            f"Last candle: {data.index[-1]}"
+            + (" | STALE: live refresh failed, showing last good data" if _yahoo_diag.get("status") == "stale" else "")
         )
     if data.empty and _angel_credentials_ready:
         # Optional failover if Yahoo is temporarily unavailable but the user has
