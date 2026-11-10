@@ -2358,9 +2358,10 @@ def _normalize_yahoo_frame(frame):
     return df[needed + ["Volume"]].loc[~df.index.duplicated(keep="last")].sort_index()
 
 
-@st.cache_data(ttl=30, show_spinner=False)
-def fetch_yahoo_batch(tickers, interval, period):
-    """Fetch many Yahoo tickers in one HTTP batch and return {ticker: OHLCV}.
+def _fetch_yahoo_batch_yfinance(tickers, interval, period):
+    """yfinance batch download (now only the FALLBACK path; see fetch_yahoo_batch below).
+
+    Fetch many Yahoo tickers in one HTTP batch and return {ticker: OHLCV}.
 
     This replaces 60 serial downloads in the NIFTY-30 scanner with two batch
     requests (one intraday, one daily). Failed symbols stay empty; no values are
@@ -2412,6 +2413,75 @@ def fetch_yahoo_batch(tickers, interval, period):
     except Exception as exc:
         log_app_error("fetch_yahoo_batch", exc)
         return empty_result
+
+
+def _fetch_yahoo_batch_direct(tickers, interval, period, max_workers=6):
+    """Fetch each ticker from Yahoo's chart endpoint in parallel threads.
+
+    This is the same endpoint the main chart uses successfully. yfinance's batch download
+    often returns nothing on cloud hosts (cookie/crumb or rate-limit blocks), which is why the
+    scanner / market board / macro snapshot stayed empty even when single-symbol charts worked."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    ticker_list = [str(t).strip() for t in tickers if str(t).strip()]
+    results = {t: pd.DataFrame() for t in ticker_list}
+    if not ticker_list:
+        return results
+
+    def _one(tk):
+        frame, err = _yahoo_chart_api_frame(tk, interval, period)
+        if (frame is None or frame.empty) and err and "temporarily skipped" not in str(err):
+            pytime.sleep(0.4)                     # one gentle retry for transient 429/timeouts
+            frame, err = _yahoo_chart_api_frame(tk, interval, period)
+        return tk, frame
+
+    try:
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = [pool.submit(_one, tk) for tk in ticker_list]
+            for fut in as_completed(futures, timeout=40):
+                try:
+                    tk, frame = fut.result()
+                    if frame is not None and not frame.empty:
+                        results[tk] = _normalize_yahoo_frame(frame)
+                except Exception as exc:
+                    log_app_error("fetch_yahoo_batch_direct", f"{type(exc).__name__}: {exc}")
+    except Exception as exc:
+        log_app_error("fetch_yahoo_batch_direct", f"{type(exc).__name__}: {exc}")
+    return results
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _fetch_yahoo_batch_cached(tickers, interval, period):
+    ticker_list = tuple(str(t).strip() for t in tickers if str(t).strip())
+    results = _fetch_yahoo_batch_direct(ticker_list, interval, period)
+    missing = tuple(t for t in ticker_list if results.get(t) is None or results[t].empty)
+    # yfinance only for symbols the direct endpoint could not supply (and only when the
+    # direct path is not completely down, to avoid doubling the wait on a dead network).
+    if missing and len(missing) < len(ticker_list):
+        fallback = _fetch_yahoo_batch_yfinance(missing, interval, period)
+        for t in missing:
+            if fallback.get(t) is not None and not fallback[t].empty:
+                results[t] = fallback[t]
+    elif missing and len(missing) == len(ticker_list):
+        results = _fetch_yahoo_batch_yfinance(ticker_list, interval, period)
+    return results
+
+
+def fetch_yahoo_batch(tickers, interval, period):
+    """Return {ticker: OHLCV}. Direct Yahoo chart API first, yfinance as fallback.
+
+    A completely empty result is NOT kept in the cache (it used to be cached for 30 s, so a
+    single blocked request made the scanner look dead even after pressing refresh)."""
+    ticker_list = tuple(str(t).strip() for t in tickers if str(t).strip())
+    result = _fetch_yahoo_batch_cached(ticker_list, str(interval), str(period))
+    if ticker_list and all((result.get(t) is None or result[t].empty) for t in ticker_list):
+        try:
+            _fetch_yahoo_batch_cached.clear()
+        except Exception:
+            pass
+    return result
+
+
+fetch_yahoo_batch.clear = _fetch_yahoo_batch_cached.clear
 
 
 def _market_quote_from_frames(name, ticker_used, intraday_frame, daily_frame, fallback_label=None):
@@ -3006,8 +3076,20 @@ def render_live_global_india_market_board():
     st.caption("Source: Yahoo Finance. Yahoo latency varies by instrument. GIFT Nifty proxy is labelled separately and is not represented as a futures quote.")
 
 
-@st.cache_data(ttl=60, show_spinner=False)
 def build_nifty_top30_scanner():
+    """Cached scanner. A result with no prices at all is dropped from the cache so the next
+    press of the refresh button really re-fetches instead of replaying the failure."""
+    result = _build_nifty_top30_scanner_cached()
+    try:
+        if result is None or result.empty or result["CMP"].notna().sum() == 0:
+            _build_nifty_top30_scanner_cached.clear()
+    except Exception:
+        pass
+    return result
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _build_nifty_top30_scanner_cached():
     rows = []
     intervals = {"3m": "3min", "5m": "5min", "10m": "10min", "15m": "15min"}
     symbols = tuple(NIFTY_TOP30.values())
@@ -3069,6 +3151,9 @@ def build_nifty_top30_scanner():
                 "Overall": "N/A", "Score": 0, "Data Status": f"Error: {str(exc)[:100]}"
             })
     return pd.DataFrame(rows)
+
+
+build_nifty_top30_scanner.clear = _build_nifty_top30_scanner_cached.clear
 
 
 def scanner_breadth_summary(scanner_df):
