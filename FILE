@@ -7927,8 +7927,10 @@ def ai_lab_open_positions(journal):
     side = df["Side"].astype(str).str.upper() if "Side" in df.columns else pd.Series("BUY", index=df.index)
     df["Side"] = np.where(side.isin(["BUY", "SELL"]), side, np.where(df["Signal"].astype(str).str.upper().str.contains("SELL"), "SELL", "BUY"))
     df["sgn"] = np.where(df["Side"] == "BUY", 1.0, -1.0)
-    stop = df["TrailingStop"].where(df["TrailingStop"].notna() & (df["TrailingStop"] > 0), df["StopLoss"])
-    df["Stop"] = stop
+    # Same rule as the exit engine: the effective stop is the TIGHTER of stop-loss and trailing stop
+    # (higher for BUY, lower for SELL).
+    _both = pd.concat([df["StopLoss"].where(df["StopLoss"] > 0), df["TrailingStop"].where(df["TrailingStop"] > 0)], axis=1)
+    df["Stop"] = np.where(df["sgn"] > 0, _both.max(axis=1), _both.min(axis=1))
     df["Notional"] = (df["Price"] * df["Qty"]).abs()
     df["OpenPnL"] = df["sgn"] * (df["Price"] - df["EntryPrice"]) * df["Qty"]
     risk = df["sgn"] * (df["Price"] - df["Stop"]) * df["Qty"]
