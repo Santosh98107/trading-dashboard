@@ -50,7 +50,7 @@ def _install_streamlit_compat():
 
 _install_streamlit_compat()
 # Visible deployment marker: confirms which source file Streamlit Cloud is running.
-APP_BUILD_ID = "2026-11-10-FINAL-FAST-09-PRICEFIX"
+APP_BUILD_ID = "2026-11-12-FINAL-FAST-10-NAV"
 # Optional integrations: Yahoo mode must still start if Angel SDK/TOTP or
 # the auto-refresh helper is not installed.
 try:
@@ -7927,8 +7927,10 @@ def ai_lab_open_positions(journal):
     side = df["Side"].astype(str).str.upper() if "Side" in df.columns else pd.Series("BUY", index=df.index)
     df["Side"] = np.where(side.isin(["BUY", "SELL"]), side, np.where(df["Signal"].astype(str).str.upper().str.contains("SELL"), "SELL", "BUY"))
     df["sgn"] = np.where(df["Side"] == "BUY", 1.0, -1.0)
-    stop = df["TrailingStop"].where(df["TrailingStop"].notna() & (df["TrailingStop"] > 0), df["StopLoss"])
-    df["Stop"] = stop
+    # Same rule as the exit engine: the effective stop is the TIGHTER of stop-loss and trailing stop
+    # (higher for BUY, lower for SELL).
+    _both = pd.concat([df["StopLoss"].where(df["StopLoss"] > 0), df["TrailingStop"].where(df["TrailingStop"] > 0)], axis=1)
+    df["Stop"] = np.where(df["sgn"] > 0, _both.max(axis=1), _both.min(axis=1))
     df["Notional"] = (df["Price"] * df["Qty"]).abs()
     df["OpenPnL"] = df["sgn"] * (df["Price"] - df["EntryPrice"]) * df["Qty"]
     risk = df["sgn"] * (df["Price"] - df["Stop"]) * df["Qty"]
@@ -8103,8 +8105,28 @@ def ai_lab_copilot_answer(question, ctx):
 # =========================================================
 # AI LAB - USER INTERFACE
 # =========================================================
+AL_ALL_TABS = ["Weakness", "Strengths", "Strategy Builder", "Evolution", "Self-Learning", "Weekly Report",
+               "Calibration", "Prediction Accuracy", "Copilot", "Trade Replay", "Opportunities", "Portfolio Risk"]
+# Which AI Lab tabs appear on which page of the app.
+AL_VIEWS = {
+    "command": ["Copilot", "Weakness", "Strengths", "Self-Learning", "Calibration", "Prediction Accuracy"],
+    "scanner": ["Opportunities"],
+    "research": ["Strategy Builder", "Evolution"],
+    "replay": ["Trade Replay"],
+    "reports": ["Weekly Report"],
+    "portfolio": ["Portfolio Risk"],
+}
+_AL_LABEL_TAB = {"weakness": "Weakness", "strengths": "Strengths", "strategy_builder": "Strategy Builder", "evolution": "Evolution",
+                 "self_learning": "Self-Learning", "weekly_report": "Weekly Report", "calibration": "Calibration",
+                 "prediction_accuracy": "Prediction Accuracy", "copilot": "Copilot", "trade_replay": "Trade Replay",
+                 "opportunities": "Opportunities", "portfolio_risk": "Portfolio Risk"}
+_AL_ACTIVE = set(AL_ALL_TABS)
+
+
 def _al_safe(label, fn):
     """Run one tab body; a failure in one feature never breaks the page or the other tabs."""
+    if _AL_LABEL_TAB.get(label) not in _AL_ACTIVE:
+        return                       # this tab is not shown on the current page
     try:
         fn()
     except Exception as exc:
@@ -8117,22 +8139,33 @@ def _al_money(v):
     return f"{v:,.2f}" if np.isfinite(v) else "n/a"
 
 
-def render_ai_lab(selected, timeframe, data, analysis, backtest_trades_df):
-    st.divider()
-    st.header("AI Lab - Trader Intelligence")
-    st.caption("Everything here is computed from your own journal, signal log, backtest and candles. Small samples are labelled; nothing is invented. "
-               "Learning features are research aids: they do not change the live signal engine.")
+def render_ai_lab(selected, timeframe, data, analysis, backtest_trades_df, view="all", show_header=True):
+    """view = 'all' renders the 12 tabs together; otherwise only the tabs that belong on that page."""
+    global _AL_ACTIVE
+    from contextlib import nullcontext
+    names = AL_ALL_TABS if view == "all" else AL_VIEWS[view]
+    _AL_ACTIVE = set(names)
+    if show_header:
+        st.divider()
+        st.header("AI Lab - Trader Intelligence")
+        st.caption("Everything here is computed from your own journal, signal log, backtest and candles. Small samples are labelled; nothing is invented. "
+                   "Learning features are research aids: they do not change the live signal engine.")
     journal = load_journal()
     closed = _al_memo("closed", _al_journal_sig(journal), lambda: _al_closed_trades(journal))
     n_closed = 0 if closed is None or closed.empty else len(closed)
     have_data = isinstance(data, pd.DataFrame) and not data.empty
     bt_feat = _al_bt_features(backtest_trades_df) if isinstance(backtest_trades_df, pd.DataFrame) else pd.DataFrame()
-    model = ai_lab_get_model(journal)
-    st.caption(f"Closed journal trades available: {n_closed} | Simulated backtest trades: {len(bt_feat)} | "
-               f"Self-learning model: {'active' if model.get('status') == 'active' else 'learning'}")
+    model = ai_lab_get_model(journal) if view in ("all", "command", "scanner") else {"status": "learning", "n": 0, "need": AI_LAB_MIN_MODEL_TRADES}
+    if view in ("all", "command"):
+        st.caption(f"Closed journal trades available: {n_closed} | Simulated backtest trades: {len(bt_feat)} | "
+                   f"Self-learning model: {'active' if model.get('status') == 'active' else 'learning'}")
+    if len(names) == 1:
+        _tab_objs = {names[0]: st.container()}
+    else:
+        _tab_objs = dict(zip(names, st.tabs(names)))
 
-    tabs = st.tabs(["Weakness", "Strengths", "Strategy Builder", "Evolution", "Self-Learning", "Weekly Report",
-                    "Calibration", "Prediction Accuracy", "Copilot", "Trade Replay", "Opportunities", "Portfolio Risk"])
+    def _T(name):
+        return _tab_objs.get(name) or nullcontext()
 
     # ---------- shared (cached) values ----------
     def get_eval(h):
@@ -8153,11 +8186,12 @@ def render_ai_lab(selected, timeframe, data, analysis, backtest_trades_df):
         r = ev[ev["Status"] == "Resolved"]
         return pd.DataFrame({"confidence": r["Confidence"], "outcome": r["Direction OK"].astype(float)})
 
-    weak_summary, weak_per, worst = ai_lab_weakness(closed) if n_closed else (pd.DataFrame(), pd.DataFrame(), None)
-    str_tables, str_best = ai_lab_strength(closed) if n_closed else ({}, {})
+    _need_coach = view in ("all", "command") and n_closed > 0
+    weak_summary, weak_per, worst = ai_lab_weakness(closed) if _need_coach else (pd.DataFrame(), pd.DataFrame(), None)
+    str_tables, str_best = ai_lab_strength(closed) if _need_coach else ({}, {})
 
     # ---------- 1. WEAKNESS ----------
-    with tabs[0]:
+    with _T("Weakness"):
         def body():
             st.subheader("Personal Weakness Analyzer")
             if not n_closed:
@@ -8183,7 +8217,7 @@ def render_ai_lab(selected, timeframe, data, analysis, backtest_trades_df):
         _al_safe("weakness", body)
 
     # ---------- 2. STRENGTH ----------
-    with tabs[1]:
+    with _T("Strengths"):
         def body():
             st.subheader("Personal Strength Analyzer")
             if n_closed:
@@ -8215,7 +8249,7 @@ def render_ai_lab(selected, timeframe, data, analysis, backtest_trades_df):
         _al_safe("strengths", body)
 
     # ---------- 3. STRATEGY BUILDER ----------
-    with tabs[2]:
+    with _T("Strategy Builder"):
         def body():
             st.subheader("Auto Strategy Builder")
             st.caption("Searches 240 simple filter combinations (RSI, ADX, EMA alignment, volume spike, MACD) on the older 70% of simulated trades, "
@@ -8248,7 +8282,7 @@ def render_ai_lab(selected, timeframe, data, analysis, backtest_trades_df):
         _al_safe("strategy_builder", body)
 
     # ---------- 4. EVOLUTION ----------
-    with tabs[3]:
+    with _T("Evolution"):
         def body():
             st.subheader("Strategy Evolution (weekly)")
             st.caption("Once per ISO week (and per symbol/timeframe) the builder re-optimises, re-ranks and stores a snapshot, then shows what changed since last week.")
@@ -8270,7 +8304,7 @@ def render_ai_lab(selected, timeframe, data, analysis, backtest_trades_df):
         _al_safe("evolution", body)
 
     # ---------- 5. SELF LEARNING ----------
-    with tabs[4]:
+    with _T("Self-Learning"):
         def body():
             st.subheader("Self-Learning Engine")
             if model.get("status") != "active":
@@ -8303,7 +8337,7 @@ def render_ai_lab(selected, timeframe, data, analysis, backtest_trades_df):
         _al_safe("self_learning", body)
 
     # ---------- 6. WEEKLY REPORT ----------
-    with tabs[5]:
+    with _T("Weekly Report"):
         def body():
             st.subheader("Weekly AI Report")
             if not n_closed:
@@ -8349,7 +8383,7 @@ def render_ai_lab(selected, timeframe, data, analysis, backtest_trades_df):
         _al_safe("weekly_report", body)
 
     # ---------- 7. CALIBRATION ----------
-    with tabs[6]:
+    with _T("Calibration"):
         def body():
             st.subheader("Confidence Calibration")
             st.caption("Compares the confidence the app printed with how often those signals actually worked.")
@@ -8378,7 +8412,7 @@ def render_ai_lab(selected, timeframe, data, analysis, backtest_trades_df):
         _al_safe("calibration", body)
 
     # ---------- 8. PREDICTION ACCURACY ----------
-    with tabs[7]:
+    with _T("Prediction Accuracy"):
         def body():
             st.subheader("Prediction Accuracy Dashboard")
             if not have_data:
@@ -8406,7 +8440,7 @@ def render_ai_lab(selected, timeframe, data, analysis, backtest_trades_df):
         _al_safe("prediction_accuracy", body)
 
     # ---------- 9. COPILOT ----------
-    with tabs[8]:
+    with _T("Copilot"):
         def body():
             st.subheader("AI Copilot")
             st.caption("Answers come from the app's own scores, levels and your journal (rule-based, no external AI, so it cannot invent facts).")
@@ -8440,7 +8474,7 @@ def render_ai_lab(selected, timeframe, data, analysis, backtest_trades_df):
         _al_safe("copilot", body)
 
     # ---------- 10. TRADE REPLAY ----------
-    with tabs[9]:
+    with _T("Trade Replay"):
         def body():
             st.subheader("Trade Replay")
             if not have_data:
@@ -8520,7 +8554,7 @@ def render_ai_lab(selected, timeframe, data, analysis, backtest_trades_df):
         _al_safe("trade_replay", body)
 
     # ---------- 11. OPPORTUNITIES ----------
-    with tabs[10]:
+    with _T("Opportunities"):
         def body():
             st.subheader("Opportunity Ranking - Top Trades Today")
             st.caption("Scores NIFTY, BANKNIFTY, SENSEX and the stock list on 5-minute candles: Quality (trend stack, ADX, volume, RSI zone, VWAP, SuperTrend), "
@@ -8550,7 +8584,7 @@ def render_ai_lab(selected, timeframe, data, analysis, backtest_trades_df):
         _al_safe("opportunities", body)
 
     # ---------- 12. PORTFOLIO RISK ----------
-    with tabs[11]:
+    with _T("Portfolio Risk"):
         def body():
             st.subheader("Portfolio Risk Analyzer")
             pos = ai_lab_open_positions(journal)
@@ -8631,10 +8665,141 @@ st.title("Elite Trading Dashboard Final Ultimate")
 st.caption("WebSocket Primary | Upstox V3 | REST Fallback | Walk Forward | Auto Exit | News Filter | Dynamic Option Chain")
 st.sidebar.caption(f"App build: {APP_BUILD_ID}")
 
+# =========================================================
+# APP NAVIGATION - 10 pages. Nothing was removed: every existing section is routed into one of these page
+# containers (in its original order) and only the selected page is visible. Widgets on hidden pages keep
+# their state, and the live-data / auto-refresh logic keeps running on every page.
+# =========================================================
+_EC_PAGE_DEFS = [
+    ("Dashboard", "🏠 Dashboard", "Live price, signal and headline numbers at a glance."),
+    ("Market", "📈 Market", "Global and Indian market board, charts, multi-timeframe view, news and options."),
+    ("Signals", "🎯 Signals", "Why the engine says BUY, SELL or WAIT: scoring, validation and institutional checks."),
+    ("Scanner", "🔍 Scanner", "NIFTY Top 30 scanner and the AI opportunity ranking."),
+    ("Portfolio", "💼 Portfolio", "Risk limits, paper trading, open positions and portfolio risk."),
+    ("AI Command Center", "🤖 AI Command Center", "Copilot, trade coach, weaknesses and strengths, self-learning and prediction accuracy."),
+    ("Research Lab", "🧪 Research Lab", "Backtests, walk-forward, optimiser, strategy builder and the learning lab."),
+    ("Trade Replay", "🎮 Trade Replay", "Replay past trades candle by candle and see what could have been done better."),
+    ("Reports", "📊 Reports", "Journal analytics, daily / weekly / monthly reports, exports and the weekly AI report."),
+    ("Settings", "⚙ Settings", "Data providers, API keys, alerts, news filters and signal weights."),
+]
+_EC_LABELS = [d[1] for d in _EC_PAGE_DEFS]
+_ec_page_label = st.radio("Navigation", _EC_LABELS, horizontal=True, key="ec_nav_page", label_visibility="collapsed")
+_ec_active = next((d[0] for d in _EC_PAGE_DEFS if d[1] == _ec_page_label), "Dashboard")
+
+_ec_css = ["""
+.st-key-ec_nav_page div[role="radiogroup"]{gap:.4rem;flex-wrap:wrap;}
+.st-key-ec_nav_page label{border:1px solid rgba(128,128,128,.35);border-radius:999px;padding:.25rem .85rem;margin:0 !important;cursor:pointer;}
+.st-key-ec_nav_page label > div:first-child{display:none;}
+.st-key-ec_nav_page label:has(input:checked){background:rgba(255,75,75,.16);border-color:#ff4b4b;font-weight:600;}
+[data-testid="stElementContainer"]:has(> [data-testid="stMarkdown"] .ec-pg){display:none !important;}
+.element-container:has(.ec-pg){display:none !important;}
+"""]
+for _i, _d in enumerate(_EC_PAGE_DEFS):
+    if _d[0] != _ec_active:
+        _ec_css.append(f".st-key-ec_pg_{_i}{{display:none !important;}}")
+        _ec_css.append(f'[data-testid="stVerticalBlock"]:has(> [data-testid="stElementContainer"] > [data-testid="stMarkdown"] .ec-pg-{_i}){{display:none !important;}}')
+        _ec_css.append(f'[data-testid="stVerticalBlock"]:has(> .element-container .ec-pg-{_i}){{display:none !important;}}')
+st.markdown("<style>" + "\n".join(_ec_css) + "</style>", unsafe_allow_html=True)
+
+
+def _ec_new_container(key):
+    try:
+        return st.container(key=key)           # keyed containers (newer Streamlit) can be targeted by CSS
+    except TypeError:
+        return st.container()                  # older Streamlit: the hidden marker below is used instead
+
+
+_EC_ALWAYS = _ec_new_container("ec_pg_always")  # shown on every page: symbol / source / timeframe and refresh controls
+_EC_CONTAINERS = {}
+_EC_DASH_TOP = None
+for _i, (_key, _label, _desc) in enumerate(_EC_PAGE_DEFS):
+    _c = _ec_new_container(f"ec_pg_{_i}")
+    with _c:
+        st.markdown(f'<span class="ec-pg ec-pg-{_i}"></span>', unsafe_allow_html=True)
+        st.header(_label)
+        st.caption(_desc)
+        if _key == "Dashboard":
+            _EC_DASH_TOP = st.container()      # headline strip, filled in once the analysis is ready
+    _EC_CONTAINERS[_key] = _c
+_EC_ACTIVE_CTX = None
+
+
+def _ec_section(name):
+    """Route everything rendered from here on into a page. Only ever called between top-level statements."""
+    global _EC_ACTIVE_CTX
+    if _EC_ACTIVE_CTX is not None:
+        try:
+            _EC_ACTIVE_CTX.__exit__(None, None, None)
+        except Exception:
+            pass
+        _EC_ACTIVE_CTX = None
+    target = _EC_ALWAYS if name == "__always__" else _EC_CONTAINERS.get(name)
+    if target is not None:
+        target.__enter__()
+        _EC_ACTIVE_CTX = target
+
+
+try:                                            # charts drawn while hidden need a resize nudge when their page is shown
+    import streamlit.components.v1 as _ec_components
+    with _EC_ALWAYS:
+        _ec_components.html("<script>setTimeout(function(){try{window.parent.dispatchEvent(new Event('resize'));}catch(e){}},400);</script>", height=0)
+except Exception:
+    pass
+
+
+def _ec_render_dashboard_strip(selected, timeframe, analysis, data):
+    """Headline numbers at the top of the Dashboard page (additive; reads existing values only)."""
+    if _EC_DASH_TOP is None or _ec_active != "Dashboard":
+        return
+    try:
+        with _EC_DASH_TOP:
+            journal = load_journal()
+            price = globals().get("current_display_price")
+            if (price is None or not np.isfinite(_al_num(price))) and isinstance(data, pd.DataFrame) and not data.empty:
+                price = float(data["Close"].iloc[-1])
+            pos = ai_lab_open_positions(journal)
+            open_pnl = float(pos["OpenPnL"].fillna(0).sum()) if not pos.empty else 0.0
+            today_pnl = 0.0
+            if journal is not None and not journal.empty and "Status" in journal.columns and "ExitTime" in journal.columns:
+                cl = journal[journal["Status"].astype(str).str.upper() == "CLOSED"]
+                if not cl.empty:
+                    ex = _al_parse_dt(cl["ExitTime"])
+                    today_pnl = float(pd.to_numeric(cl.loc[(ex.dt.date == ist_now().date()).fillna(False), "PnL"], errors="coerce").fillna(0).sum())
+            c = st.columns(6)
+            c[0].metric("Symbol", f"{selected} · {timeframe}")
+            c[1].metric("Price", f"{float(price):,.2f}" if price is not None and np.isfinite(_al_num(price)) else "n/a")
+            c[2].metric("Signal", str(analysis.get("signal_text")) if isinstance(analysis, dict) else "No candles")
+            conf = analysis.get("confidence") if isinstance(analysis, dict) else None
+            c[3].metric("Setup confidence", f"{conf}%" if conf is not None else "n/a")
+            c[4].metric("Open positions", int(len(pos)), f"{open_pnl:+,.2f} open P&L" if len(pos) else None)
+            c[5].metric("Today's realised P&L", f"{today_pnl:+,.2f}")
+            st.caption(f"Data source: {globals().get('active_data_source', 'n/a')} | Page navigation is at the top. "
+                       "Everything that was on the single long page is still here, grouped by page.")
+    except Exception as exc:
+        log_app_error("ec_dashboard_strip", exc)
+
+
+def _ec_render_ai_lab_pages(selected, timeframe, data, analysis, backtest_trades_df):
+    """Place each AI Lab tab on its page. Only the visible page's tabs are computed (keeps the app light)."""
+    plan = [("AI Command Center", "command"), ("Scanner", "scanner"), ("Research Lab", "research"),
+            ("Trade Replay", "replay"), ("Reports", "reports"), ("Portfolio", "portfolio")]
+    for page, view in plan:
+        if page != _ec_active:
+            continue
+        _ec_section(page)
+        try:
+            render_ai_lab(selected, timeframe, data, analysis, backtest_trades_df, view=view, show_header=False)
+        except Exception as _lab_err:
+            log_app_error(f"ai_lab_{view}", _lab_err)
+            st.error(f"AI Lab error: {type(_lab_err).__name__}: {_lab_err}")
+
+
+_ec_section("__always__")
 selected = st.selectbox("Select Stock / Index", list(stocks.keys()))
 data_source = st.radio("Data Source", ["Yahoo", "Angel", "Upstox"], horizontal=True)
 timeframe = st.selectbox("Select Time Frame", ["1m", "3m", "5m", "10m", "15m", "30m", "1h", "1d"])
 
+_ec_section("Settings")
 with st.expander("Upstox API Settings — market data only", expanded=(data_source == "Upstox")):
     st.caption("OAuth 2.0 connection for Upstox market-data APIs. Access token stays in this Streamlit session; this application does not place broker orders.")
     upstox_client_id = st.text_input("Upstox API Key / Client ID", key="upstox_client_id_input")
@@ -8662,6 +8827,7 @@ with st.expander("Upstox API Settings — market data only", expanded=(data_sour
             st.session_state.pop("upstox_connected_at", None)
             st.rerun()
 
+_ec_section("__always__")
 st.subheader("Market Data Refresh Controls")
 refresh_col1, refresh_col2, refresh_col3 = st.columns([1.25, 1.0, 1.0])
 with refresh_col1:
@@ -8712,6 +8878,7 @@ else:
 if auto_refresh and AUTO_REFRESH_AVAILABLE:
     st_autorefresh(interval=refresh_seconds * 1000, key="elite_live_market_board_refresh")
 
+_ec_section("Settings")
 with st.expander("Macro / Geo-political Bias Settings"):
     st.checkbox("Use macro bias in live signals (USD/INR, crude, DXY, US yields, VIX, US/Asia cues)", value=True, key="use_macro_bias")
     st.checkbox("Include geo-political headline scan (Google News RSS, no API key)", value=True, key="use_geo_news")
@@ -8948,6 +9115,7 @@ if all((angel_api_key, angel_client_code, angel_pin, angel_totp_secret)):
     st.session_state["angel_saved_pin"] = angel_pin
     st.session_state["angel_saved_totp_secret"] = angel_totp_secret
 
+_ec_section("Market")
 # This board intentionally renders before the selected OHLC pipeline. It remains
 # visible if Angel/Yahoo chart candles are unavailable later in the script.
 render_live_global_india_market_board()
@@ -9233,6 +9401,7 @@ if data.empty:
     )
     st.subheader("Market Dashboard — awaiting valid OHLC candles")
     st.info("Angel login and quote polling are separate from historical candles. The dashboard will not invent OHLC bars or indicator values when both sources return no usable history.")
+    _ec_section("Scanner")
     st.subheader("Major Stocks Scanner — NIFTY Top 30")
     st.caption("Yahoo Finance scanner: 30 constituents across 3m / 5m / 10m / 15m. It runs separately from the primary candle feed.")
     st.info("The scanner is deliberately not auto-started on a failed main feed. This prevents slow bulk requests from making the whole page appear blank.")
@@ -9253,23 +9422,28 @@ if data.empty:
     else:
         st.dataframe(blank_nifty_scanner_frame(), use_container_width=True, hide_index=True)
         st.caption("Press Run / refresh NIFTY Top 30 scanner to retrieve market data. Prices and trends are not fabricated.")
+    _ec_section("Market")
     st.subheader("Charts and analytics")
     st.info("Heikin-Ashi candles, MACD, RSI, VWAP, ADX, MTF, signal scoring and backtest are paused until a real OHLC history response is received.")
+    _ec_section("Reports")
     st.subheader("Saved Trade Journal")
     try:
         saved_journal = load_journal()
         st.dataframe(saved_journal.tail(100), use_container_width=True, hide_index=True)
     except Exception as journal_error:
         st.error(f"Journal error: {journal_error}")
+    _ec_section("Portfolio")
     st.info("Live ticks may be unavailable outside market hours. Historical candles and live quotes depend on the selected provider and instrument permissions.")
     render_paper_trading_no_data_controls(
         selected, timeframe,
         current_price=(angel_ltp_value if data_source == "Angel" else None)
     )
+    _ec_section("__always__")
     if auto_refresh and AUTO_REFRESH_AVAILABLE:
         st.caption("Auto-refresh remains active for the Global/Macro and Major Indian Stocks market board. The chart waits for valid OHLC candles.")
     elif auto_refresh and not AUTO_REFRESH_AVAILABLE:
         st.warning("Auto-refresh is enabled but streamlit-autorefresh is not installed. Install requirements.txt and redeploy.")
+    _ec_section("AI Command Center")
     # Institutional Analysis, FVG, Relative Strength and the AI Trainer need candles, so they resume
     # automatically once data returns. The journal-based AI Coach does not need candles, so keep it visible.
     st.divider()
@@ -9286,11 +9460,8 @@ if data.empty:
     except Exception as _coach_err:
         log_app_error("ai_coach_no_data", _coach_err)
     # The journal-based AI Lab features do not need candles, so they stay available while data is down.
-    try:
-        render_ai_lab(selected, timeframe, None, None, pd.DataFrame())
-    except Exception as _lab_err:
-        log_app_error("ai_lab_no_data", _lab_err)
-        st.error(f"AI Lab error: {type(_lab_err).__name__}: {_lab_err}")
+    _ec_render_dashboard_strip(selected, timeframe, None, None)
+    _ec_render_ai_lab_pages(selected, timeframe, None, None, pd.DataFrame())
     st.stop()
 
 if active_data_source != data_source:
@@ -9463,6 +9634,7 @@ if not _trainer_allowed:
 stats = compute_trade_statistics(backtest_trades_df, initial_capital=DEFAULT_INITIAL_BALANCE)
 equity_curve_df, max_drawdown = compute_equity_curve_from_trades(backtest_trades_df, initial_capital=DEFAULT_INITIAL_BALANCE)
 
+_ec_section("Signals")
 with st.expander("🏛️ Institutional Signal Participation Audit", expanded=False):
     _inst_audit = analysis.get("institutional_participation_audit", {})
     if _inst_audit:
@@ -9475,6 +9647,7 @@ with st.expander("🏛️ Institutional Signal Participation Audit", expanded=Fa
     else:
         st.info("Institutional audit unavailable for this analysis run.")
 
+_ec_section("AI Command Center")
 with st.expander("🧠 Loss Intelligence & Similar Historical Setups", expanded=True):
     if _trainer_profile and _trainer_profile.get("approved"):
         st.info(f"AI Trainer approved paper filter active: {_trainer_profile.get('rule')} = {_trainer_profile.get('threshold')}. Signal scores are unchanged; only paper eligibility is gated.")
@@ -9564,6 +9737,7 @@ with st.expander("🧠 Loss Intelligence & Similar Historical Setups", expanded=
         else:
             st.warning(ml_result.get("message", "ML training is not available."))
 
+_ec_section("Market")
 if backtest_is_comparable:
     health_score, health_label = strategy_health_monitor(
         analysis["validation_score"],
@@ -9743,6 +9917,7 @@ with st.expander("Candlestick Pattern Library — latest detected patterns"):
     active_patterns = [name for name in pattern_cols if bool(latest_pattern_row.get(name, False))]
     st.write(", ".join(active_patterns) if active_patterns else "No recognized pattern on the latest completed candle.")
 
+_ec_section("Dashboard")
 st.subheader("Live Signal Analytics")
 price_col1, price_col2, price_col3 = st.columns(3)
 with price_col1:
@@ -9803,6 +9978,7 @@ elif analysis["signal_type"] == "sell":
 else:
     st.warning(alert_text)
 
+_ec_section("Signals")
 with st.expander("Signal scoring breakdown and entry blockers", expanded=(analysis.get("signal_type") == "neutral")):
     st.write(f"Directional bias: **{analysis.get('directional_bias', 'Neutral')}** | Bullish score: **{analysis.get('bullish_score', 0)}** | Bearish score: **{analysis.get('bearish_score', 0)}** | Edge: **{analysis.get('directional_edge', 0)}**")
     st.write(f"Trend structure: **BUY {analysis.get('buy_trend_votes', 0)}/{analysis.get('trend_vote_count', 3)}** | **SELL {analysis.get('sell_trend_votes', 0)}/{analysis.get('trend_vote_count', 3)}**")
@@ -9857,6 +10033,7 @@ with sv5:
 with sv6:
     st.metric("Market Regime", analysis["market_regime"])
 
+_ec_section("Market")
 st.subheader("Multi Timeframe Alignment")
 st.dataframe(mtf_table, use_container_width=True)
 m1, m2, m3 = st.columns(3)
@@ -9874,6 +10051,7 @@ elif "Bearish" in mtf_grade:
 else:
     st.warning(mtf_grade)
 
+_ec_section("Dashboard")
 top1, top2, top3, top4 = st.columns(4)
 with top1:
     st.metric("Current Price", round(current_display_price, 2))
@@ -9997,6 +10175,7 @@ with r3:
 with r4:
     st.metric("Signal Quality", signal_quality)
 
+_ec_section("Portfolio")
 st.subheader("Risk Management")
 rk1, rk2, rk3, rk4, rk5 = st.columns(5)
 risk_state = load_risk_state()
@@ -10225,6 +10404,7 @@ else:
     history_cols = [c for c in ["DateTime", "Symbol", "Side", "EntryPrice", "Quantity", "RemainingQty", "ExitPrice", "Status", "RealizedPnL", "PnL", "Result", "LossReason", "Notes"] if c in paper_journal.columns]
     st.dataframe(paper_journal[history_cols].tail(100), use_container_width=True, hide_index=True)
 
+_ec_section("Signals")
 with st.expander("Why this signal? — Explainable Signal Factors", expanded=False):
     ex1, ex2, ex3, ex4 = st.columns(4)
     ex1.metric("Bullish Score", analysis.get("bullish_score", 0))
@@ -10244,6 +10424,7 @@ with st.expander("Why this signal? — Explainable Signal Factors", expanded=Fal
             st.write("-", risk_text)
     st.caption(f"Adaptive confidence score: {analysis.get('confidence', 'N/A')} / 100. This is a ranking score, not a calibrated probability or guarantee.")
 
+_ec_section("Market")
 if news_filter_enabled:
     st.subheader("News Filter Events")
     st.caption(
@@ -10285,6 +10466,7 @@ if news_filter_enabled:
     else:
         st.info(news_info.get("message", "No recent relevant news."))
 
+_ec_section("Scanner")
 st.subheader("Major Stocks Scanner — NIFTY Top 30 | CMP & % Change")
 st.caption("30 major NIFTY constituents scanned on 3m, 5m, 10m and 15m. Yahoo Finance is independent of the primary Angel/Yahoo candle selection.")
 if st.button("Run / refresh NIFTY Top 30 scanner", key="run_scanner_with_main_data"):
@@ -10305,6 +10487,7 @@ else:
     st.dataframe(blank_nifty_scanner_frame(), use_container_width=True, hide_index=True)
     st.info("The 30-stock scanner is ready. Press Run / refresh NIFTY Top 30 scanner to fetch provider data.")
 
+_ec_section("Research Lab")
 st.subheader("Backtest Analytics")
 st.caption(f"Backtest input: {len(backtest_data):,} candles | {backtest_data.index.min()} to {backtest_data.index.max()} | {selected} | {timeframe}")
 if backtest_trades_df.empty:
@@ -10345,6 +10528,7 @@ setup_cols = st.columns(2)
 setup_cols[0].metric("Best Performing Setup", best_setup_label)
 setup_cols[1].metric("Worst Performing Setup", worst_setup_label)
 
+_ec_section("AI Command Center")
 st.subheader("🧠 AI Backtest Trainer & Strategy Optimizer")
 st.caption("Evidence-based diagnostics and chronological parameter testing. It does not rewrite your scoring formula; approved filters can only gate paper-trade eligibility.")
 trainer_col1, trainer_col2 = st.columns([1, 2])
@@ -10413,6 +10597,7 @@ with bc3:
 with bc4:
     st.metric("Profitability Score", stats["profitability_score"])
 
+_ec_section("Research Lab")
 st.subheader("Walk Forward Validation")
 wf_ctrl1, wf_ctrl2, wf_ctrl3 = st.columns([1.35, 1.0, 1.0])
 with wf_ctrl1:
@@ -10550,6 +10735,7 @@ update_daily_summary()
 update_weekly_summary()
 update_monthly_summary()
 
+_ec_section("Reports")
 st.subheader("Journal Analytics Dashboard")
 closed_journal = journal[journal["Status"] == "CLOSED"].copy() if not journal.empty else pd.DataFrame()
 if not closed_journal.empty:
@@ -10612,6 +10798,7 @@ with _exp3:
 with _exp4:
     csv_download_button("Signal audit log", safe_read_csv(SIGNAL_AUDIT_FILE), "signal_audit.csv", "dl_signal_audit")
 
+_ec_section("Market")
 st.subheader("Option Suggestion")
 if option_suggestion["type"] == "CALL":
     st.success(option_suggestion["text"])
@@ -10620,6 +10807,7 @@ elif option_suggestion["type"] == "PUT":
 else:
     st.warning(option_suggestion["text"])
 
+_ec_section("__always__")
 if auto_refresh and not AUTO_REFRESH_AVAILABLE:
     st.caption("Auto-refresh helper is not installed; use the manual browser refresh or install streamlit-autorefresh.")
 
@@ -10738,6 +10926,7 @@ def _edu_oi_classification(frame):
     return out
 
 
+_ec_section("Research Lab")
 with st.expander("📚 Educational Market Learning Lab — descriptive analysis only", expanded=False):
     st.caption("Read-only learning tools. Outputs are historical observations, not trade instructions, forecasts, or order controls. This section is isolated from the existing signal and paper-trading logic.")
     edu_tabs = st.tabs(["Market Structure", "Liquidity & Sweeps", "Sector / Relative Strength", "OI Patterns", "Order Blocks & FVG", "Volume Profile", "AI Trainer"])
@@ -10932,6 +11121,7 @@ with st.expander("📚 Educational Market Learning Lab — descriptive analysis 
 # =========================================================
 # INSTITUTIONAL ANALYSIS (rendered once; these components already feed the signal score)
 # =========================================================
+_ec_section("Signals")
 st.divider()
 st.header("Institutional Analysis")
 try:
@@ -10947,8 +11137,5 @@ except Exception as _inst_ui_err:
 # AI LAB (weakness, strengths, builder, evolution, self-learning, report, calibration,
 # prediction accuracy, copilot, replay, opportunities, portfolio risk)
 # =========================================================
-try:
-    render_ai_lab(selected, timeframe, data, analysis, backtest_trades_df)
-except Exception as _lab_err:
-    log_app_error("ai_lab", _lab_err)
-    st.error(f"AI Lab error: {type(_lab_err).__name__}: {_lab_err}")
+_ec_render_dashboard_strip(selected, timeframe, analysis, data)
+_ec_render_ai_lab_pages(selected, timeframe, data, analysis, backtest_trades_df)
