@@ -50,7 +50,7 @@ def _install_streamlit_compat():
 
 _install_streamlit_compat()
 # Visible deployment marker: confirms which source file Streamlit Cloud is running.
-APP_BUILD_ID = "2026-11-12-FINAL-FAST-10-NAV"
+APP_BUILD_ID = "2026-11-12-DASH-EXTRAS"
 # Optional integrations: Yahoo mode must still start if Angel SDK/TOTP or
 # the auto-refresh helper is not installed.
 try:
@@ -753,6 +753,25 @@ def login_panel():
                     st.sidebar.error("Invalid username or password")
             except Exception as e:
                 st.sidebar.error(f"Login error: {e}")
+
+        # Forgot password: reset with the owner's RESET_KEY (st.secrets / environment).
+        with st.sidebar.expander("Forgot password?", expanded=False):
+            if not _reset_key():
+                st.caption("To enable resets, add RESET_KEY = \"your-secret\" in Streamlit "
+                           "App settings > Secrets (or as an environment variable), then reboot the app. "
+                           f"Until then, the default login {DEFAULT_ADMIN_USERNAME} / {DEFAULT_ADMIN_PASSWORD} still works.")
+            with st.form("forgot_password_form", clear_on_submit=True):
+                fp_user = st.text_input("Username", value=DEFAULT_ADMIN_USERNAME, key="fp_user")
+                fp_key = st.text_input("Reset key", type="password", key="fp_key")
+                fp_new = st.text_input("New password (minimum 6 characters)", type="password", key="fp_new")
+                fp_conf = st.text_input("Confirm new password", type="password", key="fp_conf")
+                fp_submit = st.form_submit_button("Reset Password", use_container_width=True)
+            if fp_submit:
+                try:
+                    _ok, _msg = reset_password_with_key(fp_user, fp_key, fp_new, fp_conf)
+                except Exception as _e:
+                    _ok, _msg = False, f"Reset failed: {_e}"
+                (st.success if _ok else st.error)(_msg)
         st.stop()
 
     st.sidebar.success(f"Logged in as: {st.session_state.username}")
@@ -2439,14 +2458,14 @@ def _fetch_yahoo_batch_direct(tickers, interval, period, max_workers=4):
         while (frame is None or frame.empty) and err and attempt < 2:
             attempt += 1
             # Back off longer when Yahoo says "too many requests"; short pause for other glitches.
-            pytime.sleep(1.5 * attempt if ("429" in str(err) or "Too Many" in str(err)) else 0.4)
+            pytime.sleep(1.0 * attempt if ("429" in str(err) or "Too Many" in str(err)) else 0.3)
             frame, err = _yahoo_chart_api_frame(tk, interval, period, use_breaker=False)
         return tk, frame
 
     try:
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             futures = [pool.submit(_one, tk) for tk in ticker_list]
-            for fut in as_completed(futures, timeout=40):
+            for fut in as_completed(futures, timeout=20):
                 try:
                     tk, frame = fut.result()
                     if frame is not None and not frame.empty:
@@ -2481,16 +2500,32 @@ def fetch_yahoo_batch(tickers, interval, period):
     A completely empty result is NOT kept in the cache (it used to be cached for 30 s, so a
     single blocked request made the scanner look dead even after pressing refresh)."""
     ticker_list = tuple(str(t).strip() for t in tickers if str(t).strip())
+    _key = (ticker_list, str(interval), str(period))
+    # Speed: after a fully failed batch, do not re-hammer Yahoo on every 15 s rerun.
+    # A short pause (25 s) keeps the page responsive; manual refresh clears it via .clear().
+    if pytime.time() < _BATCH_FAIL_UNTIL.get(_key, 0):
+        return {t: pd.DataFrame() for t in ticker_list}
     result = _fetch_yahoo_batch_cached(ticker_list, str(interval), str(period))
     if ticker_list and all((result.get(t) is None or result[t].empty) for t in ticker_list):
+        _BATCH_FAIL_UNTIL[_key] = pytime.time() + 25
         try:
             _fetch_yahoo_batch_cached.clear()
         except Exception:
             pass
+    else:
+        _BATCH_FAIL_UNTIL.pop(_key, None)
     return result
 
 
-fetch_yahoo_batch.clear = _fetch_yahoo_batch_cached.clear
+_BATCH_FAIL_UNTIL = {}
+
+
+def _clear_batch_cache():
+    _BATCH_FAIL_UNTIL.clear()
+    _fetch_yahoo_batch_cached.clear()
+
+
+fetch_yahoo_batch.clear = _clear_batch_cache
 
 
 def _yahoo_spark_quotes(tickers):
@@ -8755,6 +8790,8 @@ def _ec_render_dashboard_strip(selected, timeframe, analysis, data):
         with _EC_DASH_TOP:
             journal = load_journal()
             price = globals().get("current_display_price")
+            if price is None:
+                price = globals().get("_ec_nodata_price")
             if (price is None or not np.isfinite(_al_num(price))) and isinstance(data, pd.DataFrame) and not data.empty:
                 price = float(data["Close"].iloc[-1])
             pos = ai_lab_open_positions(journal)
@@ -8775,8 +8812,234 @@ def _ec_render_dashboard_strip(selected, timeframe, analysis, data):
             c[5].metric("Today's realised P&L", f"{today_pnl:+,.2f}")
             st.caption(f"Data source: {globals().get('active_data_source', 'n/a')} | Page navigation is at the top. "
                        "Everything that was on the single long page is still here, grouped by page.")
+            _ec_render_dashboard_extras(analysis, data)
     except Exception as exc:
         log_app_error("ec_dashboard_strip", exc)
+
+
+# =========================================================
+# DASHBOARD EXTRAS: Top Opportunities | System Health | Daily Feature Validation |
+# Production Readiness | Smart Money Tracker  (additive; every block is isolated)
+# =========================================================
+_FIIDII_DOWN_UNTIL = 0.0
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_fii_dii_flows():
+    """Latest FII/FPI and DII cash-market flows (Rs crore) from NSE. Real data only: if NSE blocks the
+    request the result says so; nothing is invented."""
+    global _FIIDII_DOWN_UNTIL
+    if pytime.time() < _FIIDII_DOWN_UNTIL:
+        return {"ok": False, "error": "NSE recently blocked the request; retrying shortly."}
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0 Safari/537.36",
+               "Accept": "application/json,text/plain,*/*", "Referer": "https://www.nseindia.com/reports/fii-dii"}
+    try:
+        sess = requests.Session()
+        sess.get("https://www.nseindia.com", headers=headers, timeout=(2, 3))
+        resp = sess.get("https://www.nseindia.com/api/fiidiiTradeReact", headers=headers, timeout=(2, 4))
+        resp.raise_for_status()
+        rows = resp.json()
+        out = {"ok": True, "date": None}
+        for r in rows if isinstance(rows, list) else []:
+            cat = str(r.get("category", "")).upper()
+            key = "DII" if cat.startswith("DII") else ("FII" if cat.startswith("FII") else None)
+            if key:
+                out[key] = {"buy": float(str(r.get("buyValue", "0")).replace(",", "") or 0),
+                            "sell": float(str(r.get("sellValue", "0")).replace(",", "") or 0),
+                            "net": float(str(r.get("netValue", "0")).replace(",", "") or 0)}
+                out["date"] = r.get("date") or out["date"]
+        if "FII" not in out and "DII" not in out:
+            raise RuntimeError("NSE response had no FII/DII rows")
+        return out
+    except Exception as exc:
+        _FIIDII_DOWN_UNTIL = pytime.time() + 300
+        log_app_error("fii_dii", f"{type(exc).__name__}: {exc}")
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
+def _ec_run_feature_validation(analysis, data_source):
+    """Run real, lightweight checks. Returns list of (name, status, detail); status in PASS/WARN/FAIL."""
+    out = []
+
+    def add(name, fn):
+        try:
+            status, detail = fn()
+        except Exception as exc:
+            status, detail = "FAIL", f"{type(exc).__name__}: {exc}"
+        out.append((name, status, detail))
+
+    def t_yahoo():
+        fr, err = _yahoo_chart_api_frame("^NSEI", "5m", "1d", use_breaker=False)
+        return ("PASS", f"{len(fr)} candles") if fr is not None and not fr.empty else ("FAIL", str(err)[:120])
+
+    def t_ws():
+        if data_source != "Angel":
+            return "WARN", "Not in use (data source is not Angel)"
+        s = ws_get_state()
+        return ("PASS", "connected") if s.get("connected") else ("WARN", str(s.get("error") or "not connected")[:120])
+
+    def t_signal():
+        if isinstance(analysis, dict) and analysis.get("signal_text") is not None:
+            return "PASS", str(analysis.get("signal_text"))
+        return "WARN", "No analysis yet (needs candles)"
+
+    def t_db():
+        os.makedirs(DATA_DIR, exist_ok=True)
+        probe = os.path.join(DATA_DIR, ".health_probe.tmp")
+        with open(probe, "w") as f:
+            f.write("ok")
+        with open(probe) as f:
+            assert f.read() == "ok"
+        os.remove(probe)
+        j = load_journal()
+        users = safe_read_csv(USERS_FILE, pd.DataFrame())
+        return "PASS", f"journal rows {0 if j is None else len(j)}, users {len(users)}"
+
+    def t_scanner():
+        res = st.session_state.get("nifty30_scanner_result")
+        if isinstance(res, pd.DataFrame) and not res.empty and res["CMP"].notna().sum() > 0:
+            return "PASS", f"{int(res['CMP'].notna().sum())}/{len(res)} prices (last scan)"
+        fr = fetch_yahoo_batch(("RELIANCE.NS", "TCS.NS", "SBIN.NS"), "5m", "1d")
+        n = sum(1 for v in fr.values() if v is not None and not v.empty)
+        return ("PASS", f"{n}/3 symbols") if n == 3 else (("WARN", f"{n}/3 symbols") if n else ("FAIL", "no prices"))
+
+    def t_ai():
+        j = load_journal()
+        closed = _al_closed_trades(j)
+        ai_lab_weakness(closed)
+        ai_lab_get_model(j)
+        return "PASS", f"engines ran on {len(closed)} closed trades"
+
+    def t_risk():
+        lv = get_suggested_paper_levels({"atr": 10.0, "signal_type": "buy"}, "BUY", 100.0)
+        lv2 = get_suggested_paper_levels({"atr": 10.0, "signal_type": "sell"}, "SELL", 100.0)
+        sl1 = float(lv.get("stop_loss", lv.get("sl", np.nan)))
+        sl2 = float(lv2.get("stop_loss", lv2.get("sl", np.nan)))
+        return ("PASS", f"BUY SL {sl1:.2f} < entry, SELL SL {sl2:.2f} > entry") if sl1 < 100 < sl2 else ("FAIL", "stop on wrong side of entry")
+
+    for n, f in [("Yahoo Fetch Test", t_yahoo), ("WebSocket Test", t_ws), ("Signal Generation Test", t_signal),
+                 ("Database Test", t_db), ("Scanner Test", t_scanner), ("AI Engine Test", t_ai), ("Risk Manager Test", t_risk)]:
+        add(n, f)
+    # production-configuration checks
+    out.append(("Persistent storage (ELITE_DATA_DIR)", "PASS" if STORAGE_IS_CONFIGURED else "WARN",
+                DATA_DIR if STORAGE_IS_CONFIGURED else "Not set: journal may reset on restart"))
+    out.append(("Auto-refresh component", "PASS" if AUTO_REFRESH_AVAILABLE else "WARN",
+                "installed" if AUTO_REFRESH_AVAILABLE else "streamlit-autorefresh missing"))
+    out.append(("Password recovery (RESET_KEY)", "PASS" if _reset_key() else "WARN",
+                "configured" if _reset_key() else "RESET_KEY not set"))
+    try:
+        _u = pd.read_csv(USERS_FILE)
+        _r = _u[_u["username"].astype(str).str.strip() == st.session_state.get("username", "")]
+        default_pw = bool(not _r.empty and verify_password(DEFAULT_ADMIN_PASSWORD, str(_r["password"].iloc[0])))
+        out.append(("Default password changed", "WARN" if default_pw else "PASS", "admin123 still active" if default_pw else "custom password"))
+    except Exception:
+        out.append(("Default password changed", "WARN", "could not check"))
+    return out
+
+
+def _ec_render_top_opportunities():
+    st.subheader("🔥 Top Opportunities")
+    res = st.session_state.get("al_opps")
+    if st.button("Rank / refresh top opportunities", key="ec_top_opp_btn"):
+        with st.spinner("Scoring NIFTY, BANKNIFTY, SENSEX and stocks..."):
+            _j = load_journal()
+            _df, _missing = ai_lab_rank_opportunities(ai_lab_get_model(_j), _al_closed_trades(_j), dict(stocks))
+        res = {"df": _df, "missing": _missing, "at": now_str()}
+        st.session_state["al_opps"] = res        # shared with the AI Lab Opportunities tab
+    if not res:
+        st.info("Press the button to rank the watchlist (about 10-20 s). The same ranking is available on the Scanner page.")
+        return
+    df_ = res["df"]
+    if df_ is None or df_.empty:
+        st.warning("No symbol could be scored (price feed unavailable).")
+        return
+    view = df_.head(7)[["Rank", "Symbol", "Score"] + [c for c in ("Direction", "Grade") if c in df_.columns]]
+    st.dataframe(view, use_container_width=True, hide_index=True)
+    st.caption(f"Ranked at {res.get('at')} | Score blends setup quality, risk:reward and learned probability. A screening aid, not a trade instruction.")
+
+
+def _ec_render_system_health(analysis, data):
+    st.subheader("🩺 System Health")
+    try:
+        err = safe_read_csv(ERROR_LOG_FILE, pd.DataFrame(columns=["DateTime", "Source", "Message"]))
+    except Exception:
+        err = pd.DataFrame()
+    recent = 0
+    try:
+        if not err.empty:
+            dt = pd.to_datetime(err["DateTime"], errors="coerce")
+            recent = int((dt > (pd.Timestamp(ist_now()).tz_localize(None) - pd.Timedelta(hours=1))).sum())
+    except Exception:
+        recent = 0
+    yd = _YAHOO_FETCH_DIAGNOSTICS if isinstance(_YAHOO_FETCH_DIAGNOSTICS, dict) else {}
+    feed_ok = isinstance(data, pd.DataFrame) and not data.empty
+    breaker = max(0, int(_YAHOO_NET_DOWN_UNTIL - pytime.time()))
+    c = st.columns(5)
+    c[0].metric("Price feed", "Online" if feed_ok else "No candles", str(globals().get("active_data_source", "n/a")))
+    c[1].metric("Yahoo", str(yd.get("status", "n/a")), f"{yd.get('rows', 0)} rows")
+    c[2].metric("Yahoo pause", f"{breaker}s" if breaker else "None")
+    c[3].metric("Errors (last hour)", recent, f"{len(err)} logged" if len(err) else None)
+    c[4].metric("Build", str(APP_BUILD_ID)[-14:])
+    c2 = st.columns(3)
+    c2[0].metric("Storage", "Persistent" if STORAGE_IS_CONFIGURED else "Temporary")
+    c2[1].metric("Auto-refresh", "On" if (globals().get("auto_refresh") and AUTO_REFRESH_AVAILABLE) else "Off")
+    c2[2].metric("Server time (IST)", ist_now().strftime("%H:%M:%S"))
+    if not err.empty:
+        with st.expander("Last 5 logged errors"):
+            st.dataframe(err.tail(5), use_container_width=True, hide_index=True)
+
+
+def _ec_render_validation_and_readiness(analysis):
+    st.subheader("✅ Daily Feature Validation & Production Readiness")
+    if st.button("Run validation now", key="ec_validate_btn"):
+        with st.spinner("Running checks..."):
+            st.session_state["ec_validation"] = {"rows": _ec_run_feature_validation(analysis, globals().get("data_source")), "at": now_str()}
+    v = st.session_state.get("ec_validation")
+    if not v:
+        st.info("Press 'Run validation now' to test the Yahoo feed, WebSocket, signals, database, scanner, AI engine and risk manager.")
+        return
+    rows = v["rows"]
+    passed = sum(1 for r in rows if r[1] == "PASS")
+    failed = sum(1 for r in rows if r[1] == "FAIL")
+    warn = sum(1 for r in rows if r[1] == "WARN")
+    score = round(100 * (passed + 0.5 * warn) / max(1, len(rows)))
+    icon = {"PASS": "✓", "WARN": "⚠", "FAIL": "✗"}
+    c = st.columns(4)
+    c[0].metric("Production Readiness", f"{score}%")
+    c[1].metric("Passed", passed)
+    c[2].metric("Failed", failed)
+    c[3].metric("Warning", warn)
+    st.dataframe(pd.DataFrame([{"": icon[s], "Check": n, "Status": s, "Detail": d} for n, s, d in rows]),
+                 use_container_width=True, hide_index=True)
+    st.caption(f"Run at {v['at']}. Readiness = (passed + half of warnings) / total checks; the first 7 are the daily feature tests.")
+
+
+def _ec_render_smart_money():
+    st.subheader("🏦 Smart Money Tracker")
+    fl = fetch_fii_dii_flows()
+    if not fl.get("ok"):
+        st.warning(f"FII/DII flow data is unavailable right now ({fl.get('error')}). NSE often blocks cloud servers; nothing is estimated.")
+        return
+    c = st.columns(3)
+    for col, key, label in ((c[0], "FII", "FII / FPI"), (c[1], "DII", "DII")):
+        if key in fl:
+            n = fl[key]["net"]
+            col.metric(f"{label} {'Buying' if n >= 0 else 'Selling'}", f"₹{abs(n):,.0f} Cr", f"Buy {fl[key]['buy']:,.0f} | Sell {fl[key]['sell']:,.0f}", delta_color="off")
+    net = sum(fl[k]["net"] for k in ("FII", "DII") if k in fl)
+    c[2].metric("Net", "Positive" if net >= 0 else "Negative", f"₹{net:+,.0f} Cr")
+    st.caption(f"NSE cash-market provisional data for {fl.get('date') or 'latest session'}, refreshed every 10 minutes.")
+
+
+def _ec_render_dashboard_extras(analysis, data):
+    for name, fn in (("top_opportunities", lambda: _ec_render_top_opportunities()),
+                     ("system_health", lambda: _ec_render_system_health(analysis, data)),
+                     ("validation", lambda: _ec_render_validation_and_readiness(analysis)),
+                     ("smart_money", lambda: _ec_render_smart_money())):
+        try:
+            fn()
+        except Exception as exc:
+            log_app_error(f"ec_extra_{name}", exc)
+            st.warning(f"{name.replace('_', ' ').title()} could not be rendered: {type(exc).__name__}: {exc}")
 
 
 def _ec_render_ai_lab_pages(selected, timeframe, data, analysis, backtest_trades_df):
@@ -9190,6 +9453,7 @@ if not _angel_session_ready:
 # Until Test Angel Login succeeds, use Yahoo rather than attempting broker data.
 _angel_credentials_ready = bool(_angel_session_ready)
 
+_ec_section("__always__")   # data-feed status / price messages must be visible on every page, not only Market
 st.info(
     f"Market data request: {data_source} | {selected} | {timeframe}. "
     "Angel live LTP priority: WebSocket primary with REST polling fallback. Upstox uses V3 LTP and Historical Candle REST APIs. "
@@ -9364,11 +9628,20 @@ else:
             st.warning("Yahoo Finance returned no OHLC rows. Using connected Angel One candle history as a clearly-labelled fallback.")
 
 if data.empty:
+    _ec_section("Dashboard")   # price / feed status belongs on the Dashboard (was landing on the hidden Market page)
     # Quote retrieval is independent of OHLC history: even if Yahoo candles fail,
     # show a clearly-labelled latest quote/bar when Yahoo can provide one.
     if data_source == "Yahoo":
         _yahoo_empty_quote = fetch_yahoo_ltp(ticker)
+        if _yahoo_empty_quote.get("price") is None:
+            try:   # last resort: one lightweight spark request
+                _sp = _yahoo_spark_quotes([ticker]).get(ticker) or {}
+                if _sp.get("price") is not None:
+                    _yahoo_empty_quote = {"price": _sp["price"], "source": "Yahoo spark quote", "status": "spark_fallback", "timestamp": None}
+            except Exception as _sp_err:
+                log_app_error("dashboard_spark_quote", _sp_err)
         if _yahoo_empty_quote.get("price") is not None:
+            _ec_nodata_price = float(_yahoo_empty_quote["price"])
             st.metric(
                 f"Yahoo latest available price — {_yahoo_empty_quote.get('source', 'Yahoo')}",
                 f"{float(_yahoo_empty_quote['price']):,.2f}",
@@ -9380,6 +9653,11 @@ if data.empty:
             )
         else:
             st.warning("Yahoo quote and intraday candles are both unavailable. Check the Yahoo fetch diagnostic above and the deployment network/logs.")
+            try:
+                _why = {k: v for k, v in dict(_YAHOO_LAST_ERRORS).items() if str(k) == str(ticker)} or dict(list(_YAHOO_LAST_ERRORS.items())[-3:])
+                st.caption(f"Yahoo diagnostics: {_YAHOO_FETCH_DIAGNOSTICS} | last errors: {_why}")
+            except Exception:
+                pass
     if data_source == "Angel" and (polling_mode or ws_enable):
         if angel_ltp_value is not None:
             st.metric(f"Angel One Latest Traded Price — {angel_ltp_source}", f"{angel_ltp_value:,.2f}")
@@ -9466,6 +9744,8 @@ if data.empty:
 
 if active_data_source != data_source:
     st.info(f"Selected source: {data_source} | Actual OHLC candle source: {active_data_source}. The data source is labelled separately so fallback data is not mistaken for broker data.")
+
+_ec_section("Market")   # from here the charts / analytics belong to the Market page
 
 if timeframe == "3m":
     data = resample_ohlcv(data, "3min")
