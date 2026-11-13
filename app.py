@@ -62,7 +62,7 @@ def _ec_export(mod):
 
 _install_streamlit_compat()
 # Visible deployment marker: confirms which source file Streamlit Cloud is running.
-APP_BUILD_ID = "2026-11-13-PERSIST-FAST"
+APP_BUILD_ID = "2026-11-13-BUDGET-VISIBLE"
 # Optional integrations: Yahoo mode must still start if Angel SDK/TOTP or
 # the auto-refresh helper is not installed.
 try:
@@ -485,7 +485,21 @@ def _fetch_data_raw(ticker, interval, period):
 
 
 
-_FETCH_BUDGET_SEC = 7.0   # the page never waits longer than this for candles; the fetch finishes in the background
+_FETCH_BUDGET_SEC = 7.0        # longest single wait for candles
+_RUN_WAIT_BUDGET_SEC = 9.0     # ALL waits for background network work in one refresh share this budget
+
+
+def _ec_wait_for(fut, want):
+    """Wait for a background network job, but never let one refresh spend more than _RUN_WAIT_BUDGET_SEC waiting in total
+    (candles + 7 timeframes + option chain + FII/DII used to add up to a minute when the network was slow). Once the budget is
+    used, later jobs only report whether they have already finished; their results appear on the next refresh."""
+    used = float(st.session_state.get("_ec_wait_used", 0.0))
+    allow = max(0.0, min(float(want), _RUN_WAIT_BUDGET_SEC - used))
+    t0 = pytime.time()
+    try:
+        return fut.result(timeout=allow)
+    finally:
+        st.session_state["_ec_wait_used"] = used + (pytime.time() - t0)
 
 
 def fetch_data(ticker, interval, period):
@@ -499,7 +513,7 @@ def fetch_data(ticker, interval, period):
         fut = rs.FETCH_POOL.submit(_fetch_data_blocking, ticker, interval, period)
         rs.FETCH_PENDING[key] = fut
     try:
-        frame = fut.result(timeout=_FETCH_BUDGET_SEC)
+        frame = _ec_wait_for(fut, _FETCH_BUDGET_SEC)
         rs.FETCH_PENDING.pop(key, None)
         return frame
     except _FutTimeout:
@@ -507,7 +521,7 @@ def fetch_data(ticker, interval, period):
         rs.YAHOO_DIAG_BY_KEY[key] = {"status": "slow", "source": "Yahoo (still loading in the background)",
                                      "rows": int(len(stale)) if stale is not None else 0,
                                      "last_candle": str(stale.index[-1]) if stale is not None and len(stale) else None,
-                                     "error": f"no answer within {_FETCH_BUDGET_SEC:.0f}s"}
+                                     "error": "no answer within this refresh's wait budget (still loading in the background)"}
         return stale.copy() if stale is not None and not stale.empty else pd.DataFrame()
     except Exception as exc:
         rs.FETCH_PENDING.pop(key, None)
@@ -3416,8 +3430,7 @@ def _nse_option_chain_download(symbol):
     return None
 
 
-@st.cache_data(max_entries=32, ttl=120)
-def get_option_chain_snapshot(symbol="NIFTY"):
+def _option_chain_worker(symbol="NIFTY"):
     """Live option chain, else the last good snapshot (marked stale), else None."""
 
     def _last_good():
@@ -3452,6 +3465,36 @@ def get_option_chain_snapshot(symbol="NIFTY"):
         rs.NSE_DOWN_UNTIL = pytime.time() + 120
         log_app_error("get_option_chain_snapshot", e)
         return _last_good()
+
+
+def get_option_chain_snapshot(symbol="NIFTY"):
+    """Option chain without ever blocking the page: fresh copy (< 2 min) from memory, else the download runs in the
+    background and we wait only what is left of this refresh's budget; otherwise the last good snapshot is returned."""
+    from concurrent.futures import TimeoutError as _FutTimeout
+    now = pytime.time()
+    ent = rs.OPTION_CHAIN.get(symbol)
+    if ent and now - ent["ts"] < 120:
+        return ent["data"]
+    fkey = ("option_chain", symbol)
+    fut = rs.FETCH_PENDING.get(fkey)
+    if fut is None and now >= rs.NSE_DOWN_UNTIL:
+        fut = rs.FETCH_POOL.submit(_option_chain_worker, symbol)
+        rs.FETCH_PENDING[fkey] = fut
+    if fut is not None:
+        try:
+            data = _ec_wait_for(fut, 3.0)
+            rs.FETCH_PENDING.pop(fkey, None)
+            rs.OPTION_CHAIN[symbol] = {"ts": pytime.time(), "data": data}
+            return data
+        except _FutTimeout:
+            pass
+        except Exception as exc:
+            rs.FETCH_PENDING.pop(fkey, None)
+            log_app_error("get_option_chain_snapshot", exc)
+    return ent["data"] if ent else None
+
+
+get_option_chain_snapshot.clear = lambda: rs.OPTION_CHAIN.clear()
 
 
 def get_dynamic_option_chain_symbol(selected_symbol):
@@ -6147,6 +6190,8 @@ _ec_css = ["""
 for _i, _d in enumerate(_EC_PAGE_DEFS):
     if _d[0] != _ec_active:
         _ec_css.append(f".st-key-ec_pg_{_i}{{display:none !important;}}")
+        # an error raised while a hidden page is the active container must never be invisible: reveal that page
+        _ec_css.append(f'.st-key-ec_pg_{_i}:has([data-testid="stException"]){{display:flex !important;}}')
         _ec_css.append(f'[data-testid="stVerticalBlock"]:has(> [data-testid="stElementContainer"] > [data-testid="stMarkdown"] .ec-pg-{_i}){{display:none !important;}}')
         _ec_css.append(f'[data-testid="stVerticalBlock"]:has(> .element-container .ec-pg-{_i}){{display:none !important;}}')
 st.markdown("<style>" + "\n".join(_ec_css) + "</style>", unsafe_allow_html=True)
@@ -6163,7 +6208,9 @@ _EC_ALWAYS = _ec_new_container("ec_pg_always")  # shown on every page: symbol / 
 _EC_CONTAINERS = {}
 _EC_DASH_TOP = None
 _EC_DASH_PRICE = None
+_EC_DASH_PROGRESS = None
 _EC_RUN_T0 = pytime.time()
+st.session_state["_ec_wait_used"] = 0.0   # fresh network-wait budget for this refresh
 for _i, (_key, _label, _desc) in enumerate(_EC_PAGE_DEFS):
     _c = _ec_new_container(f"ec_pg_{_i}")
     with _c:
@@ -6174,6 +6221,7 @@ for _i, (_key, _label, _desc) in enumerate(_EC_PAGE_DEFS):
             _EC_DASH_TOP = st.container()      # headline strip, filled in once the analysis is ready
             _EC_DASH_PRICE = _EC_DASH_TOP.empty()   # live price: filled as soon as candles arrive, before the heavy analysis
             _EC_DASH_PRICE.info("⏳ Loading live price…")
+            _EC_DASH_PROGRESS = _EC_DASH_TOP.empty()  # shows which step the refresh is on and how long it took
     _EC_CONTAINERS[_key] = _c
 _EC_ACTIVE_CTX = None
 
@@ -6240,6 +6288,16 @@ try:                                            # charts drawn while hidden need
         _ec_components.html("<script>setTimeout(function(){try{window.parent.dispatchEvent(new Event('resize'));}catch(e){}},400);</script>", height=0)
 except Exception:
     pass
+
+
+def _ec_stage(label):
+    """Dashboard: which step is running and the elapsed time. If a refresh ever stalls, the label shows where."""
+    try:
+        ph = globals().get("_EC_DASH_PROGRESS")
+        if ph is not None and _ec_active == "Dashboard":
+            ph.caption(f"⏱ {label} … {pytime.time() - _EC_RUN_T0:.1f}s")
+    except Exception:
+        pass
 
 
 def _ec_render_early_price(data):
@@ -6351,8 +6409,33 @@ def _ec_render_dashboard_strip(selected, timeframe, analysis, data):
 # =========================================================
 
 
-@st.cache_data(max_entries=32, ttl=600, show_spinner=False)
 def fetch_fii_dii_flows():
+    """Non-blocking wrapper: memory copy (10 min, failures 2 min), else the NSE request runs in the background."""
+    from concurrent.futures import TimeoutError as _FutTimeout
+    now = pytime.time()
+    ent = rs.FIIDII.get("v")
+    if ent and now - ent["ts"] < (600 if ent["data"].get("ok") else 120):
+        return ent["data"]
+    fut = rs.FETCH_PENDING.get("fii_dii")
+    if fut is None:
+        fut = rs.FETCH_POOL.submit(_fii_dii_worker)
+        rs.FETCH_PENDING["fii_dii"] = fut
+    try:
+        data = _ec_wait_for(fut, 2.5)
+        rs.FETCH_PENDING.pop("fii_dii", None)
+        rs.FIIDII["v"] = {"ts": pytime.time(), "data": data}
+        return data
+    except _FutTimeout:
+        return ent["data"] if ent else {"ok": False, "error": "still loading in the background (shown on the next refresh)"}
+    except Exception as exc:
+        rs.FETCH_PENDING.pop("fii_dii", None)
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
+fetch_fii_dii_flows.clear = lambda: rs.FIIDII.clear()
+
+
+def _fii_dii_worker():
     """Latest FII/FPI and DII cash-market flows (Rs crore) from NSE. Real data only: if NSE blocks the
     request the result says so; nothing is invented."""
     if pytime.time() < rs.FIIDII_DOWN_UNTIL:
@@ -7441,9 +7524,11 @@ elif timeframe == "10m":
 
 ok, msg = data_integrity_check(data, ["Open", "High", "Low", "Close", "Volume"], min_rows=2)
 if not ok:
+    _ec_section("__always__")   # visible on every page (it used to land on the hidden Market page)
     st.error(f"Data integrity failed: {msg}")
     st.stop()
 
+_ec_stage("Indicators")
 data = add_indicators(data).replace([np.inf, -np.inf], np.nan).ffill()
 # Keep interactive backtests bounded. Indicator columns are already computed on
 # the full chart frame; 1,200 recent bars provide a responsive intraday sample.
@@ -7453,6 +7538,7 @@ backtest_data = data.tail(MAX_BACKTEST_BARS).copy()
 if len(data) < 35:
     st.warning(f"Only {len(data)} candles available. Live price / chart can display, but backtest and some long-period indicators need more history.")
 
+_ec_stage("Multi-timeframe data")
 htf_interval, _ = get_higher_timeframe(timeframe)
 angel_creds = (angel_api_key, angel_client_code, angel_pin, angel_totp_secret)
 htf_data = get_tf_indicator_frame(active_data_source, selected, ticker, htf_interval, angel_creds)
@@ -7488,6 +7574,7 @@ bull_count = sum("Bullish" in sig for sig in mtf_table["Trend"])
 bear_count = sum("Bearish" in sig for sig in mtf_table["Trend"])
 mtf_available_count = sum("N/A" not in str(sig) for sig in mtf_table["Trend"])
 
+_ec_stage("Option chain / PCR")
 dynamic_oc_symbol = get_dynamic_option_chain_symbol(selected)
 option_metrics = parse_option_chain_metrics(dynamic_oc_symbol) if dynamic_oc_symbol else {
     "pcr": None, "oi_bias": "N/A", "long_unwinding": False,
@@ -7580,6 +7667,7 @@ if st.session_state.get("use_smart_money", True):
     smart_money_info = build_smart_money_context()
 st.session_state["smart_money_info_latest"] = smart_money_info
 
+_ec_stage("Signal analysis")
 analysis = analyze_signal(
     data,
     htf_bias=htf_bias,
@@ -9126,3 +9214,5 @@ _ec_render_dashboard_strip(selected, timeframe, analysis, data)
 _ec_render_ai_lab_pages(selected, timeframe, data, analysis, backtest_trades_df)
 _ec_render_extra_pages(analysis, data)
 st.session_state["ec_last_run_secs"] = round(pytime.time() - _EC_RUN_T0, 1)
+if _EC_DASH_PROGRESS is not None and _ec_active == "Dashboard":
+    _EC_DASH_PROGRESS.caption(f"✅ Updated in {st.session_state['ec_last_run_secs']}s (network waits {st.session_state.get('_ec_wait_used', 0):.1f}s)")
