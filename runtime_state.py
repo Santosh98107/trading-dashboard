@@ -23,9 +23,11 @@ YAHOO_FETCH_DIAGNOSTICS = {"status": "not_requested", "source": None, "rows": 0,
 BATCH_FAIL_UNTIL = {}
 
 # ---- background fetching: a slow network call never blocks the page for more than a few seconds ----
-FETCH_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ec-fetch")
+FETCH_POOL = ThreadPoolExecutor(max_workers=6, thread_name_prefix="ec-fetch")
 FETCH_PENDING = {}              # key -> Future still running from an earlier rerun
 LAST_FETCH_SECONDS = {}         # key -> how long the last completed fetch took
+OPTION_CHAIN = {}               # symbol -> {'ts', 'data'} latest NSE option chain
+FIIDII = {}                     # {'ts', 'data'} latest FII / DII flows
 
 MACRO_BG = {"ctx": None, "ts": 0.0, "running": False, "geo": True}   # macro context built in a background thread
 MACRO_BG_LOCK = threading.Lock()
@@ -56,7 +58,7 @@ def clear_all():
     global YAHOO_NET_DOWN_UNTIL, YF_NET_DOWN_UNTIL, NSE_DOWN_UNTIL, FIIDII_DOWN_UNTIL
     YAHOO_NET_DOWN_UNTIL = YF_NET_DOWN_UNTIL = NSE_DOWN_UNTIL = FIIDII_DOWN_UNTIL = 0.0
     MACRO_BG.update(ctx=None, ts=0.0, running=False)
-    for d in (YAHOO_LAST_ERRORS, LAST_GOOD_FRAMES, YAHOO_DIAG_BY_KEY, BATCH_FAIL_UNTIL, FETCH_PENDING, LAST_FETCH_SECONDS):
+    for d in (YAHOO_LAST_ERRORS, LAST_GOOD_FRAMES, YAHOO_DIAG_BY_KEY, BATCH_FAIL_UNTIL, FETCH_PENDING, LAST_FETCH_SECONDS, OPTION_CHAIN, FIIDII):
         d.clear()
     YAHOO_FETCH_DIAGNOSTICS.clear()
     YAHOO_FETCH_DIAGNOSTICS.update({"status": "not_requested", "source": None, "rows": 0, "error": None})
