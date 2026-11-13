@@ -7,6 +7,9 @@ import shutil
 import hashlib
 import hmac
 import gzip
+import io
+import re
+import sqlite3
 import threading
 import time as pytime
 from datetime import datetime, timedelta, time, timezone
@@ -40,6 +43,7 @@ WEEKLY_RISK_FILE = os.path.join(DATA_DIR, "weekly_risk_state.csv")
 MONTHLY_RISK_FILE = os.path.join(DATA_DIR, "monthly_risk_state.csv")
 OPTION_CHAIN_FILE = os.path.join(DATA_DIR, "option_chain_cache.json")
 NEWS_CACHE_FILE = os.path.join(DATA_DIR, "news_cache.json")
+DB_FILE = os.path.join(DATA_DIR, "elite.db")   # SQLite database: journal, users, paper/risk state, summaries, audit, error log
 
 DEFAULT_INITIAL_BALANCE = 100000.0
 DATA_INTEGRITY_MIN_ROWS = 30
@@ -119,8 +123,8 @@ def reset_password_with_key(username, reset_key, new_password, confirm_password)
     username = str(username or "").strip()
     configured = _reset_key()
     if not configured:
-        return False, ("Reset key is not configured. Set RESET_KEY in secrets/environment, or delete "
-                       f"'{USERS_FILE}' to restore {DEFAULT_ADMIN_USERNAME} / {DEFAULT_ADMIN_PASSWORD}.")
+        return False, ("Reset key is not configured. Set RESET_KEY in secrets/environment, or log in with the "
+                       f"default {DEFAULT_ADMIN_USERNAME} / {DEFAULT_ADMIN_PASSWORD} and use Change Password.")
     if not hmac.compare_digest(str(reset_key or ""), configured):
         return False, "Reset key is incorrect."
     if not username:
@@ -146,17 +150,163 @@ _BACKUP_MIN_INTERVAL_SEC = 600
 _LAST_BACKUP_AT = {}
 
 
-def backup_file(path):
+# =========================================================
+# SQLITE STORAGE
+# Every former CSV data file (journal, users, paper / risk state, summaries, signal audit, error log,
+# AI Lab history) is now a table in one SQLite file (DB_FILE). The function names safe_read_csv /
+# safe_write_csv / backup_file are kept so the rest of the app is unchanged.
+#   * writes run inside one transaction (all-or-nothing), WAL mode lets readers and a writer coexist
+#   * values are stored as TEXT and read back through pandas' own CSV type inference, so numbers, dates and
+#     True/False columns come back exactly as they did from the CSV files
+#   * an existing CSV is imported into its table automatically the first time it is needed and is left on disk
+# =========================================================
+_DB_LOCK = threading.RLock()
+
+
+def _table_name(path):
+    """Table for a data-file path, or None when the path is outside DATA_DIR (then plain CSV is used)."""
     try:
-        if os.path.exists(path):
-            now_ts = pytime.time()
-            if now_ts - _LAST_BACKUP_AT.get(path, 0) < _BACKUP_MIN_INTERVAL_SEC:
-                return   # auto-refresh rewrites files every few seconds; do not flood the backup history
-            _LAST_BACKUP_AT[path] = now_ts
-            ts = ist_now().strftime("%Y%m%d_%H%M%S")
-            name = os.path.basename(path)
-            shutil.copy(path, os.path.join(BACKUP_DIR, f"{ts}_{name}"))
-            enforce_backup_retention()
+        full = os.path.abspath(str(path))
+        if os.path.dirname(full) != os.path.abspath(DATA_DIR) or not full.lower().endswith(".csv"):
+            return None
+        return re.sub(r"\W", "_", os.path.splitext(os.path.basename(full))[0])
+    except Exception:
+        return None
+
+
+def _db_connect():
+    os.makedirs(DATA_DIR, exist_ok=True)
+    con = sqlite3.connect(DB_FILE, timeout=20, isolation_level=None)   # autocommit; we open transactions explicitly
+    try:
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("PRAGMA synchronous=NORMAL")
+        con.execute("PRAGMA busy_timeout=20000")
+    except Exception:
+        pass
+    return con
+
+
+def _q(name):
+    return '"' + str(name).replace('"', '""') + '"'
+
+
+def _table_exists(con, table):
+    return con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone() is not None
+
+
+def _frame_to_text_rows(df):
+    """DataFrame -> (columns, rows of str/None) using exactly the text pandas would write to a CSV."""
+    text = pd.read_csv(io.StringIO(df.to_csv(index=False)), dtype=str, keep_default_na=False)
+    cols = [str(c) for c in text.columns]
+    rows = [tuple((v if v != "" else None) for v in r) for r in text.itertuples(index=False, name=None)]
+    return cols, rows
+
+
+def _store_table(con, table, df):
+    cols, rows = _frame_to_text_rows(df)
+    if not cols:
+        cols = ["_empty"]
+        rows = []
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        con.execute(f"DROP TABLE IF EXISTS {_q(table)}")
+        con.execute(f"CREATE TABLE {_q(table)} (" + ", ".join(f"{_q(c)} TEXT" for c in cols) + ")")
+        if rows:
+            con.executemany(f"INSERT INTO {_q(table)} VALUES (" + ",".join("?" * len(cols)) + ")", rows)
+        con.execute("COMMIT")
+    except Exception:
+        try:
+            con.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+
+
+def _load_table(con, table):
+    cur = con.execute(f"SELECT * FROM {_q(table)} ORDER BY rowid")
+    cols = [d[0] for d in cur.description]
+    rows = cur.fetchall()
+    if cols == ["_empty"]:
+        return pd.DataFrame()
+    text = pd.DataFrame(rows, columns=cols, dtype=object)
+    return pd.read_csv(io.StringIO(text.to_csv(index=False)))   # same type inference as reading the old CSV
+
+
+def _migrate_csv_if_needed(con, path, table, log=True):
+    """One-time import of a legacy CSV into its table. The CSV file itself is left untouched."""
+    if _table_exists(con, table) or not os.path.exists(path):
+        return
+    try:
+        _store_table(con, table, pd.read_csv(path))
+    except Exception as e:
+        if log:
+            log_app_error("csv_to_sqlite_migration", f"{path} -> {e}")
+
+
+def db_exists(path):
+    table = _table_name(path)
+    if table is None:
+        return os.path.exists(path)
+    with _DB_LOCK:
+        con = _db_connect()
+        try:
+            _migrate_csv_if_needed(con, path, table)
+            return _table_exists(con, table)
+        finally:
+            con.close()
+
+
+def db_read(path):
+    table = _table_name(path)
+    if table is None:
+        return pd.read_csv(path)
+    with _DB_LOCK:
+        con = _db_connect()
+        try:
+            _migrate_csv_if_needed(con, path, table)
+            if not _table_exists(con, table):
+                raise FileNotFoundError(f"table {table} does not exist")
+            return _load_table(con, table)
+        finally:
+            con.close()
+
+
+def db_write(df, path):
+    table = _table_name(path)
+    if table is None:
+        tmp_path = f"{path}.tmp"
+        df.to_csv(tmp_path, index=False)
+        os.replace(tmp_path, path)
+        return
+    with _DB_LOCK:
+        con = _db_connect()
+        try:
+            _store_table(con, table, df)
+        finally:
+            con.close()
+
+
+def backup_file(path):
+    """Throttled snapshot of the whole SQLite database (SQLite's online-backup API: safe while the app is running)."""
+    try:
+        if not os.path.exists(DB_FILE):
+            return
+        now_ts = pytime.time()
+        if now_ts - _LAST_BACKUP_AT.get("db", 0) < _BACKUP_MIN_INTERVAL_SEC:
+            return   # auto-refresh saves every few seconds; do not flood the backup history
+        _LAST_BACKUP_AT["db"] = now_ts
+        ts = ist_now().strftime("%Y%m%d_%H%M%S")
+        dest = os.path.join(BACKUP_DIR, f"{ts}_elite.db")
+        src = _db_connect()
+        try:
+            dst = sqlite3.connect(dest)
+            try:
+                src.backup(dst)
+            finally:
+                dst.close()
+        finally:
+            src.close()
+        enforce_backup_retention()
     except Exception as e:
         log_app_error("backup_file", e)
 
@@ -180,26 +330,27 @@ def enforce_backup_retention():
 
 
 def log_app_error(source, message):
+    """Append one row to the error-log table (kept to the latest 500 rows)."""
     try:
-        row = pd.DataFrame([{
-            "DateTime": now_str(),
-            "Source": str(source),
-            "Message": str(message)
-        }])
-        if os.path.exists(ERROR_LOG_FILE):
-            old = pd.read_csv(ERROR_LOG_FILE)
-            old = pd.concat([old, row], ignore_index=True).tail(500)   # keep the log bounded
-            old.to_csv(ERROR_LOG_FILE, index=False)
-        else:
-            row.to_csv(ERROR_LOG_FILE, index=False)
+        with _DB_LOCK:
+            con = _db_connect()
+            try:
+                table = _table_name(ERROR_LOG_FILE)
+                _migrate_csv_if_needed(con, ERROR_LOG_FILE, table, log=False)
+                con.execute(f"CREATE TABLE IF NOT EXISTS {_q(table)} (DateTime TEXT, Source TEXT, Message TEXT)")
+                con.execute(f"INSERT INTO {_q(table)} VALUES (?,?,?)", (now_str(), str(source), str(message)))
+                con.execute(f"DELETE FROM {_q(table)} WHERE rowid <= (SELECT MAX(rowid) FROM {_q(table)}) - 500")
+            finally:
+                con.close()
     except Exception:
         pass
 
 
 def safe_read_csv(path, default_df=None):
+    """Read a data table (name kept from the CSV days). Returns default_df / empty frame when it does not exist."""
     try:
-        if os.path.exists(path):
-            return pd.read_csv(path)
+        if db_exists(path):
+            return db_read(path)
         return default_df.copy() if default_df is not None else pd.DataFrame()
     except Exception as e:
         log_app_error("safe_read_csv", f"{path} -> {e}")
@@ -207,21 +358,13 @@ def safe_read_csv(path, default_df=None):
 
 
 def safe_write_csv(df, path):
+    """Save a data table atomically (single SQLite transaction)."""
     try:
         backup_file(path)
-        # Atomic save: write a temp file, then swap it in. A crash or restart in the middle of a save can
-        # no longer leave a half-written (corrupt) journal / users / paper-state file.
-        tmp_path = f"{path}.tmp"
-        df.to_csv(tmp_path, index=False)
-        os.replace(tmp_path, path)
+        db_write(df, path)
         return True
     except Exception as e:
         log_app_error("safe_write_csv", f"{path} -> {e}")
-        try:
-            if os.path.exists(f"{path}.tmp"):
-                os.remove(f"{path}.tmp")
-        except Exception:
-            pass
         return False
 
 
@@ -252,11 +395,11 @@ def _create_admin_user():
 
 
 def init_users():
-    if not os.path.exists(USERS_FILE):
+    if not db_exists(USERS_FILE):
         _create_admin_user()
         return
     try:
-        users = pd.read_csv(USERS_FILE)
+        users = db_read(USERS_FILE)
         if "username" not in users.columns or "password" not in users.columns:
             raise ValueError("Invalid users file structure")
     except Exception:
@@ -265,7 +408,7 @@ def init_users():
 
 def init_journal():
     """Create the paper journal with backward-compatible partial-exit fields."""
-    if not os.path.exists(JOURNAL_FILE):
+    if not db_exists(JOURNAL_FILE):
         cols = [
             "DateTime", "TradeDate", "TradeTime", "Symbol", "Timeframe", "Signal", "SignalType", "Side", "EntryPrice", "ExitPrice",
             "Quantity", "RemainingQty", "StopLoss", "Target1", "Target2", "Target3", "TrailingStop",
@@ -284,7 +427,7 @@ def init_journal():
 
 
 def init_paper_state():
-    if not os.path.exists(PAPER_STATE_FILE):
+    if not db_exists(PAPER_STATE_FILE):
         df = pd.DataFrame([{
             "Balance": DEFAULT_INITIAL_BALANCE,
             "UsedMargin": 0.0,
@@ -295,28 +438,28 @@ def init_paper_state():
 
 
 def init_daily_summary():
-    if not os.path.exists(DAILY_SUMMARY_FILE):
+    if not db_exists(DAILY_SUMMARY_FILE):
         safe_write_csv(pd.DataFrame(columns=[
             "Date", "TotalTrades", "Wins", "Losses", "RealizedPnL", "WinRate"
         ]), DAILY_SUMMARY_FILE)
 
 
 def init_weekly_summary():
-    if not os.path.exists(WEEKLY_SUMMARY_FILE):
+    if not db_exists(WEEKLY_SUMMARY_FILE):
         safe_write_csv(pd.DataFrame(columns=[
             "WeekKey", "TotalTrades", "Wins", "Losses", "RealizedPnL", "WinRate"
         ]), WEEKLY_SUMMARY_FILE)
 
 
 def init_monthly_summary():
-    if not os.path.exists(MONTHLY_SUMMARY_FILE):
+    if not db_exists(MONTHLY_SUMMARY_FILE):
         safe_write_csv(pd.DataFrame(columns=[
             "MonthKey", "TotalTrades", "Wins", "Losses", "RealizedPnL", "WinRate"
         ]), MONTHLY_SUMMARY_FILE)
 
 
 def init_risk_state():
-    if not os.path.exists(RISK_STATE_FILE):
+    if not db_exists(RISK_STATE_FILE):
         df = pd.DataFrame([{
             "DailyLossLimit": 2000.0,
             "MaxTradesPerDay": 5,
@@ -330,7 +473,7 @@ def init_risk_state():
 
 
 def init_weekly_risk():
-    if not os.path.exists(WEEKLY_RISK_FILE):
+    if not db_exists(WEEKLY_RISK_FILE):
         df = pd.DataFrame([{
             "WeekKey": ist_now().strftime("%G-W%V"),
             "WeeklyLossLimit": 5000.0,
@@ -341,7 +484,7 @@ def init_weekly_risk():
 
 
 def init_monthly_risk():
-    if not os.path.exists(MONTHLY_RISK_FILE):
+    if not db_exists(MONTHLY_RISK_FILE):
         df = pd.DataFrame([{
             "MonthKey": ist_now().strftime("%Y-%m"),
             "MonthlyLossLimit": 15000.0,
@@ -352,7 +495,7 @@ def init_monthly_risk():
 
 
 def init_signal_audit():
-    if not os.path.exists(SIGNAL_AUDIT_FILE):
+    if not db_exists(SIGNAL_AUDIT_FILE):
         df = pd.DataFrame(columns=[
             "DateTime", "Symbol", "Timeframe", "Signal", "SignalType", "Price",
             "ValidationScore", "TradeQualityScore", "StrategyGrade",
@@ -448,8 +591,8 @@ def _write_csv_if_changed(df, path):
     The risk-lock files were rewritten (and backed up) on every Streamlit rerun, i.e. every few
     seconds with auto-refresh, which slowed the page and wore the disk for no reason."""
     try:
-        if os.path.exists(path):
-            old = pd.read_csv(path)
+        if db_exists(path):
+            old = db_read(path)
             if (list(old.columns) == list(df.columns) and len(old) == len(df)
                     and old.astype(str).reset_index(drop=True).equals(df.astype(str).reset_index(drop=True))):
                 return True
@@ -545,3 +688,90 @@ def update_logged_in_password(username, current_password, new_password, confirm_
 
     return True, "Password updated successfully. Use the new password next time you log in."
 
+
+
+# =========================================================
+# OPTION VOLUME HISTORY (live Put / Call volume flow)
+# NSE reports volume as a running total for the day. Saving a snapshot at every NSE update lets the
+# dashboard show how much Call and Put volume was added in the last few minutes (the live flow).
+# =========================================================
+def record_option_volume(symbol, om):
+    """Save one snapshot of day-so-far Call / Put volume. Duplicates (same NSE timestamp) and stale
+    snapshots are ignored."""
+    try:
+        if not isinstance(om, dict) or om.get("chain_stale") or om.get("call_volume") is None:
+            return
+        if not (om.get("call_volume") or om.get("put_volume")):
+            return
+        chain_time = str(om.get("chain_time") or "")
+        with _DB_LOCK:
+            con = _db_connect()
+            try:
+                con.execute('CREATE TABLE IF NOT EXISTS option_volume_history (Symbol TEXT, ChainTime TEXT, RecordedEpoch REAL, '
+                            'RecordedAt TEXT, Expiry TEXT, CallVolume REAL, PutVolume REAL, CallOI REAL, PutOI REAL)')
+                last = con.execute("SELECT ChainTime, Expiry FROM option_volume_history WHERE Symbol=? ORDER BY rowid DESC LIMIT 1", (symbol,)).fetchone()
+                if last and chain_time and last[0] == chain_time and last[1] == str(om.get("chain_expiry")):
+                    return
+                con.execute("INSERT INTO option_volume_history VALUES (?,?,?,?,?,?,?,?,?)",
+                            (symbol, chain_time, pytime.time(), now_str(), str(om.get("chain_expiry")),
+                             float(om.get("call_volume") or 0), float(om.get("put_volume") or 0),
+                             float(om.get("call_oi") or 0), float(om.get("put_oi") or 0)))
+                con.execute("DELETE FROM option_volume_history WHERE RecordedEpoch < ?", (pytime.time() - 3 * 86400,))
+            finally:
+                con.close()
+    except Exception as e:
+        log_app_error("record_option_volume", e)
+
+
+def load_option_volume(symbol, hours=9):
+    """Snapshots of the last `hours` hours as a DataFrame: Time (IST), Expiry, Call, Put."""
+    try:
+        with _DB_LOCK:
+            con = _db_connect()
+            try:
+                if not _table_exists(con, "option_volume_history"):
+                    return pd.DataFrame(columns=["Epoch", "Time", "Expiry", "Call", "Put"])
+                rows = con.execute("SELECT RecordedEpoch, RecordedAt, Expiry, CallVolume, PutVolume FROM option_volume_history "
+                                   "WHERE Symbol=? AND RecordedEpoch >= ? ORDER BY RecordedEpoch",
+                                   (symbol, pytime.time() - hours * 3600)).fetchall()
+            finally:
+                con.close()
+        df = pd.DataFrame(rows, columns=["Epoch", "Time", "Expiry", "Call", "Put"])
+        df["Time"] = pd.to_datetime(df["Time"], format="%d-%m-%Y %H:%M:%S", errors="coerce")
+        return df
+    except Exception as e:
+        log_app_error("load_option_volume", e)
+        return pd.DataFrame(columns=["Epoch", "Time", "Expiry", "Call", "Put"])
+
+
+def option_volume_live_flow(symbol, window_minutes=15):
+    """Call / Put volume ADDED over roughly the last `window_minutes` (latest total minus an earlier total).
+    Returns None until two snapshots at least 2 minutes apart exist."""
+    df = load_option_volume(symbol)
+    if df.empty or len(df) < 2:
+        return None
+    latest = df.iloc[-1]
+    df = df[(df["Expiry"] == latest["Expiry"]) & (df["Time"].dt.date == latest["Time"].date())]
+    if len(df) < 2:
+        return None
+    target = float(latest["Epoch"]) - window_minutes * 60
+    older = df[df["Epoch"] <= target]
+    base = older.iloc[-1] if not older.empty else df.iloc[0]
+    minutes = (float(latest["Epoch"]) - float(base["Epoch"])) / 60.0
+    if minutes < 2:
+        return None
+    d_call, d_put = float(latest["Call"] - base["Call"]), float(latest["Put"] - base["Put"])
+    if d_call < 0 or d_put < 0:      # volume counters restart each day; ignore a reset
+        return None
+    total = d_call + d_put
+    live_pcr = round(d_put / d_call, 2) if d_call > 0 else None
+    if total <= 0:
+        dominant = "No new volume"
+    elif d_call >= 1.15 * d_put:
+        dominant = "Call volume rising faster"
+    elif d_put >= 1.15 * d_call:
+        dominant = "Put volume rising faster"
+    else:
+        dominant = "Balanced"
+    return {"minutes": round(minutes, 1), "d_call": int(d_call), "d_put": int(d_put), "live_pcr": live_pcr,
+            "dominant": dominant, "history": df[["Time", "Call", "Put"]]}
