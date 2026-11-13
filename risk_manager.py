@@ -535,5 +535,3 @@ def auto_paper_trade_exit(current_price, symbol=None, atr=None):
     except Exception as exc:
         log_app_error("auto_paper_trade_exit", exc)
         return {"closed": 0, "partial": 0, "updated": 0}
-
-
