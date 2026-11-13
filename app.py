@@ -15,8 +15,67 @@ import pandas as pd
 import plotly.graph_objects as go
 import requests
 import streamlit as st
+
+
+def _ec_preflight():
+    """Startup self-check, run BEFORE the project modules are imported.
+
+    The app is split into several files that must all sit next to app.py. If one of them is missing, empty (a blank file
+    created by mistake in the GitHub editor), truncated, or was uploaded with a doubled extension (database.py.py), Python
+    used to fail deep inside an import with a cryptic NameError. This turns that into a plain message naming the file."""
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+    except Exception:
+        here = os.getcwd()
+    # file -> (text that must be inside it, minimum size in bytes, approximate size of the correct file)
+    expected = {
+        "database.py": ("DATA_DIR = os.environ.get", 15000, "30 KB"),
+        "risk_manager.py": ("def auto_paper_trade_exit", 12000, "25 KB"),
+        "ai_engine.py": ("def render_ai_lab", 50000, "99 KB"),
+        "runtime_state.py": ("WS_SHARED_STATE", 1500, "3 KB"),
+        "institutional_upgrades.py": (None, 0, "your existing file"),   # existence only: its content is yours, never judged
+    }
+    problems = []
+    for fname, (marker, min_size, good_size) in expected.items():
+        path = os.path.join(here, fname)
+        if not os.path.exists(path):
+            problems.append((fname, "MISSING from the repository root", "-", good_size))
+            continue
+        try:
+            size = os.path.getsize(path)
+            with open(path, "r", encoding="utf-8", errors="ignore") as _fh:
+                text = _fh.read()
+        except Exception as exc:
+            problems.append((fname, f"cannot be read ({type(exc).__name__})", "-", good_size))
+            continue
+        if size < min_size or (marker is not None and marker not in text):
+            problems.append((fname, "EMPTY or INCOMPLETE (wrong content was uploaded)", f"{size / 1024:.1f} KB", good_size))
+    try:
+        stray = sorted(f for f in os.listdir(here) if f.endswith(".py.py") or f.endswith(".txt.txt"))
+    except Exception:
+        stray = []
+    if not problems:
+        return
+    st.set_page_config(page_title="Setup problem", layout="wide")
+    st.error("The app cannot start: one or more of its code files is missing or wrong in your GitHub repository.")
+    lines = ["| File | Problem | Size now | Correct size |", "|---|---|---|---|"]
+    lines += [f"| `{f}` | {why} | {now} | about {good} |" for f, why, now, good in problems]
+    st.markdown("\n".join(lines))
+    st.markdown(
+        "**How to fix:** open each file listed above on GitHub and compare its size with the 'Correct size'. "
+        "Then use **Add file > Upload files**, drag in the real file with exactly that name (for example `database.py`), "
+        "commit, and press **Reboot app**. Do not create the file with an empty 'Name your file' box."
+    )
+    if stray:
+        st.warning("Files with a doubled extension were found (they are ignored by Python): " + ", ".join(stray) +
+                   ". Rename them or delete them.")
+    st.stop()
+
+
+_ec_preflight()
 import yfinance as yf
 import institutional_upgrades as inst
+import runtime_state as rs   # state that must survive Streamlit reruns
 import inspect as _inspect
 
 
@@ -61,7 +120,7 @@ def _ec_export(mod):
 
 _install_streamlit_compat()
 # Visible deployment marker: confirms which source file Streamlit Cloud is running.
-APP_BUILD_ID = "2026-11-13-PCR-LIVEFLOW"
+APP_BUILD_ID = "2026-11-13-PREFLIGHT"
 # Optional integrations: Yahoo mode must still start if Angel SDK/TOTP or
 # the auto-refresh helper is not installed.
 try:
@@ -93,6 +152,11 @@ st.set_page_config(page_title="Elite Trading Dashboard Final Ultimate", layout="
 
 # FILES / CONFIG constants, IST helpers, auth helpers and journal I/O now come from database.py
 import database
+if not hasattr(database, "DATA_DIR"):
+    st.error("Python loaded a 'database' module that is not this app's database.py (loaded from: "
+             f"{getattr(database, '__file__', 'unknown location')}). Make sure database.py from the latest upload is in the repository "
+             "root next to app.py, then press Reboot app.")
+    st.stop()
 _ec_export(database)
 
 MAX_WS_RETRIES = 5
@@ -103,7 +167,7 @@ IDEAL_RR = 3.0
 STRICT_TRADE_ONLY_STRONG = False
 # Configurable group weights applied to the signal engine (1.0 = unchanged).
 SIGNAL_WEIGHTS = {"trend": 1.0, "momentum": 1.0, "price_action": 1.0,
-                  "mtf": 1.0, "options": 1.0, "institutional": 1.0, "macro": 1.0, "smart_money": 1.0}
+                  "mtf": 1.0, "options": 1.0, "institutional": 1.0, "macro": 1.0, "smart_money": 1.0, "option_flow": 1.0}
 DISABLE_BUY_BIAS_TRADING = False
 DISABLE_SELL_BIAS_TRADING = False
 MANDATORY_ADX = 20
@@ -122,24 +186,8 @@ DATA_INTEGRITY_MIN_ROWS = 30
 BACKUP_RETENTION_COUNT = 30
 USE_POLLING_AS_PRIMARY = False  # WebSocket is primary for Angel live LTP; REST polling is fallback.
 
-WS_STATE_LOCK = threading.Lock()
-WS_SHARED_STATE = {
-    "running": False,
-    "connected": False,
-    "error": "",
-    "last_tick": None,
-    "live_price": None,
-    "retries": 0,
-    "should_run": False,
-    "thread_started": False,
-    "symbol": None,
-    "socket": None,
-    "last_data_time": None,
-    "last_tick_epoch": None,
-    "generation": 0,
-    "retry_exhausted": False,
-    "log": []
-}
+WS_STATE_LOCK = rs.WS_STATE_LOCK          # persistent objects (see runtime_state.py)
+WS_SHARED_STATE = rs.WS_SHARED_STATE
 
 # =========================================================
 # BASIC UTILITIES
@@ -316,12 +364,8 @@ def login_panel():
 # =========================================================
 # DATA FETCH
 # =========================================================
-_YAHOO_FETCH_DIAGNOSTICS = {"status": "not_requested", "source": None, "rows": 0, "error": None}
 
 
-_YF_NET_DOWN_UNTIL = 0.0
-_YAHOO_NET_DOWN_UNTIL = 0.0   # circuit breaker: after a network-level failure, skip Yahoo briefly instead of re-waiting per call
-_YAHOO_LAST_ERRORS = {}       # ticker -> last Yahoo error text (shown in the scanner diagnostics panel)
 
 
 def _yahoo_chart_api_frame(ticker, interval, period, use_breaker=True):
@@ -329,8 +373,7 @@ def _yahoo_chart_api_frame(ticker, interval, period, use_breaker=True):
 
     use_breaker=False is used by the parallel scanner so that a couple of slow requests cannot
     make every remaining stock be skipped."""
-    global _YAHOO_NET_DOWN_UNTIL
-    if use_breaker and pytime.time() < _YAHOO_NET_DOWN_UNTIL:
+    if use_breaker and pytime.time() < rs.YAHOO_NET_DOWN_UNTIL:
         return pd.DataFrame(), "Yahoo temporarily skipped after a recent network failure (retrying shortly)"
     range_value = str(period or "7d").lower()
     allowed_ranges = {"1d", "5d", "7d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "ytd", "max",
@@ -391,28 +434,27 @@ def _yahoo_chart_api_frame(ticker, interval, period, use_breaker=True):
                 frame[col] = pd.to_numeric(frame[col], errors="coerce")
             frame = frame.dropna(subset=["Open", "High", "Low", "Close"])
             frame = frame.loc[~frame.index.duplicated(keep="last")].sort_index()
-            _YAHOO_LAST_ERRORS.pop(str(ticker), None)
+            rs.YAHOO_LAST_ERRORS.pop(str(ticker), None)
             return to_ist_naive_index(frame), None
         except Exception as exc:
             last_error = f"{host}: {type(exc).__name__}: {exc}"
             if isinstance(exc, (requests.ConnectionError, requests.Timeout)):
                 _net_failures += 1
     if _net_failures >= 2 and use_breaker:
-        _YAHOO_NET_DOWN_UNTIL = pytime.time() + 15
-    _YAHOO_LAST_ERRORS[str(ticker)] = str(last_error)[:300]
+        rs.YAHOO_NET_DOWN_UNTIL = pytime.time() + 45
+    rs.YAHOO_LAST_ERRORS[str(ticker)] = str(last_error)[:300]
     return pd.DataFrame(), last_error
 
 
 @st.cache_data(max_entries=32, ttl=8, show_spinner=False)
 def _fetch_data_raw(ticker, interval, period):
     """Reliable Yahoo OHLCV loader: chart endpoint first, yfinance as fallback."""
-    global _YAHOO_FETCH_DIAGNOSTICS
     needed = ["Open", "High", "Low", "Close", "Volume"]
     errors = []
     try:
         frame, direct_error = _yahoo_chart_api_frame(ticker, interval, period)
         if not frame.empty:
-            _YAHOO_FETCH_DIAGNOSTICS = {
+            rs.YAHOO_FETCH_DIAGNOSTICS = {
                 "status": "success", "source": "Yahoo Chart API", "rows": int(len(frame)), "error": None,
                 "last_candle": str(frame.index[-1]),
             }
@@ -422,9 +464,8 @@ def _fetch_data_raw(ticker, interval, period):
 
         # Compatibility fallback for installations where Yahoo's chart host is blocked.
         raw = pd.DataFrame()
-        global _YF_NET_DOWN_UNTIL
         _yf_t0 = pytime.time()
-        if pytime.time() < _YF_NET_DOWN_UNTIL:
+        if pytime.time() < rs.YF_NET_DOWN_UNTIL:
             errors.append("yfinance skipped: recent failure (retrying shortly)")
         else:
             try:
@@ -446,7 +487,7 @@ def _fetch_data_raw(ticker, interval, period):
                 raw = pd.DataFrame()
                 errors.append(f"yfinance download: {type(exc).__name__}: {exc}")
             if (raw is None or getattr(raw, "empty", True)) and (pytime.time() - _yf_t0) > 4.0:
-                _YF_NET_DOWN_UNTIL = pytime.time() + 15       # slow + empty = dead network: stop re-waiting
+                rs.YF_NET_DOWN_UNTIL = pytime.time() + 45       # slow + empty = dead network: stop re-waiting
 
         if isinstance(raw, pd.DataFrame) and isinstance(raw.columns, pd.MultiIndex):
             selected_level = None
@@ -480,7 +521,7 @@ def _fetch_data_raw(ticker, interval, period):
 
         if frame.empty:
             message = " | ".join(errors) or "Yahoo returned an empty OHLCV response"
-            _YAHOO_FETCH_DIAGNOSTICS = {"status": "failed", "source": None, "rows": 0, "error": message}
+            rs.YAHOO_FETCH_DIAGNOSTICS = {"status": "failed", "source": None, "rows": 0, "error": message}
             log_app_error("fetch_data", message)
             return pd.DataFrame()
 
@@ -492,7 +533,7 @@ def _fetch_data_raw(ticker, interval, period):
         frame["Volume"] = frame["Volume"].fillna(0)
         frame = frame[~frame.index.duplicated(keep="last")].sort_index()
         frame = to_ist_naive_index(frame)
-        _YAHOO_FETCH_DIAGNOSTICS = {
+        rs.YAHOO_FETCH_DIAGNOSTICS = {
             "status": "success", "source": "yfinance fallback", "rows": int(len(frame)),
             "error": " | ".join(errors) if errors else None,
             "last_candle": str(frame.index[-1]) if not frame.empty else None,
@@ -500,22 +541,65 @@ def _fetch_data_raw(ticker, interval, period):
         return frame
     except Exception as exc:
         message = f"{type(exc).__name__}: {exc}"
-        _YAHOO_FETCH_DIAGNOSTICS = {"status": "failed", "source": None, "rows": 0, "error": message}
+        rs.YAHOO_FETCH_DIAGNOSTICS = {"status": "failed", "source": None, "rows": 0, "error": message}
         log_app_error("fetch_data", message)
         return pd.DataFrame()
 
 
-_LAST_GOOD_FRAMES = {}
-_YAHOO_DIAG_BY_KEY = {}
+
+
+_FETCH_BUDGET_SEC = 7.0        # longest single wait for candles
+_RUN_WAIT_BUDGET_SEC = 9.0     # ALL waits for background network work in one refresh share this budget
+
+
+def _ec_wait_for(fut, want):
+    """Wait for a background network job, but never let one refresh spend more than _RUN_WAIT_BUDGET_SEC waiting in total
+    (candles + 7 timeframes + option chain + FII/DII used to add up to a minute when the network was slow). Once the budget is
+    used, later jobs only report whether they have already finished; their results appear on the next refresh."""
+    used = float(st.session_state.get("_ec_wait_used", 0.0))
+    allow = max(0.0, min(float(want), _RUN_WAIT_BUDGET_SEC - used))
+    t0 = pytime.time()
+    try:
+        return fut.result(timeout=allow)
+    finally:
+        st.session_state["_ec_wait_used"] = used + (pytime.time() - t0)
 
 
 def fetch_data(ticker, interval, period):
+    """Time-boxed candle loader. The real (possibly slow) fetch runs in a background thread; this call waits at most
+    _FETCH_BUDGET_SEC and otherwise returns the last good candles (marked stale) while the fetch keeps going. The
+    next refresh picks up the finished result. A blocked or slow Yahoo can therefore no longer freeze the app."""
+    from concurrent.futures import TimeoutError as _FutTimeout
+    key = (str(ticker), str(interval), str(period))
+    fut = rs.FETCH_PENDING.get(key)
+    if fut is None:
+        fut = rs.FETCH_POOL.submit(_fetch_data_blocking, ticker, interval, period)
+        rs.FETCH_PENDING[key] = fut
+    try:
+        frame = _ec_wait_for(fut, _FETCH_BUDGET_SEC)
+        rs.FETCH_PENDING.pop(key, None)
+        return frame
+    except _FutTimeout:
+        stale = rs.LAST_GOOD_FRAMES.get(key)
+        rs.YAHOO_DIAG_BY_KEY[key] = {"status": "slow", "source": "Yahoo (still loading in the background)",
+                                     "rows": int(len(stale)) if stale is not None else 0,
+                                     "last_candle": str(stale.index[-1]) if stale is not None and len(stale) else None,
+                                     "error": "no answer within this refresh's wait budget (still loading in the background)"}
+        return stale.copy() if stale is not None and not stale.empty else pd.DataFrame()
+    except Exception as exc:
+        rs.FETCH_PENDING.pop(key, None)
+        log_app_error("fetch_data", exc)
+        stale = rs.LAST_GOOD_FRAMES.get(key)
+        return stale.copy() if stale is not None and not stale.empty else pd.DataFrame()
+
+
+def _fetch_data_blocking(ticker, interval, period):
     """Resilient wrapper: retries wider ranges when Yahoo returns nothing, and falls back to the
     last good candles (clearly labelled stale) so the app never goes blank on a temporary Yahoo failure."""
     key = (str(ticker), str(interval), str(period))
     _t_start = pytime.time()
     frame = _fetch_data_raw(ticker, interval, period)
-    diag = dict(_YAHOO_FETCH_DIAGNOSTICS)
+    diag = dict(rs.YAHOO_FETCH_DIAGNOSTICS)
     _fast_empty = (pytime.time() - _t_start) < 6.0     # a dead/blocked network is slow: do not multiply the wait
     if (frame is None or frame.empty) and _fast_empty and str(interval) in ("1m", "2m", "5m"):
         for alt_period in ("5d", "1mo"):
@@ -523,23 +607,24 @@ def fetch_data(ticker, interval, period):
                 continue
             alt = _fetch_data_raw(ticker, interval, alt_period)
             if alt is not None and not alt.empty:
-                frame, diag = alt, dict(_YAHOO_FETCH_DIAGNOSTICS)
+                frame, diag = alt, dict(rs.YAHOO_FETCH_DIAGNOSTICS)
                 break
+    rs.LAST_FETCH_SECONDS[key] = round(pytime.time() - _t_start, 1)
     if frame is not None and not frame.empty:
-        _LAST_GOOD_FRAMES[key] = frame.copy()
+        rs.LAST_GOOD_FRAMES[key] = frame.copy()
         diag["rows"] = int(len(frame))
         diag["last_candle"] = str(frame.index[-1])
         diag["source"] = diag.get("source") or "Yahoo Finance"
-        _YAHOO_DIAG_BY_KEY[key] = diag
+        rs.YAHOO_DIAG_BY_KEY[key] = diag
         return frame
-    stale = _LAST_GOOD_FRAMES.get(key)
+    stale = rs.LAST_GOOD_FRAMES.get(key)
     if stale is not None and not stale.empty:
-        _YAHOO_DIAG_BY_KEY[key] = {
+        rs.YAHOO_DIAG_BY_KEY[key] = {
             "status": "stale", "source": "Yahoo (last good data, live refresh failed)",
             "rows": int(len(stale)), "last_candle": str(stale.index[-1]), "error": diag.get("error"),
         }
         return stale.copy()
-    _YAHOO_DIAG_BY_KEY[key] = diag
+    rs.YAHOO_DIAG_BY_KEY[key] = diag
     return pd.DataFrame()
 
 
@@ -2005,25 +2090,24 @@ def fetch_yahoo_batch(tickers, interval, period):
     _key = (ticker_list, str(interval), str(period))
     # Speed: after a fully failed batch, do not re-hammer Yahoo on every 15 s rerun.
     # A short pause (25 s) keeps the page responsive; manual refresh clears it via .clear().
-    if pytime.time() < _BATCH_FAIL_UNTIL.get(_key, 0):
+    if pytime.time() < rs.BATCH_FAIL_UNTIL.get(_key, 0):
         return {t: pd.DataFrame() for t in ticker_list}
     result = _fetch_yahoo_batch_cached(ticker_list, str(interval), str(period))
     if ticker_list and all((result.get(t) is None or result[t].empty) for t in ticker_list):
-        _BATCH_FAIL_UNTIL[_key] = pytime.time() + 25
+        rs.BATCH_FAIL_UNTIL[_key] = pytime.time() + 25
         try:
             _fetch_yahoo_batch_cached.clear()
         except Exception:
             pass
     else:
-        _BATCH_FAIL_UNTIL.pop(_key, None)
+        rs.BATCH_FAIL_UNTIL.pop(_key, None)
     return result
 
 
-_BATCH_FAIL_UNTIL = {}
 
 
 def _clear_batch_cache():
-    _BATCH_FAIL_UNTIL.clear()
+    rs.BATCH_FAIL_UNTIL.clear()
     _fetch_yahoo_batch_cached.clear()
 
 
@@ -2067,10 +2151,10 @@ def _yahoo_spark_quotes(tickers):
                     if prev is None and len(vals) >= 2:
                         prev = vals[-2]
                     out[str(sym)] = {"price": vals[-1], "prev": float(prev) if prev else None}
-                _YAHOO_LAST_ERRORS.pop("spark", None)
+                rs.YAHOO_LAST_ERRORS.pop("spark", None)
                 break
             except Exception as exc:
-                _YAHOO_LAST_ERRORS["spark"] = f"{host}: {type(exc).__name__}: {str(exc)[:200]}"
+                rs.YAHOO_LAST_ERRORS["spark"] = f"{host}: {type(exc).__name__}: {str(exc)[:200]}"
     return out
 
 
@@ -2097,8 +2181,8 @@ def render_scanner_diagnostics():
                     rows.append({"Test": label, "Result": f"{type(exc).__name__}", "Seconds": round(pytime.time() - t0, 2),
                                  "Response start": str(exc)[:160]})
             st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-        errs = [{"Ticker": t, "Last Yahoo error": _YAHOO_LAST_ERRORS[t]} for t in list(NIFTY_TOP30.values()) + ["spark"]
-                if t in _YAHOO_LAST_ERRORS]
+        errs = [{"Ticker": t, "Last Yahoo error": rs.YAHOO_LAST_ERRORS[t]} for t in list(NIFTY_TOP30.values()) + ["spark"]
+                if t in rs.YAHOO_LAST_ERRORS]
         if errs:
             st.markdown("**Last recorded errors**")
             st.dataframe(pd.DataFrame(errs), use_container_width=True, hide_index=True)
@@ -2518,8 +2602,8 @@ def score_macro_bias(snapshot, geo=None, news_info=None):
     }
 
 
-_MACRO_BG = {"ctx": None, "ts": 0.0, "running": False, "geo": True}
-_MACRO_BG_LOCK = threading.Lock()
+_MACRO_BG = rs.MACRO_BG              # persistent (see runtime_state.py); a per-run copy made every refresh wait for the macro thread again
+_MACRO_BG_LOCK = rs.MACRO_BG_LOCK
 
 
 def _macro_bg_worker(news_info, use_geo_news):
@@ -3359,7 +3443,6 @@ def get_news_events(api_key, symbol, provider="Marketaux", lookback_hours=6, art
 # =========================================================
 # OPTION CHAIN / PCR / OI
 # =========================================================
-_NSE_DOWN_UNTIL = 0.0   # circuit breaker: NSE blocks most cloud IPs; do not re-wait on every cache miss
 
 
 _NSE_BROWSER_HEADERS = {
@@ -3410,10 +3493,8 @@ def _nse_option_chain_download(symbol):
     return None
 
 
-@st.cache_data(max_entries=32, ttl=120)
-def get_option_chain_snapshot(symbol="NIFTY"):
+def _option_chain_worker(symbol="NIFTY"):
     """Live option chain, else the last good snapshot (marked stale), else None."""
-    global _NSE_DOWN_UNTIL
 
     def _last_good():
         try:
@@ -3428,12 +3509,12 @@ def get_option_chain_snapshot(symbol="NIFTY"):
             pass
         return None
 
-    if pytime.time() < _NSE_DOWN_UNTIL:
+    if pytime.time() < rs.NSE_DOWN_UNTIL:
         return _last_good()
     try:
         data = _nse_option_chain_download(symbol)
         if not data:
-            _NSE_DOWN_UNTIL = pytime.time() + 120      # NSE refused / blocked this server; retry in 2 minutes
+            rs.NSE_DOWN_UNTIL = pytime.time() + 120      # NSE refused / blocked this server; retry in 2 minutes
             log_app_error("get_option_chain_snapshot", "NSE returned no option chain (blocked or empty)")
             return _last_good()
         try:
@@ -3444,9 +3525,39 @@ def get_option_chain_snapshot(symbol="NIFTY"):
         data["_ec_meta"] = {"stale": False, "saved_at": now_str()}
         return data
     except Exception as e:
-        _NSE_DOWN_UNTIL = pytime.time() + 120
+        rs.NSE_DOWN_UNTIL = pytime.time() + 120
         log_app_error("get_option_chain_snapshot", e)
         return _last_good()
+
+
+def get_option_chain_snapshot(symbol="NIFTY"):
+    """Option chain without ever blocking the page: fresh copy (< 2 min) from memory, else the download runs in the
+    background and we wait only what is left of this refresh's budget; otherwise the last good snapshot is returned."""
+    from concurrent.futures import TimeoutError as _FutTimeout
+    now = pytime.time()
+    ent = rs.OPTION_CHAIN.get(symbol)
+    if ent and now - ent["ts"] < 120:
+        return ent["data"]
+    fkey = ("option_chain", symbol)
+    fut = rs.FETCH_PENDING.get(fkey)
+    if fut is None and now >= rs.NSE_DOWN_UNTIL:
+        fut = rs.FETCH_POOL.submit(_option_chain_worker, symbol)
+        rs.FETCH_PENDING[fkey] = fut
+    if fut is not None:
+        try:
+            data = _ec_wait_for(fut, 3.0)
+            rs.FETCH_PENDING.pop(fkey, None)
+            rs.OPTION_CHAIN[symbol] = {"ts": pytime.time(), "data": data}
+            return data
+        except _FutTimeout:
+            pass
+        except Exception as exc:
+            rs.FETCH_PENDING.pop(fkey, None)
+            log_app_error("get_option_chain_snapshot", exc)
+    return ent["data"] if ent else None
+
+
+get_option_chain_snapshot.clear = lambda: rs.OPTION_CHAIN.clear()
 
 
 def get_dynamic_option_chain_symbol(selected_symbol):
@@ -3728,6 +3839,7 @@ def analyze_signal(
     macro_info=None,
     macro_hard_block=False,
     smart_money_info=None,
+    option_flow_info=None,
 ):
     """Explainable multi-factor signal engine.
 
@@ -4076,6 +4188,24 @@ def analyze_signal(
         bullish, bearish = _mark("smart_money", "Smart Money (FII / DII cash flows)", bullish, bearish, False,
                                   "FII/DII data unavailable or disabled; contributes 0")
 
+    # ================= OPTION FLOW (day OI change + live Put/Call volume flow; live only, max +/-1 point) =================
+    flow_points = 0.0
+    if isinstance(option_flow_info, dict) and option_flow_info.get("available"):
+        flow_points = float(option_flow_info.get("signal_points", 0.0) or 0.0)
+        if flow_points > 0:
+            bullish += flow_points
+            reasons.append(f"Option flow {option_flow_info.get('label')} (+{flow_points:.2f} bullish)")
+        elif flow_points < 0:
+            bearish += -flow_points
+            reasons.append(f"Option flow {option_flow_info.get('label')} (+{-flow_points:.2f} bearish)")
+        else:
+            reasons.append("Option flow neutral")
+        bullish, bearish = _mark("option_flow", "Option flow (OI change + live Put/Call volume)",
+                                  bullish, bearish, True, str(option_flow_info.get("summary", "")))
+    else:
+        bullish, bearish = _mark("option_flow", "Option flow (OI change + live Put/Call volume)", bullish, bearish, False,
+                                  "Option-chain flow unavailable or disabled; contributes 0")
+
     regime = detect_market_regime(df)
     _news_message_for_regime = str((news_info or {}).get("message", ""))
     if (news_info or {}).get("status") == "ok" and "News risk detected" in _news_message_for_regime:
@@ -4303,6 +4433,9 @@ def analyze_signal(
         "smart_money_points": round(smart_points, 2),
         "smart_money_label": (smart_money_info or {}).get("label", "N/A") if isinstance(smart_money_info, dict) else "N/A",
         "smart_money_summary": (smart_money_info or {}).get("summary", "") if isinstance(smart_money_info, dict) else "",
+        "option_flow_points": round(flow_points, 2),
+        "option_flow_label": (option_flow_info or {}).get("label", "N/A") if isinstance(option_flow_info, dict) else "N/A",
+        "option_flow_summary": (option_flow_info or {}).get("summary", "") if isinstance(option_flow_info, dict) else "",
         "liquidity_block_buy": liquidity_block_buy,
         "liquidity_block_sell": liquidity_block_sell, "signal_weights": _w,
         "liquidity_block_entry": bool(liquidity_block_buy or liquidity_block_sell),
@@ -6120,6 +6253,8 @@ _ec_css = ["""
 for _i, _d in enumerate(_EC_PAGE_DEFS):
     if _d[0] != _ec_active:
         _ec_css.append(f".st-key-ec_pg_{_i}{{display:none !important;}}")
+        # an error raised while a hidden page is the active container must never be invisible: reveal that page
+        _ec_css.append(f'.st-key-ec_pg_{_i}:has([data-testid="stException"]){{display:flex !important;}}')
         _ec_css.append(f'[data-testid="stVerticalBlock"]:has(> [data-testid="stElementContainer"] > [data-testid="stMarkdown"] .ec-pg-{_i}){{display:none !important;}}')
         _ec_css.append(f'[data-testid="stVerticalBlock"]:has(> .element-container .ec-pg-{_i}){{display:none !important;}}')
 st.markdown("<style>" + "\n".join(_ec_css) + "</style>", unsafe_allow_html=True)
@@ -6135,6 +6270,10 @@ def _ec_new_container(key):
 _EC_ALWAYS = _ec_new_container("ec_pg_always")  # shown on every page: symbol / source / timeframe and refresh controls
 _EC_CONTAINERS = {}
 _EC_DASH_TOP = None
+_EC_DASH_PRICE = None
+_EC_DASH_PROGRESS = None
+_EC_RUN_T0 = pytime.time()
+st.session_state["_ec_wait_used"] = 0.0   # fresh network-wait budget for this refresh
 for _i, (_key, _label, _desc) in enumerate(_EC_PAGE_DEFS):
     _c = _ec_new_container(f"ec_pg_{_i}")
     with _c:
@@ -6143,6 +6282,9 @@ for _i, (_key, _label, _desc) in enumerate(_EC_PAGE_DEFS):
         st.caption(_desc)
         if _key == "Dashboard":
             _EC_DASH_TOP = st.container()      # headline strip, filled in once the analysis is ready
+            _EC_DASH_PRICE = _EC_DASH_TOP.empty()   # live price: filled as soon as candles arrive, before the heavy analysis
+            _EC_DASH_PRICE.info("⏳ Loading live price…")
+            _EC_DASH_PROGRESS = _EC_DASH_TOP.empty()  # shows which step the refresh is on and how long it took
     _EC_CONTAINERS[_key] = _c
 _EC_ACTIVE_CTX = None
 
@@ -6209,6 +6351,44 @@ try:                                            # charts drawn while hidden need
         _ec_components.html("<script>setTimeout(function(){try{window.parent.dispatchEvent(new Event('resize'));}catch(e){}},400);</script>", height=0)
 except Exception:
     pass
+
+
+def _ec_stage(label):
+    """Dashboard: which step is running and the elapsed time. If a refresh ever stalls, the label shows where."""
+    try:
+        ph = globals().get("_EC_DASH_PROGRESS")
+        if ph is not None and _ec_active == "Dashboard":
+            ph.caption(f"⏱ {label} … {pytime.time() - _EC_RUN_T0:.1f}s")
+    except Exception:
+        pass
+
+
+def _ec_render_early_price(data):
+    """Dashboard: show the price the moment candles are available (the full strip below needs the whole analysis)."""
+    ph = globals().get("_EC_DASH_PRICE")
+    if ph is None:
+        return
+    try:
+        with ph.container():
+            if data is None or getattr(data, "empty", True):
+                st.warning("⏳ Price not loaded yet: the data provider is slow or blocked. Showing it as soon as it answers "
+                           "(auto refresh retries). 🧹 Clear cache & reset feeds can force a fresh start.")
+                return
+            last = float(data["Close"].iloc[-1])
+            prev = float(data["Close"].iloc[-2]) if len(data) > 1 else last
+            live = globals().get("angel_ltp_value")
+            if live is None:
+                live = globals().get("upstox_ltp_value")
+            shown = float(live) if live is not None else last
+            _diag = rs.YAHOO_DIAG_BY_KEY.get((str(globals().get("ticker")), str(globals().get("yf_interval")), str(globals().get("yf_period"))), {})
+            tag = "STALE (last good data)" if _diag.get("status") in ("stale", "slow") else ("live quote" if live is not None else "latest candle")
+            c = st.columns(4)
+            c[0].metric(f"{globals().get('selected', '')} price", f"{shown:,.2f}", f"{shown - prev:+,.2f} ({(shown - prev) / prev * 100:+.2f}%)" if prev else None)
+            c[1].metric("Price type", tag)
+            c[2].metric("Last candle", str(data.index[-1])[:19])
+            c[3].metric("Source / candles", f"{globals().get('active_data_source', 'n/a')} / {len(data):,}")
+    except Exception as exc:
+        log_app_error("ec_early_price", exc)
 
 
 def _ec_render_dashboard_strip(selected, timeframe, analysis, data):
@@ -6279,7 +6459,7 @@ def _ec_render_dashboard_strip(selected, timeframe, analysis, data):
                         if len(_h) >= 3:
                             st.line_chart(_h[["Call", "Put"]], height=180)
                 else:
-                    _wait = max(0, int(_NSE_DOWN_UNTIL - pytime.time()))
+                    _wait = max(0, int(rs.NSE_DOWN_UNTIL - pytime.time()))
                     st.warning("Put / Call volume and PCR are unavailable: NSE did not return the option chain to this server "
                                "(NSE often blocks cloud IPs). " + (f"Retrying in {_wait}s." if _wait else "Retrying on the next refresh."))
     except Exception as exc:
@@ -6290,15 +6470,38 @@ def _ec_render_dashboard_strip(selected, timeframe, analysis, data):
 # EXTRA PAGES: Top Opportunities | System Health | Daily Feature Validation |
 # Production Readiness | Smart Money Tracker  (additive; every block is isolated)
 # =========================================================
-_FIIDII_DOWN_UNTIL = 0.0
 
 
-@st.cache_data(max_entries=32, ttl=600, show_spinner=False)
 def fetch_fii_dii_flows():
+    """Non-blocking wrapper: memory copy (10 min, failures 2 min), else the NSE request runs in the background."""
+    from concurrent.futures import TimeoutError as _FutTimeout
+    now = pytime.time()
+    ent = rs.FIIDII.get("v")
+    if ent and now - ent["ts"] < (600 if ent["data"].get("ok") else 120):
+        return ent["data"]
+    fut = rs.FETCH_PENDING.get("fii_dii")
+    if fut is None:
+        fut = rs.FETCH_POOL.submit(_fii_dii_worker)
+        rs.FETCH_PENDING["fii_dii"] = fut
+    try:
+        data = _ec_wait_for(fut, 2.5)
+        rs.FETCH_PENDING.pop("fii_dii", None)
+        rs.FIIDII["v"] = {"ts": pytime.time(), "data": data}
+        return data
+    except _FutTimeout:
+        return ent["data"] if ent else {"ok": False, "error": "still loading in the background (shown on the next refresh)"}
+    except Exception as exc:
+        rs.FETCH_PENDING.pop("fii_dii", None)
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
+fetch_fii_dii_flows.clear = lambda: rs.FIIDII.clear()
+
+
+def _fii_dii_worker():
     """Latest FII/FPI and DII cash-market flows (Rs crore) from NSE. Real data only: if NSE blocks the
     request the result says so; nothing is invented."""
-    global _FIIDII_DOWN_UNTIL
-    if pytime.time() < _FIIDII_DOWN_UNTIL:
+    if pytime.time() < rs.FIIDII_DOWN_UNTIL:
         return {"ok": False, "error": "NSE recently blocked the request; retrying shortly."}
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0 Safari/537.36",
                "Accept": "application/json,text/plain,*/*", "Referer": "https://www.nseindia.com/reports/fii-dii"}
@@ -6321,9 +6524,50 @@ def fetch_fii_dii_flows():
             raise RuntimeError("NSE response had no FII/DII rows")
         return out
     except Exception as exc:
-        _FIIDII_DOWN_UNTIL = pytime.time() + 300
+        rs.FIIDII_DOWN_UNTIL = pytime.time() + 300
         log_app_error("fii_dii", f"{type(exc).__name__}: {exc}")
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
+def build_option_flow_context(om, flow):
+    """Turn the option chain into one explainable signal input (range +/-1.0).
+
+    1) OI-change part (+/-0.5): which side is ADDING open interest today. Put OI building faster than Call OI is
+       writing/support under the market (bullish); Call OI building faster is writing/resistance above it (bearish).
+       Open-interest change, unlike raw volume, separates writing from squaring-off.
+    2) Live-volume part (+/-0.5): volume added in the last ~15 min. When the busier side (Put or Call volume) is the same
+       side that is adding OI, the flow is confirmed (full weight); when the opposite side is busier the OI signal is
+       dampened. One-sidedness counts: a 2:1 Put:Call (or Call:Put) ratio is full strength. A weak / balanced OI change
+       means volume cannot add much on its own.
+    Unavailable (stale snapshot / NSE blocked / SENSEX) contributes nothing. Live only: no historical option data to replay."""
+    try:
+        if not isinstance(om, dict) or not (om.get("call_oi") or om.get("put_oi")):
+            return {"available": False, "summary": "option chain unavailable"}
+        if om.get("chain_stale"):
+            return {"available": False, "summary": f"option chain is a stale snapshot ({om.get('chain_saved_at')})"}
+        ce, pe = float(om.get("call_change_oi") or 0), float(om.get("put_change_oi") or 0)
+        tot = abs(ce) + abs(pe)
+        oi_part = 0.5 * float(np.clip((pe - ce) / tot, -1, 1)) if tot > 0 else 0.0
+        vol_part, vol_txt = 0.0, "volume flow still collecting"
+        if isinstance(flow, dict) and flow.get("live_pcr") and (flow.get("d_call", 0) + flow.get("d_put", 0)) > 0 and oi_part != 0:
+            strength = float(np.clip(abs(np.log(float(flow["live_pcr"]))) / np.log(2.0), 0, 1))
+            put_busier = float(flow["live_pcr"]) > 1
+            agrees = put_busier == (oi_part > 0)
+            clarity = min(1.0, abs(oi_part) / 0.5)      # volume can only confirm / dampen an OI signal that is actually clear
+            vol_part = float(np.sign(oi_part)) * 0.5 * strength * clarity * (1.0 if agrees else -0.5)
+            vol_txt = (f"volume added {flow['minutes']:.0f}m: Call {flow['d_call']:,} / Put {flow['d_put']:,} "
+                       f"({'confirms' if agrees else 'dampens'} the OI signal)")
+        elif isinstance(flow, dict):
+            vol_txt = "no new volume in the window"
+        pts = round(oi_part + vol_part, 2)
+        pts = 0.0 if abs(pts) < 0.10 else pts
+        label = ("Bullish" if pts >= 0.5 else "Mildly bullish" if pts > 0 else
+                 "Bearish" if pts <= -0.5 else "Mildly bearish" if pts < 0 else "Neutral")
+        return {"available": True, "signal_points": pts, "label": label, "oi_part": round(oi_part, 2), "vol_part": round(vol_part, 2),
+                "summary": f"Day OI change: Call {ce:+,.0f} / Put {pe:+,.0f}; {vol_txt}"}
+    except Exception as exc:
+        log_app_error("option_flow_context", exc)
+        return {"available": False, "summary": f"option flow unavailable ({type(exc).__name__})"}
 
 
 def build_smart_money_context(max_age_days=4):
@@ -6474,15 +6718,23 @@ def _ec_render_system_health(analysis, data):
             recent = int((dt > (pd.Timestamp(ist_now()).tz_localize(None) - pd.Timedelta(hours=1))).sum())
     except Exception:
         recent = 0
-    yd = _YAHOO_FETCH_DIAGNOSTICS if isinstance(_YAHOO_FETCH_DIAGNOSTICS, dict) else {}
+    yd = rs.YAHOO_FETCH_DIAGNOSTICS if isinstance(rs.YAHOO_FETCH_DIAGNOSTICS, dict) else {}
     feed_ok = isinstance(data, pd.DataFrame) and not data.empty
-    breaker = max(0, int(_YAHOO_NET_DOWN_UNTIL - pytime.time()))
+    breaker = max(0, int(rs.YAHOO_NET_DOWN_UNTIL - pytime.time()))
     c = st.columns(5)
     c[0].metric("Price feed", "Online" if feed_ok else "No candles", str(globals().get("active_data_source", "n/a")))
     c[1].metric("Yahoo", str(yd.get("status", "n/a")), f"{yd.get('rows', 0)} rows")
     c[2].metric("Yahoo pause", f"{breaker}s" if breaker else "None")
     c[3].metric("Errors (last hour)", recent, f"{len(err)} logged" if len(err) else None)
     c[4].metric("Build", str(APP_BUILD_ID)[-14:])
+    c3 = st.columns(3)
+    c3[0].metric("Last full run (s)", st.session_state.get("ec_last_run_secs", "n/a"))
+    _fs = list(rs.LAST_FETCH_SECONDS.values())
+    c3[1].metric("Slowest data fetch (s)", max(_fs) if _fs else "n/a")
+    c3[2].metric("Background fetches running", sum(1 for f in rs.FETCH_PENDING.values() if not f.done()))
+    if st.button("🧹 Clear cache & reset feeds", key="ec_clear_cache_btn_health"):
+        _ec_clear_everything()
+        st.rerun()
     c2 = st.columns(3)
     c2[0].metric("Storage", "Persistent" if STORAGE_IS_CONFIGURED else "Temporary")
     c2[1].metric("Auto-refresh", "On" if (globals().get("auto_refresh") and AUTO_REFRESH_AVAILABLE) else "Off")
@@ -6635,6 +6887,23 @@ if refresh_market_now:
 else:
     st.session_state["force_market_refresh"] = False
 
+def _ec_clear_everything():
+    """Manual reset: Streamlit caches, circuit breakers, stale candles, pending background fetches."""
+    try:
+        st.cache_data.clear()
+    except Exception as _e:
+        log_app_error("clear_cache_data", _e)
+    rs.clear_all()
+    for _k in ("angel_history_cache", "tf_frame_cache"):
+        st.session_state[_k] = {}
+    st.session_state["last_manual_refresh_at"] = now_str() + " (cache cleared)"
+
+
+if st.button("🧹 Clear cache & reset feeds", key="ec_clear_cache_btn",
+             help="Clears every cache, the Yahoo/NSE retry pauses and any stale prices, then reloads. Your login and journal are not touched."):
+    _ec_clear_everything()
+    st.rerun()
+
 if st.session_state.get("last_manual_refresh_at"):
     st.caption("Last manual refresh: " + str(st.session_state["last_manual_refresh_at"]))
 if auto_refresh and AUTO_REFRESH_AVAILABLE:
@@ -6648,6 +6917,30 @@ else:
 # boards must continue to refresh even if the selected primary chart feed fails.
 if auto_refresh and AUTO_REFRESH_AVAILABLE:
     st_autorefresh(interval=refresh_seconds * 1000, key="elite_live_market_board_refresh")
+
+def _ec_render_option_flow_signal_point(analysis):
+    """Signals page: the Option-flow point that is part of the live score."""
+    try:
+        of = st.session_state.get("option_flow_info_latest") or {}
+        st.subheader("📊 Option flow point (OI change + live Put/Call volume)")
+        if not of.get("available"):
+            st.info(f"Option flow is not contributing to this signal: {of.get('summary', 'no data')}.")
+            return
+        c = st.columns(4)
+        c[0].metric("Option flow", str(of.get("label")))
+        c[1].metric("Points added to score", f"{float(of.get('signal_points', 0.0)):+.2f}")
+        c[2].metric("From OI change", f"{float(of.get('oi_part', 0.0)):+.2f}")
+        c[3].metric("From live volume", f"{float(of.get('vol_part', 0.0)):+.2f}")
+        pts = float(of.get("signal_points", 0.0))
+        side = str((analysis or {}).get("signal_type") or "").lower()
+        if pts and side in ("buy", "sell"):
+            agrees = (pts > 0 and side == "buy") or (pts < 0 and side == "sell")
+            st.caption(("✅ Option flow agrees with" if agrees else "⚠ Option flow is against") + f" the current {side.upper()} signal. {of.get('summary')}")
+        else:
+            st.caption(str(of.get("summary")))
+    except Exception as exc:
+        log_app_error("option_flow_signal_point", exc)
+
 
 def _ec_render_smart_money_signal_point(analysis):
     """Signals page: the Smart Money point that is part of the live score."""
@@ -6679,6 +6972,8 @@ with st.expander("Macro / Geo-political Bias Settings"):
     st.checkbox("Include geo-political headline scan (Google News RSS, no API key)", value=True, key="use_geo_news")
     st.checkbox("Hard-block entries against an extreme macro backdrop", value=False, key="macro_hard_block")
     st.checkbox("Use Smart Money (FII / DII cash flows) in live signals", value=True, key="use_smart_money")
+    st.checkbox("Use live option flow (OI change + Put/Call volume) in live signals", value=True, key="use_option_flow")
+    st.caption("Option flow adds at most +/-1 point (on top of the PCR point): day OI change decides the side, live Put/Call volume confirms or dampens it. Live only.")
     st.caption("Smart money adds at most +/-1 point to the live score (FII weighted 70%, DII 30%). Live only: not replayed in backtests.")
     st.caption("Macro adds at most +/-2 points to the live score. It is not replayed in backtests (no historical macro/news archive).")
 
@@ -7131,7 +7426,7 @@ else:
     with st.spinner(f"Yahoo Finance: loading {ticker} ({yf_interval})…"):
         data = fetch_data(ticker, yf_interval, yf_period)
     yahoo_primary_rows = int(len(data))
-    _yahoo_diag = dict(_YAHOO_DIAG_BY_KEY.get((str(ticker), str(yf_interval), str(yf_period)), _YAHOO_FETCH_DIAGNOSTICS))
+    _yahoo_diag = dict(rs.YAHOO_DIAG_BY_KEY.get((str(ticker), str(yf_interval), str(yf_period)), rs.YAHOO_FETCH_DIAGNOSTICS))
     if data.empty:
         st.error(
             f"Yahoo OHLC fetch failed for {ticker} / {yf_interval}. "
@@ -7164,13 +7459,14 @@ else:
 
 if data.empty:
     _ec_section("Dashboard")   # price / feed status belongs on the Dashboard (was landing on the hidden Market page)
+    _ec_render_early_price(data)   # replaces the "Loading live price" placeholder with the reason
     # Quote retrieval is independent of OHLC history: even if Yahoo candles fail,
     # show a clearly-labelled latest quote/bar when Yahoo can provide one.
     if data_source == "Yahoo":
         _yahoo_empty_quote = fetch_yahoo_ltp(ticker)
         if _yahoo_empty_quote.get("price") is None:
-            try:   # last resort: one lightweight spark request
-                _sp = _yahoo_spark_quotes([ticker]).get(ticker) or {}
+            try:   # last resort: one lightweight spark request (skipped while Yahoo is in its retry pause)
+                _sp = (_yahoo_spark_quotes([ticker]).get(ticker) or {}) if pytime.time() >= rs.YAHOO_NET_DOWN_UNTIL else {}
                 if _sp.get("price") is not None:
                     _yahoo_empty_quote = {"price": _sp["price"], "source": "Yahoo spark quote", "status": "spark_fallback", "timestamp": None}
             except Exception as _sp_err:
@@ -7189,8 +7485,8 @@ if data.empty:
         else:
             st.warning("Yahoo quote and intraday candles are both unavailable. Check the Yahoo fetch diagnostic above and the deployment network/logs.")
             try:
-                _why = {k: v for k, v in dict(_YAHOO_LAST_ERRORS).items() if str(k) == str(ticker)} or dict(list(_YAHOO_LAST_ERRORS.items())[-3:])
-                st.caption(f"Yahoo diagnostics: {_YAHOO_FETCH_DIAGNOSTICS} | last errors: {_why}")
+                _why = {k: v for k, v in dict(rs.YAHOO_LAST_ERRORS).items() if str(k) == str(ticker)} or dict(list(rs.YAHOO_LAST_ERRORS.items())[-3:])
+                st.caption(f"Yahoo diagnostics: {rs.YAHOO_FETCH_DIAGNOSTICS} | last errors: {_why}")
             except Exception:
                 pass
     if data_source == "Angel" and (polling_mode or ws_enable):
@@ -7281,6 +7577,7 @@ if data.empty:
 if active_data_source != data_source:
     st.info(f"Selected source: {data_source} | Actual OHLC candle source: {active_data_source}. The data source is labelled separately so fallback data is not mistaken for broker data.")
 
+_ec_render_early_price(data)   # price appears now, not after the whole analysis has run
 _ec_section("Market")   # from here the charts / analytics belong to the Market page
 
 if timeframe == "3m":
@@ -7290,9 +7587,11 @@ elif timeframe == "10m":
 
 ok, msg = data_integrity_check(data, ["Open", "High", "Low", "Close", "Volume"], min_rows=2)
 if not ok:
+    _ec_section("__always__")   # visible on every page (it used to land on the hidden Market page)
     st.error(f"Data integrity failed: {msg}")
     st.stop()
 
+_ec_stage("Indicators")
 data = add_indicators(data).replace([np.inf, -np.inf], np.nan).ffill()
 # Keep interactive backtests bounded. Indicator columns are already computed on
 # the full chart frame; 1,200 recent bars provide a responsive intraday sample.
@@ -7302,6 +7601,7 @@ backtest_data = data.tail(MAX_BACKTEST_BARS).copy()
 if len(data) < 35:
     st.warning(f"Only {len(data)} candles available. Live price / chart can display, but backtest and some long-period indicators need more history.")
 
+_ec_stage("Multi-timeframe data")
 htf_interval, _ = get_higher_timeframe(timeframe)
 angel_creds = (angel_api_key, angel_client_code, angel_pin, angel_totp_secret)
 htf_data = get_tf_indicator_frame(active_data_source, selected, ticker, htf_interval, angel_creds)
@@ -7337,6 +7637,7 @@ bull_count = sum("Bullish" in sig for sig in mtf_table["Trend"])
 bear_count = sum("Bearish" in sig for sig in mtf_table["Trend"])
 mtf_available_count = sum("N/A" not in str(sig) for sig in mtf_table["Trend"])
 
+_ec_stage("Option chain / PCR")
 dynamic_oc_symbol = get_dynamic_option_chain_symbol(selected)
 option_metrics = parse_option_chain_metrics(dynamic_oc_symbol) if dynamic_oc_symbol else {
     "pcr": None, "oi_bias": "N/A", "long_unwinding": False,
@@ -7345,6 +7646,12 @@ option_metrics = parse_option_chain_metrics(dynamic_oc_symbol) if dynamic_oc_sym
 
 if dynamic_oc_symbol:
     record_option_volume(dynamic_oc_symbol, option_metrics)   # live Put/Call volume history
+option_flow_info = {"available": False, "summary": "Option flow input is switched off in Settings"}
+if dynamic_oc_symbol and st.session_state.get("use_option_flow", True):
+    option_flow_info = build_option_flow_context(option_metrics, option_volume_live_flow(dynamic_oc_symbol, 15))
+elif not dynamic_oc_symbol:
+    option_flow_info = {"available": False, "summary": "NSE option chain is available for NIFTY / BANKNIFTY only"}
+st.session_state["option_flow_info_latest"] = option_flow_info
 
 news_info = {
     "allow_trade": True, "message": "News filter disabled", "events": [],
@@ -7423,6 +7730,7 @@ if st.session_state.get("use_smart_money", True):
     smart_money_info = build_smart_money_context()
 st.session_state["smart_money_info_latest"] = smart_money_info
 
+_ec_stage("Signal analysis")
 analysis = analyze_signal(
     data,
     htf_bias=htf_bias,
@@ -7441,6 +7749,7 @@ analysis = analyze_signal(
     macro_info=macro_info,
     macro_hard_block=bool(st.session_state.get("macro_hard_block", False)),
     smart_money_info=smart_money_info,
+    option_flow_info=option_flow_info,
 )
 analysis = apply_adaptive_signal_intelligence(
     data, analysis, selected, timeframe,
@@ -7461,6 +7770,7 @@ equity_curve_df, max_drawdown = compute_equity_curve_from_trades(backtest_trades
 
 _ec_section("Signals")
 _ec_render_smart_money_signal_point(analysis)   # Smart Money point, shown on the Signals page
+_ec_render_option_flow_signal_point(analysis)    # Option flow point (OI change + live Put/Call volume)
 with st.expander("🏛️ Institutional Signal Participation Audit", expanded=False):
     _inst_audit = analysis.get("institutional_participation_audit", {})
     if _inst_audit:
@@ -8966,3 +9276,6 @@ except Exception as _inst_ui_err:
 _ec_render_dashboard_strip(selected, timeframe, analysis, data)
 _ec_render_ai_lab_pages(selected, timeframe, data, analysis, backtest_trades_df)
 _ec_render_extra_pages(analysis, data)
+st.session_state["ec_last_run_secs"] = round(pytime.time() - _EC_RUN_T0, 1)
+if _EC_DASH_PROGRESS is not None and _ec_active == "Dashboard":
+    _EC_DASH_PROGRESS.caption(f"✅ Updated in {st.session_state['ec_last_run_secs']}s (network waits {st.session_state.get('_ec_wait_used', 0):.1f}s)")
