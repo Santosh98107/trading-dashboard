@@ -61,7 +61,7 @@ def _ec_export(mod):
 
 _install_streamlit_compat()
 # Visible deployment marker: confirms which source file Streamlit Cloud is running.
-APP_BUILD_ID = "2026-11-13-SPLIT-MODULES"
+APP_BUILD_ID = "2026-11-13-PCR-LIVEFLOW"
 # Optional integrations: Yahoo mode must still start if Angel SDK/TOTP or
 # the auto-refresh helper is not installed.
 try:
@@ -103,7 +103,7 @@ IDEAL_RR = 3.0
 STRICT_TRADE_ONLY_STRONG = False
 # Configurable group weights applied to the signal engine (1.0 = unchanged).
 SIGNAL_WEIGHTS = {"trend": 1.0, "momentum": 1.0, "price_action": 1.0,
-                  "mtf": 1.0, "options": 1.0, "institutional": 1.0, "macro": 1.0}
+                  "mtf": 1.0, "options": 1.0, "institutional": 1.0, "macro": 1.0, "smart_money": 1.0}
 DISABLE_BUY_BIAS_TRADING = False
 DISABLE_SELL_BIAS_TRADING = False
 MANDATORY_ADX = 20
@@ -239,7 +239,7 @@ def login_panel():
                     st.session_state.username = _u_in
                     st.session_state.pop("login_failures", None)
                     st.rerun()
-                users = pd.read_csv(USERS_FILE)
+                users = db_read(USERS_FILE)
                 rows = users[users["username"].astype(str).str.strip() == _u_in]
                 stored = str(rows["password"].iloc[0]).strip() if not rows.empty else ""
                 password_ok = verify_password(_p_in, stored if stored else hash_password("x"))
@@ -278,7 +278,7 @@ def login_panel():
 
     st.sidebar.success(f"Logged in as: {st.session_state.username}")
     try:   # warn if the old default credential is still active
-        _u = pd.read_csv(USERS_FILE)
+        _u = db_read(USERS_FILE)
         _row = _u[_u["username"].astype(str).str.strip() == st.session_state.username]
         st.session_state["pwd_is_default"] = bool(not _row.empty and verify_password(DEFAULT_ADMIN_PASSWORD, str(_row["password"].iloc[0])))
         if not _row.empty and verify_password("admin123", str(_row["password"].iloc[0])):
@@ -3362,49 +3362,91 @@ def get_news_events(api_key, symbol, provider="Marketaux", lookback_hours=6, art
 _NSE_DOWN_UNTIL = 0.0   # circuit breaker: NSE blocks most cloud IPs; do not re-wait on every cache miss
 
 
+_NSE_BROWSER_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    "Accept": "application/json,text/plain,*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate",
+    "Connection": "keep-alive",
+    "Referer": "https://www.nseindia.com/option-chain",
+}
+
+
+def _nse_option_chain_download(symbol):
+    """Download an option chain from NSE. Tries the classic endpoint, then the newer v3 endpoint
+    (needs the nearest expiry). Returns the JSON dict or None. NSE blocks many cloud IPs, so every
+    step has a short timeout."""
+    sess = requests.Session()
+    page_headers = dict(_NSE_BROWSER_HEADERS, Accept="text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+    for warm in ("https://www.nseindia.com", "https://www.nseindia.com/option-chain"):   # cookies NSE expects
+        try:
+            sess.get(warm, headers=page_headers, timeout=(3, 4))
+        except Exception:
+            pass
+
+    def _ok(payload):
+        try:
+            return bool(payload and payload.get("records", {}).get("data"))
+        except Exception:
+            return False
+
+    try:   # 1) classic endpoint
+        resp = sess.get(f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}", headers=_NSE_BROWSER_HEADERS, timeout=(3, 5))
+        if resp.status_code == 200 and _ok(resp.json()):
+            return resp.json()
+    except Exception:
+        pass
+    try:   # 2) v3 endpoint: contract-info gives the expiries
+        info = sess.get(f"https://www.nseindia.com/api/option-chain-contract-info?symbol={symbol}", headers=_NSE_BROWSER_HEADERS, timeout=(3, 5)).json()
+        expiries = list(info.get("expiryDates") or [])
+        if expiries:
+            resp = sess.get("https://www.nseindia.com/api/option-chain-v3",
+                            params={"type": "Indices", "symbol": symbol, "expiry": expiries[0]},
+                            headers=_NSE_BROWSER_HEADERS, timeout=(3, 6))
+            if resp.status_code == 200 and _ok(resp.json()):
+                return resp.json()
+    except Exception:
+        pass
+    return None
+
+
 @st.cache_data(max_entries=32, ttl=120)
 def get_option_chain_snapshot(symbol="NIFTY"):
+    """Live option chain, else the last good snapshot (marked stale), else None."""
     global _NSE_DOWN_UNTIL
-    if pytime.time() < _NSE_DOWN_UNTIL:
+
+    def _last_good():
         try:
             if os.path.exists(OPTION_CHAIN_FILE):
                 with open(OPTION_CHAIN_FILE, "r") as f:
                     cache = json.load(f)
-                    if cache.get("symbol") == symbol:
-                        return cache.get("data")
+                if cache.get("symbol") == symbol and cache.get("data"):
+                    data = cache["data"]
+                    data["_ec_meta"] = {"stale": True, "saved_at": cache.get("saved_at")}
+                    return data
         except Exception:
             pass
         return None
+
+    if pytime.time() < _NSE_DOWN_UNTIL:
+        return _last_good()
     try:
-        url = f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}"
-        headers = {
-            "User-Agent": "Mozilla/5.0",
-            "Accept": "application/json,text/plain,*/*",
-            "Referer": "https://www.nseindia.com/option-chain",
-            "Accept-Language": "en-US,en;q=0.9"
-        }
-        session = requests.Session()
-        session.get("https://www.nseindia.com", headers=headers, timeout=(2, 3))
-        resp = session.get(url, headers=headers, timeout=(2, 3))
-        if resp.status_code != 200:
-            _NSE_DOWN_UNTIL = pytime.time() + 300
-            return None
-        data = resp.json()
-        with open(OPTION_CHAIN_FILE, "w") as f:
-            json.dump({"symbol": symbol, "data": data}, f)
+        data = _nse_option_chain_download(symbol)
+        if not data:
+            _NSE_DOWN_UNTIL = pytime.time() + 120      # NSE refused / blocked this server; retry in 2 minutes
+            log_app_error("get_option_chain_snapshot", "NSE returned no option chain (blocked or empty)")
+            return _last_good()
+        try:
+            with open(OPTION_CHAIN_FILE, "w") as f:
+                json.dump({"symbol": symbol, "saved_at": now_str(), "data": data}, f)
+        except Exception:
+            pass
+        data["_ec_meta"] = {"stale": False, "saved_at": now_str()}
         return data
     except Exception as e:
-        _NSE_DOWN_UNTIL = pytime.time() + 300
+        _NSE_DOWN_UNTIL = pytime.time() + 120
         log_app_error("get_option_chain_snapshot", e)
-        try:
-            if os.path.exists(OPTION_CHAIN_FILE):
-                with open(OPTION_CHAIN_FILE, "r") as f:
-                    cache = json.load(f)
-                    if cache.get("symbol") == symbol:
-                        return cache.get("data")
-        except Exception:
-            pass
-        return None
+        return _last_good()
 
 
 def get_dynamic_option_chain_symbol(selected_symbol):
@@ -3432,6 +3474,25 @@ def parse_option_chain_metrics(symbol="NIFTY"):
             ce_change_oi += float(ce.get("changeinOpenInterest") or 0)
             pe_change_oi += float(pe.get("changeinOpenInterest") or 0)
         pcr = round(total_pe / total_ce, 2) if total_ce > 0 else None
+        # Current traded volume of calls / puts for the NEAREST expiry (what the NSE option-chain page shows).
+        call_vol = put_vol = 0.0
+        try:
+            _today = ist_now().date()
+            _exp = {}
+            for item in records:
+                _d = pd.to_datetime(item.get("expiryDate") or item.get("expiryDates"), format="%d-%b-%Y", errors="coerce")
+                if pd.notna(_d) and _d.date() >= _today:
+                    _exp[id(item)] = _d
+            _near = min(_exp.values()) if _exp else None
+            for item in records:
+                if _near is not None and _exp.get(id(item)) != _near:
+                    continue
+                call_vol += float((item.get("CE") or {}).get("totalTradedVolume") or 0)
+                put_vol += float((item.get("PE") or {}).get("totalTradedVolume") or 0)
+            _near_txt = _near.strftime("%d-%b-%Y") if _near is not None else "all expiries"
+        except Exception:
+            _near_txt = "n/a"
+        _meta = data.get("_ec_meta") or {}
         # The old version called Put OI > Call OI "Bullish" and then scored both
         # PCR and OI, double-counting the same information. Keep OI as a descriptive
         # change-in-OI comparison and do not turn it into a directional score.
@@ -3444,7 +3505,12 @@ def parse_option_chain_metrics(symbol="NIFTY"):
             oi_bias = "Call OI change higher"
         return {"pcr": pcr, "oi_bias": oi_bias, "long_unwinding": False, "short_covering": False,
                 "call_oi": int(total_ce), "put_oi": int(total_pe),
-                "call_change_oi": int(ce_change_oi), "put_change_oi": int(pe_change_oi)}
+                "call_change_oi": int(ce_change_oi), "put_change_oi": int(pe_change_oi),
+                "call_volume": int(call_vol), "put_volume": int(put_vol),
+                "volume_pcr": round(put_vol / call_vol, 2) if call_vol > 0 else None,
+                "chain_expiry": _near_txt, "chain_stale": bool(_meta.get("stale")),
+                "chain_saved_at": _meta.get("saved_at"),
+                "chain_time": (data.get("records", {}) or {}).get("timestamp")}
     except Exception as exc:
         log_app_error("parse_option_chain_metrics", exc)
         return empty
@@ -3661,6 +3727,7 @@ def analyze_signal(
     signal_weights=None,
     macro_info=None,
     macro_hard_block=False,
+    smart_money_info=None,
 ):
     """Explainable multi-factor signal engine.
 
@@ -3991,6 +4058,24 @@ def analyze_signal(
     else:
         bullish, bearish = _mark("macro", "Macro / geo-political", bullish, bearish, False, "Macro data unavailable or disabled; contributes 0")
 
+    # ================= SMART MONEY (FII / DII cash-market flows; live only, max +/-1 point) =================
+    smart_points = 0.0
+    if isinstance(smart_money_info, dict) and smart_money_info.get("available"):
+        smart_points = float(smart_money_info.get("signal_points", 0.0) or 0.0)
+        if smart_points > 0:
+            bullish += smart_points
+            reasons.append(f"Smart money {smart_money_info.get('label')} (+{smart_points:.2f} bullish)")
+        elif smart_points < 0:
+            bearish += -smart_points
+            reasons.append(f"Smart money {smart_money_info.get('label')} (+{-smart_points:.2f} bearish)")
+        else:
+            reasons.append("Smart money (FII/DII) neutral")
+        bullish, bearish = _mark("smart_money", "Smart Money (FII / DII cash flows)",
+                                  bullish, bearish, True, str(smart_money_info.get("summary", "")))
+    else:
+        bullish, bearish = _mark("smart_money", "Smart Money (FII / DII cash flows)", bullish, bearish, False,
+                                  "FII/DII data unavailable or disabled; contributes 0")
+
     regime = detect_market_regime(df)
     _news_message_for_regime = str((news_info or {}).get("message", ""))
     if (news_info or {}).get("status") == "ok" and "News risk detected" in _news_message_for_regime:
@@ -4215,6 +4300,9 @@ def analyze_signal(
         "institutional_status": inst_status, "macro_points": round(macro_points, 2),
         "macro_label": (macro_info or {}).get("label", "N/A") if isinstance(macro_info, dict) else "N/A",
         "macro_summary": (macro_info or {}).get("summary", "") if isinstance(macro_info, dict) else "",
+        "smart_money_points": round(smart_points, 2),
+        "smart_money_label": (smart_money_info or {}).get("label", "N/A") if isinstance(smart_money_info, dict) else "N/A",
+        "smart_money_summary": (smart_money_info or {}).get("summary", "") if isinstance(smart_money_info, dict) else "",
         "liquidity_block_buy": liquidity_block_buy,
         "liquidity_block_sell": liquidity_block_sell, "signal_weights": _w,
         "liquidity_block_entry": bool(liquidity_block_buy or liquidity_block_sell),
@@ -5420,8 +5508,8 @@ def _period_summary(closed, key_name, key_series):
 
 def _write_if_changed(df, path):
     try:
-        if os.path.exists(path):
-            old = pd.read_csv(path)
+        if db_exists(path):
+            old = db_read(path)
             if list(old.columns) == list(df.columns) and len(old) == len(df) and \
                old.astype(str).reset_index(drop=True).equals(df.astype(str).reset_index(drop=True)):
                 return   # nothing changed: do not rewrite on every Streamlit rerun
@@ -6011,6 +6099,10 @@ _EC_PAGE_DEFS = [
     ("Research Lab", "🧪 Research Lab", "Backtests, walk-forward, optimiser, strategy builder and the learning lab."),
     ("Trade Replay", "🎮 Trade Replay", "Replay past trades candle by candle and see what could have been done better."),
     ("Reports", "📊 Reports", "Journal analytics, daily / weekly / monthly reports, exports and the weekly AI report."),
+    ("Top Opportunities", "🔥 Top Opportunities", "Ranked watchlist: NIFTY, BANKNIFTY, SENSEX and stocks by opportunity score."),
+    ("System Health", "🩺 System Health", "Price feed, Yahoo status, errors, storage and refresh state."),
+    ("Validation", "✅ Validation & Readiness", "Daily feature validation tests and the production-readiness score."),
+    ("Smart Money", "🏦 Smart Money", "FII / DII cash-market flows from NSE."),
     ("Settings", "⚙ Settings", "Data providers, API keys, alerts, news filters and signal weights."),
 ]
 _EC_LABELS = [d[1] for d in _EC_PAGE_DEFS]
@@ -6055,9 +6147,50 @@ for _i, (_key, _label, _desc) in enumerate(_EC_PAGE_DEFS):
 _EC_ACTIVE_CTX = None
 
 
+def _ec_install_hidden_page_skip():
+    """Charts and tables placed on a page you are not looking at used to be built, serialised and sent to
+    the browser on every refresh just to stay hidden. They are now skipped; switching page re-runs the app
+    and the new page draws everything. The flag lives in session_state so this one-time wrapper never
+    depends on a stale script namespace."""
+    try:
+        from streamlit.delta_generator import DeltaGenerator as _DG
+    except Exception:
+        return
+    names = ("plotly_chart", "dataframe", "table", "line_chart", "bar_chart", "area_chart", "altair_chart", "pyplot")
+
+    def _wrap(orig):
+        if getattr(orig, "_ec_wrapped", False):
+            return orig
+
+        def wrapper(*a, **k):
+            try:
+                if not st.session_state.get("_ec_page_visible", True) and k.get("on_select") in (None, "ignore"):
+                    return None
+            except Exception:
+                pass
+            return orig(*a, **k)
+        wrapper._ec_wrapped = True
+        wrapper.__doc__ = getattr(orig, "__doc__", None)
+        return wrapper
+
+    for n in names:
+        try:
+            if hasattr(st, n):
+                setattr(st, n, _wrap(getattr(st, n)))
+            if hasattr(_DG, n):
+                setattr(_DG, n, _wrap(getattr(_DG, n)))
+        except Exception:
+            pass
+
+
+_ec_install_hidden_page_skip()
+st.session_state["_ec_page_visible"] = True   # every run starts visible; _ec_section() updates it
+
+
 def _ec_section(name):
     """Route everything rendered from here on into a page. Only ever called between top-level statements."""
     global _EC_ACTIVE_CTX
+    st.session_state["_ec_page_visible"] = bool(name == "__always__" or name == _ec_active)
     if _EC_ACTIVE_CTX is not None:
         try:
             _EC_ACTIVE_CTX.__exit__(None, None, None)
@@ -6108,13 +6241,53 @@ def _ec_render_dashboard_strip(selected, timeframe, analysis, data):
             c[5].metric("Today's realised P&L", f"{today_pnl:+,.2f}")
             st.caption(f"Data source: {globals().get('active_data_source', 'n/a')} | Page navigation is at the top. "
                        "Everything that was on the single long page is still here, grouped by page.")
-            _ec_render_dashboard_extras(analysis, data)
+            # ---- Put / Call current volume + PCR (NSE option chain; NIFTY / BANKNIFTY) ----
+            om = globals().get("option_metrics")
+            _oc_sym = get_dynamic_option_chain_symbol(selected)
+            if _oc_sym is None:
+                st.caption("Put / Call volume: NSE option-chain data is available for NIFTY and BANKNIFTY only (not for this symbol).")
+            else:
+                if not (isinstance(om, dict) and om.get("call_volume") is not None):
+                    om = parse_option_chain_metrics(_oc_sym)            # cached 2 min: same call the signal engine uses
+                if isinstance(om, dict) and om.get("call_volume") is not None and (om.get("call_oi") or om.get("call_volume")):
+                    o = st.columns(5)
+                    o[0].metric("Call volume (current)", f"{int(om['call_volume']):,}")
+                    o[1].metric("Put volume (current)", f"{int(om['put_volume']):,}")
+                    o[2].metric("Volume PCR (Put/Call)", f"{om['volume_pcr']:.2f}" if om.get("volume_pcr") is not None else "N/A")
+                    o[3].metric("PCR (open interest)", f"{om['pcr']:.2f}" if om.get("pcr") is not None else "N/A")
+                    o[4].metric("OI: Call / Put", f"{int(om['call_oi']):,} / {int(om['put_oi']):,}")
+                    _note = f"{_oc_sym} option chain, nearest expiry {om.get('chain_expiry')} (volume); PCR uses all expiries. NSE time: {om.get('chain_time') or 'n/a'}."
+                    if om.get("chain_stale"):
+                        _note += f" ⚠ NSE is not answering, showing the last good snapshot saved {om.get('chain_saved_at')}."
+                    st.caption(_note)
+                    record_option_volume(_oc_sym, om)
+                    # ---- live flow: volume ADDED in the last 15 minutes (the running total always rises, so look at the change) ----
+                    st.markdown("**Live Put / Call volume flow (added in the last ~15 minutes)**")
+                    flow = option_volume_live_flow(_oc_sym, 15)
+                    if flow is None:
+                        st.info("Collecting live flow: needs two NSE snapshots at least 2 minutes apart. It fills in automatically while the app is open "
+                                "(NSE updates about every 1-2 minutes in market hours).")
+                    else:
+                        f = st.columns(4)
+                        f[0].metric(f"Call volume added ({flow['minutes']:.0f} min)", f"{flow['d_call']:,}")
+                        f[1].metric(f"Put volume added ({flow['minutes']:.0f} min)", f"{flow['d_put']:,}")
+                        f[2].metric("Live Put/Call volume ratio", f"{flow['live_pcr']:.2f}" if flow["live_pcr"] is not None else "N/A")
+                        f[3].metric("Who is rising faster", flow["dominant"])
+                        st.caption("Volume counts every trade, bought or sold. Rising Put volume can be Put buying (bearish) or Put writing (bullish), "
+                                   "so read it together with the signal and OI change; it is not a standalone buy/sell instruction.")
+                        _h = flow["history"].dropna(subset=["Time"]).set_index("Time")
+                        if len(_h) >= 3:
+                            st.line_chart(_h[["Call", "Put"]], height=180)
+                else:
+                    _wait = max(0, int(_NSE_DOWN_UNTIL - pytime.time()))
+                    st.warning("Put / Call volume and PCR are unavailable: NSE did not return the option chain to this server "
+                               "(NSE often blocks cloud IPs). " + (f"Retrying in {_wait}s." if _wait else "Retrying on the next refresh."))
     except Exception as exc:
         log_app_error("ec_dashboard_strip", exc)
 
 
 # =========================================================
-# DASHBOARD EXTRAS: Top Opportunities | System Health | Daily Feature Validation |
+# EXTRA PAGES: Top Opportunities | System Health | Daily Feature Validation |
 # Production Readiness | Smart Money Tracker  (additive; every block is isolated)
 # =========================================================
 _FIIDII_DOWN_UNTIL = 0.0
@@ -6153,6 +6326,32 @@ def fetch_fii_dii_flows():
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
 
+def build_smart_money_context(max_age_days=4):
+    """Turn the latest FII / DII net cash flows into a signal input.
+
+    points = 0.7 * clip(FII net / Rs2000 Cr, -1, 1) + 0.3 * clip(DII net / Rs2000 Cr, -1, 1)   (range +/-1.0)
+    FII is weighted more because foreign flows lead index direction. Dead-zone +/-0.10 -> neutral. Stale data
+    (older than max_age_days) or an NSE failure gives available=False and contributes nothing."""
+    try:
+        fl = fetch_fii_dii_flows()
+        if not fl.get("ok"):
+            return {"available": False, "summary": f"FII/DII data unavailable ({fl.get('error')})"}
+        dt = pd.to_datetime(fl.get("date"), format="%d-%b-%Y", errors="coerce")
+        if pd.notna(dt) and (ist_now() - dt.to_pydatetime()).days > max_age_days:
+            return {"available": False, "summary": f"FII/DII data is stale ({fl.get('date')})"}
+        fii = float(fl.get("FII", {}).get("net", 0.0))
+        dii = float(fl.get("DII", {}).get("net", 0.0))
+        pts = 0.7 * float(np.clip(fii / 2000.0, -1, 1)) + 0.3 * float(np.clip(dii / 2000.0, -1, 1))
+        pts = 0.0 if abs(pts) < 0.10 else round(pts, 2)
+        label = "Positive" if pts >= 0.25 else "Negative" if pts <= -0.25 else "Mildly positive" if pts > 0 else "Mildly negative" if pts < 0 else "Neutral"
+        return {"available": True, "signal_points": pts, "label": label, "fii_net": fii, "dii_net": dii,
+                "date": fl.get("date"),
+                "summary": f"FII net {fii:+,.0f} Cr, DII net {dii:+,.0f} Cr ({fl.get('date')})"}
+    except Exception as exc:
+        log_app_error("smart_money_context", exc)
+        return {"available": False, "summary": f"Smart money unavailable ({type(exc).__name__})"}
+
+
 def _ec_run_feature_validation(analysis, data_source):
     """Run real, lightweight checks. Returns list of (name, status, detail); status in PASS/WARN/FAIL."""
     out = []
@@ -6180,16 +6379,26 @@ def _ec_run_feature_validation(analysis, data_source):
         return "WARN", "No analysis yet (needs candles)"
 
     def t_db():
-        os.makedirs(DATA_DIR, exist_ok=True)
-        probe = os.path.join(DATA_DIR, ".health_probe.tmp")
-        with open(probe, "w") as f:
-            f.write("ok")
-        with open(probe) as f:
-            assert f.read() == "ok"
-        os.remove(probe)
+        con = _db_connect()
+        try:
+            ok = con.execute("PRAGMA integrity_check").fetchone()[0]
+            tables = [r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")]
+        finally:
+            con.close()
+        if ok != "ok":
+            return "FAIL", f"SQLite integrity_check: {ok}"
+        probe = pd.DataFrame({"a": [1, 2], "b": ["x", None]})
+        db_write(probe, os.path.join(DATA_DIR, "health_probe.csv"))
+        back = db_read(os.path.join(DATA_DIR, "health_probe.csv"))
+        con = _db_connect()
+        try:
+            con.execute('DROP TABLE IF EXISTS "health_probe"')
+        finally:
+            con.close()
+        if len(back) != 2:
+            return "FAIL", "write/read round trip failed"
         j = load_journal()
-        users = safe_read_csv(USERS_FILE, pd.DataFrame())
-        return "PASS", f"journal rows {0 if j is None else len(j)}, users {len(users)}"
+        return "PASS", f"SQLite OK, {len(tables)} tables, journal rows {0 if j is None else len(j)}"
 
     def t_scanner():
         res = st.session_state.get("nifty30_scanner_result")
@@ -6224,7 +6433,7 @@ def _ec_run_feature_validation(analysis, data_source):
     out.append(("Password recovery (RESET_KEY)", "PASS" if _reset_key() else "WARN",
                 "configured" if _reset_key() else "RESET_KEY not set"))
     try:
-        _u = pd.read_csv(USERS_FILE)
+        _u = db_read(USERS_FILE)
         _r = _u[_u["username"].astype(str).str.strip() == st.session_state.get("username", "")]
         default_pw = bool(not _r.empty and verify_password(DEFAULT_ADMIN_PASSWORD, str(_r["password"].iloc[0])))
         out.append(("Default password changed", "WARN" if default_pw else "PASS", "admin123 still active" if default_pw else "custom password"))
@@ -6234,7 +6443,6 @@ def _ec_run_feature_validation(analysis, data_source):
 
 
 def _ec_render_top_opportunities():
-    st.subheader("🔥 Top Opportunities")
     res = st.session_state.get("al_opps")
     if st.button("Rank / refresh top opportunities", key="ec_top_opp_btn"):
         with st.spinner("Scoring NIFTY, BANKNIFTY, SENSEX and stocks..."):
@@ -6255,7 +6463,6 @@ def _ec_render_top_opportunities():
 
 
 def _ec_render_system_health(analysis, data):
-    st.subheader("🩺 System Health")
     try:
         err = safe_read_csv(ERROR_LOG_FILE, pd.DataFrame(columns=["DateTime", "Source", "Message"]))
     except Exception:
@@ -6311,7 +6518,6 @@ def _ec_render_validation_and_readiness(analysis):
 
 
 def _ec_render_smart_money():
-    st.subheader("🏦 Smart Money Tracker")
     fl = fetch_fii_dii_flows()
     if not fl.get("ok"):
         st.warning(f"FII/DII flow data is unavailable right now ({fl.get('error')}). NSE often blocks cloud servers; nothing is estimated.")
@@ -6326,16 +6532,22 @@ def _ec_render_smart_money():
     st.caption(f"NSE cash-market provisional data for {fl.get('date') or 'latest session'}, refreshed every 10 minutes.")
 
 
-def _ec_render_dashboard_extras(analysis, data):
-    for name, fn in (("top_opportunities", lambda: _ec_render_top_opportunities()),
-                     ("system_health", lambda: _ec_render_system_health(analysis, data)),
-                     ("validation", lambda: _ec_render_validation_and_readiness(analysis)),
-                     ("smart_money", lambda: _ec_render_smart_money())):
-        try:
-            fn()
-        except Exception as exc:
-            log_app_error(f"ec_extra_{name}", exc)
-            st.warning(f"{name.replace('_', ' ').title()} could not be rendered: {type(exc).__name__}: {exc}")
+def _ec_render_extra_pages(analysis, data):
+    """Top Opportunities / System Health / Validation / Smart Money each have their own page.
+    Only the page you are looking at is computed, so the others cost nothing."""
+    plan = {"Top Opportunities": ("top_opportunities", lambda: _ec_render_top_opportunities()),
+            "System Health": ("system_health", lambda: _ec_render_system_health(analysis, data)),
+            "Validation": ("validation", lambda: _ec_render_validation_and_readiness(analysis)),
+            "Smart Money": ("smart_money", lambda: _ec_render_smart_money())}
+    if _ec_active not in plan:
+        return
+    name, fn = plan[_ec_active]
+    _ec_section(_ec_active)
+    try:
+        fn()
+    except Exception as exc:
+        log_app_error(f"ec_extra_{name}", exc)
+        st.warning(f"{name.replace('_', ' ').title()} could not be rendered: {type(exc).__name__}: {exc}")
 
 
 def _ec_render_ai_lab_pages(selected, timeframe, data, analysis, backtest_trades_df):
@@ -6437,11 +6649,37 @@ else:
 if auto_refresh and AUTO_REFRESH_AVAILABLE:
     st_autorefresh(interval=refresh_seconds * 1000, key="elite_live_market_board_refresh")
 
+def _ec_render_smart_money_signal_point(analysis):
+    """Signals page: the Smart Money point that is part of the live score."""
+    try:
+        sm = st.session_state.get("smart_money_info_latest") or {}
+        st.subheader("🏦 Smart Money point (FII / DII)")
+        if not sm.get("available"):
+            st.info(f"Smart money is not contributing to this signal: {sm.get('summary', 'no data')}. Open the 🏦 Smart Money tab for details.")
+            return
+        c = st.columns(4)
+        c[0].metric("Smart money", str(sm.get("label")))
+        c[1].metric("Points added to score", f"{float(sm.get('signal_points', 0.0)):+.2f}")
+        c[2].metric("FII net (₹ Cr)", f"{sm.get('fii_net', 0):+,.0f}")
+        c[3].metric("DII net (₹ Cr)", f"{sm.get('dii_net', 0):+,.0f}")
+        pts = float(sm.get("signal_points", 0.0))
+        side = str((analysis or {}).get("signal_type") or "").lower()
+        if pts and side in ("buy", "sell"):
+            agrees = (pts > 0 and side == "buy") or (pts < 0 and side == "sell")
+            st.caption(("✅ Smart money agrees with" if agrees else "⚠ Smart money is against") + f" the current {side.upper()} signal. {sm.get('summary')}")
+        else:
+            st.caption(str(sm.get("summary")))
+    except Exception as exc:
+        log_app_error("smart_money_signal_point", exc)
+
+
 _ec_section("Settings")
 with st.expander("Macro / Geo-political Bias Settings"):
     st.checkbox("Use macro bias in live signals (USD/INR, crude, DXY, US yields, VIX, US/Asia cues)", value=True, key="use_macro_bias")
     st.checkbox("Include geo-political headline scan (Google News RSS, no API key)", value=True, key="use_geo_news")
     st.checkbox("Hard-block entries against an extreme macro backdrop", value=False, key="macro_hard_block")
+    st.checkbox("Use Smart Money (FII / DII cash flows) in live signals", value=True, key="use_smart_money")
+    st.caption("Smart money adds at most +/-1 point to the live score (FII weighted 70%, DII 30%). Live only: not replayed in backtests.")
     st.caption("Macro adds at most +/-2 points to the live score. It is not replayed in backtests (no historical macro/news archive).")
 
 with st.expander("Signal Engine Weights (configurable)"):
@@ -6677,12 +6915,13 @@ if all((angel_api_key, angel_client_code, angel_pin, angel_totp_secret)):
 _ec_section("Market")
 # This board intentionally renders before the selected OHLC pipeline. It remains
 # visible if Angel/Yahoo chart candles are unavailable later in the script.
-render_live_global_india_market_board()
-try:
-    if st.session_state.get("use_macro_bias", True):
-        render_macro_outlook(build_macro_context(None, use_geo_news=st.session_state.get("use_geo_news", True)))
-except Exception as _macro_ui_err:
-    log_app_error("macro_outlook_render", _macro_ui_err)
+if _ec_active == "Market":      # display-only; skipped on other pages to save a few seconds per refresh
+    render_live_global_india_market_board()
+    try:
+        if st.session_state.get("use_macro_bias", True):
+            render_macro_outlook(build_macro_context(None, use_geo_news=st.session_state.get("use_geo_news", True)))
+    except Exception as _macro_ui_err:
+        log_app_error("macro_outlook_render", _macro_ui_err)
 
 
 ticker = stocks[selected]
@@ -7036,6 +7275,7 @@ if data.empty:
     # The journal-based AI Lab features do not need candles, so they stay available while data is down.
     _ec_render_dashboard_strip(selected, timeframe, None, None)
     _ec_render_ai_lab_pages(selected, timeframe, None, None, pd.DataFrame())
+    _ec_render_extra_pages(None, None)
     st.stop()
 
 if active_data_source != data_source:
@@ -7102,6 +7342,9 @@ option_metrics = parse_option_chain_metrics(dynamic_oc_symbol) if dynamic_oc_sym
     "pcr": None, "oi_bias": "N/A", "long_unwinding": False,
     "short_covering": False, "call_oi": 0, "put_oi": 0
 }
+
+if dynamic_oc_symbol:
+    record_option_volume(dynamic_oc_symbol, option_metrics)   # live Put/Call volume history
 
 news_info = {
     "allow_trade": True, "message": "News filter disabled", "events": [],
@@ -7175,6 +7418,11 @@ if st.session_state.get("use_macro_bias", True):
     macro_info = build_macro_context(news_info, use_geo_news=st.session_state.get("use_geo_news", True))
 st.session_state["macro_info_latest"] = macro_info
 
+smart_money_info = {"available": False, "summary": "Smart money input is switched off in Settings"}
+if st.session_state.get("use_smart_money", True):
+    smart_money_info = build_smart_money_context()
+st.session_state["smart_money_info_latest"] = smart_money_info
+
 analysis = analyze_signal(
     data,
     htf_bias=htf_bias,
@@ -7192,6 +7440,7 @@ analysis = analyze_signal(
     signal_weights=st.session_state.get("signal_weights"),
     macro_info=macro_info,
     macro_hard_block=bool(st.session_state.get("macro_hard_block", False)),
+    smart_money_info=smart_money_info,
 )
 analysis = apply_adaptive_signal_intelligence(
     data, analysis, selected, timeframe,
@@ -7211,6 +7460,7 @@ stats = compute_trade_statistics(backtest_trades_df, initial_capital=DEFAULT_INI
 equity_curve_df, max_drawdown = compute_equity_curve_from_trades(backtest_trades_df, initial_capital=DEFAULT_INITIAL_BALANCE)
 
 _ec_section("Signals")
+_ec_render_smart_money_signal_point(analysis)   # Smart Money point, shown on the Signals page
 with st.expander("🏛️ Institutional Signal Participation Audit", expanded=False):
     _inst_audit = analysis.get("institutional_participation_audit", {})
     if _inst_audit:
@@ -8715,3 +8965,4 @@ except Exception as _inst_ui_err:
 # =========================================================
 _ec_render_dashboard_strip(selected, timeframe, analysis, data)
 _ec_render_ai_lab_pages(selected, timeframe, data, analysis, backtest_trades_df)
+_ec_render_extra_pages(analysis, data)
