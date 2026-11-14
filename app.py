@@ -120,7 +120,7 @@ def _ec_export(mod):
 
 _install_streamlit_compat()
 # Visible deployment marker: confirms which source file Streamlit Cloud is running.
-APP_BUILD_ID = "2026-11-15-SAFE"
+APP_BUILD_ID = "2026-11-15-DURABLE"
 # Optional integrations: Yahoo mode must still start if Angel SDK/TOTP or
 # the auto-refresh helper is not installed.
 try:
@@ -149,6 +149,15 @@ except Exception:
     SMART_WS_AVAILABLE = False
 
 st.set_page_config(page_title="Elite Trading Dashboard Final Ultimate", layout="wide")
+
+# Permanent storage: bring the saved database back BEFORE anything opens it (a redeploy/reboot wipes the disk).
+# Optional: if durable_store.py was not uploaded, or nothing is configured, the app runs exactly as before.
+try:
+    import durable_store
+    durable_store.restore_if_needed()
+except Exception as _durable_err:
+    durable_store = None
+    _DURABLE_IMPORT_ERROR = str(_durable_err)
 
 # FILES / CONFIG constants, IST helpers, auth helpers and journal I/O now come from database.py
 import database
@@ -7166,6 +7175,37 @@ def _ec_restore_db_from_bytes(data):
             pass
 
 
+with st.expander("Permanent storage (survives redeploy / reboot)"):
+    if durable_store is None:
+        st.warning("durable_store.py is missing from the repository, so permanent storage is off. Upload it next to app.py and reboot. "
+                   + str(globals().get("_DURABLE_IMPORT_ERROR", "")))
+    else:
+        _ds = durable_store.status()
+        if not _ds["configured"]:
+            st.info("Not set up yet. Add SUPABASE_URL and SUPABASE_SERVICE_KEY in Streamlit Cloud → App settings → Secrets, then reboot. "
+                    "Until then your data lives only on Streamlit's temporary disk (use the manual backup below).")
+        else:
+            st.success(f"Permanent storage is ON ({_ds['backend']}). The database is saved automatically about every 30 seconds when something changed.")
+            if _ds["restored"]:
+                st.info("♻ " + _ds["restored"])
+            if _ds["blocked"]:
+                st.error("The startup restore failed, so saving is paused to protect your saved copy. Press 'Restore from cloud now'. " + _ds["last_error"])
+            elif _ds["last_error"]:
+                st.warning(_ds["last_error"])
+            st.caption("Last save: " + (_ds["last_ok"] or "not yet in this session") + f" | saves this session: {_ds['pushes']}")
+            _dc1, _dc2 = st.columns(2)
+            with _dc1:
+                if st.button("☁ Save to cloud now", key="ec_durable_push_btn", use_container_width=True):
+                    _ok, _msg = durable_store.push_now(force=True)
+                    (st.success if _ok else st.error)(_msg)
+            with _dc2:
+                if st.button("♻ Restore from cloud now", key="ec_durable_restore_btn", use_container_width=True,
+                             help="Replaces the current journal, paper account and users with the last cloud copy."):
+                    _ok, _msg = durable_store.force_restore()
+                    (st.success if _ok else st.error)(_msg)
+                    if _ok:
+                        st.rerun()
+
 with st.expander("Backup & restore (journal, paper account, users)"):
     st.caption("Streamlit Cloud wipes its disk on redeploy or reboot. Download a backup now and then; after a reset, upload it here to get everything back.")
     try:
@@ -9525,3 +9565,9 @@ _ec_render_extra_pages(analysis, data)
 st.session_state["ec_last_run_secs"] = round(pytime.time() - _EC_RUN_T0, 1)
 if _EC_DASH_PROGRESS is not None and _ec_active == "Dashboard":
     _EC_DASH_PROGRESS.caption(f"✅ Updated in {st.session_state['ec_last_run_secs']}s (network waits {st.session_state.get('_ec_wait_used', 0):.1f}s)")
+# Permanent storage: schedule a background upload of the database (no-op when not configured; never blocks this run).
+try:
+    if durable_store is not None:
+        durable_store.maybe_push()
+except Exception as _push_err:
+    log_app_error("durable_push", _push_err)
