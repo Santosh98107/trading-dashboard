@@ -120,7 +120,7 @@ def _ec_export(mod):
 
 _install_streamlit_compat()
 # Visible deployment marker: confirms which source file Streamlit Cloud is running.
-APP_BUILD_ID = "2026-11-15-PAPERCOST"
+APP_BUILD_ID = "2026-11-15-STRICT"
 # Optional integrations: Yahoo mode must still start if Angel SDK/TOTP or
 # the auto-refresh helper is not installed.
 try:
@@ -4333,6 +4333,13 @@ def analyze_signal(
     
     selected_side = None
     is_strong = False
+    # Optional strict "STRONG" rule (Settings). It only applies when higher-timeframe information exists,
+    # so the backtest (which has none) keeps its old behaviour and stays comparable.
+    try:
+        _strict_strong_on = bool(st.session_state.get("strict_strong_htf", False))
+    except Exception:
+        _strict_strong_on = False
+    _htf_known = (htf_bias in ("bullish", "bearish")) or int(mtf_available_count or 0) > 0
     if buy_allowed and (not sell_allowed or bullish - bearish >= bearish - bullish):
         selected_side = "BUY"
     elif sell_allowed:
@@ -4345,6 +4352,9 @@ def analyze_signal(
             target1, target2, target3 = close_price + 2*risk, close_price + 3*risk, close_price + 4*risk
             trailing_stop = close_price - 0.75*risk
             strong = bullish >= 25 and (bullish - bearish) >= 6 and buy_trend_votes >= 3 and adx >= 20 and (htf_bias == "bullish" or mtf_bull_count > mtf_bear_count or breakout or volume_spike)
+            if _strict_strong_on and _htf_known:
+                # Strict mode: higher-timeframe agreement is mandatory, plus a breakout or volume confirmation.
+                strong = bool(strong and (htf_bias == "bullish" or mtf_bull_count > mtf_bear_count) and (breakout or volume_spike))
             is_strong = bool(strong)
             signal_text = "STRONG BUY" if strong else "BUY"
             strength = "High" if strong else "Medium"
@@ -4355,6 +4365,8 @@ def analyze_signal(
             target1, target2, target3 = close_price - 2*risk, close_price - 3*risk, close_price - 4*risk
             trailing_stop = close_price + 0.75*risk
             strong = bearish >= 25 and (bearish - bullish) >= 6 and sell_trend_votes >= 3 and adx >= 20 and (htf_bias == "bearish" or mtf_bear_count > mtf_bull_count or breakdown or volume_spike)
+            if _strict_strong_on and _htf_known:
+                strong = bool(strong and (htf_bias == "bearish" or mtf_bear_count > mtf_bull_count) and (breakdown or volume_spike))
             is_strong = bool(strong)
             signal_text = "STRONG SELL" if strong else "SELL"
             strength = "High" if strong else "Medium"
@@ -7032,6 +7044,14 @@ with st.expander("Backtest costs (configurable)"):
         "Paper trading cost + slippage per side (bps of price)", min_value=0.0, max_value=50.0, value=2.0, step=0.5,
         key="paper_cost_bps",
         help="Charged on every paper exit (entry leg + exit leg of the closed units), so paper P&L is not better than live would be. 0 = old behaviour.")
+
+with st.expander("Strict STRONG signal rule (optional)"):
+    st.checkbox(
+        "Require higher-timeframe agreement for STRONG BUY / STRONG SELL", value=False, key="strict_strong_htf",
+        help="Off (default) = old rule: any one of higher-timeframe bias, MTF majority, breakout or volume spike is enough. "
+             "On = higher-timeframe agreement is mandatory AND a breakout/volume confirmation is needed. Fewer STRONG signals, stronger ones. "
+             "Only applies to live signals; the backtest has no higher-timeframe data so it is unchanged.")
+    st.caption("Normal BUY / SELL signals are not affected, only the upgrade to STRONG.")
 
 with st.expander("Signal Engine Weights (configurable)"):
     st.caption("Multipliers applied to each scoring group before the BUY/SELL decision. 1.0 = default. Mandatory thresholds (ADX 20, MTF 2, min R:R 2.0) are applied separately and are not weight-dependent.")
