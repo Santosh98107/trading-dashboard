@@ -120,7 +120,7 @@ def _ec_export(mod):
 
 _install_streamlit_compat()
 # Visible deployment marker: confirms which source file Streamlit Cloud is running.
-APP_BUILD_ID = "2026-11-13-PREFLIGHT"
+APP_BUILD_ID = "2026-11-13-COSTS"
 # Optional integrations: Yahoo mode must still start if Angel SDK/TOTP or
 # the auto-refresh helper is not installed.
 try:
@@ -3809,6 +3809,32 @@ def session_filter(df, tf):
         return {"valid": True, "message": "Session filter unavailable; not used as a blocker"}
 
 
+DEFAULT_BACKTEST_COST_BPS = 2.0   # per side, covers brokerage + STT/charges + slippage
+
+
+def _backtest_cost_bps():
+    """Per-side trading cost used by the backtest (Settings -> Backtest costs). 0 turns costs off."""
+    try:
+        return max(0.0, float(st.session_state.get("backtest_cost_bps", DEFAULT_BACKTEST_COST_BPS)))
+    except Exception:
+        return DEFAULT_BACKTEST_COST_BPS
+
+
+def _wilson_interval(win_pct, n, z=1.96):
+    """95% Wilson interval (in %) for a measured win rate. Shows how uncertain a small sample is."""
+    try:
+        n = int(n or 0)
+        if n <= 0 or win_pct is None:
+            return None
+        p = float(win_pct) / 100.0
+        den = 1 + z * z / n
+        centre = (p + z * z / (2 * n)) / den
+        half = z * ((p * (1 - p) / n + z * z / (4 * n * n)) ** 0.5) / den
+        return round(max(0.0, centre - half) * 100, 1), round(min(1.0, centre + half) * 100, 1)
+    except Exception:
+        return None
+
+
 def calculate_win_chance(backtest_win_rate, backtest_trade_count=0, backtest_is_comparable=False):
     """Return only a measured same-strategy historical rate; never a heuristic probability."""
     try:
@@ -5365,7 +5391,7 @@ def fallback_ema_backtest(df, symbol="", timeframe_label="", cost_bps=5.0):
     return pd.DataFrame(trades)
 
 
-def simple_backtest(df, symbol="", timeframe_label="", option_metrics=None, news_info=None):
+def simple_backtest(df, symbol="", timeframe_label="", option_metrics=None, news_info=None, cost_bps=None):
     """Causal same-timeframe backtest with next-bar fills and staged ATR exits.
 
     Current-day PCR/option-chain values and fabricated MTF alignment are never
@@ -5395,6 +5421,7 @@ def simple_backtest(df, symbol="", timeframe_label="", option_metrics=None, news
     if len(work) < 70:
         return 0, 0, 0, 0.0, pd.DataFrame()
 
+    _cost_bps = _backtest_cost_bps() if cost_bps is None else max(0.0, float(cost_bps))
     trades = []
     # EMA50 and the signal structure need a meaningful warm-up window.
     for i in range(55, len(work) - 10):
@@ -5510,6 +5537,10 @@ def simple_backtest(df, symbol="", timeframe_label="", option_metrics=None, news
             exit_reason = "TIME EXIT"
             remaining = 0.0
 
+        gross_points = realized_points
+        # Round-trip cost: entry + exit, each side charged _cost_bps of the traded price.
+        cost_points = (entry + float(final_exit_price)) * _cost_bps / 1e4
+        realized_points = gross_points - cost_points
         result = "WIN" if realized_points > 0 else "LOSS" if realized_points < 0 else "BREAKEVEN"
         trades.append({
             "Date": pd.to_datetime(work.index[i]).strftime("%d-%m-%Y"),
@@ -5519,6 +5550,7 @@ def simple_backtest(df, symbol="", timeframe_label="", option_metrics=None, news
             "T1": round(t1, 2), "T2": round(t2, 2), "T3": round(t3, 2),
             "Exit": round(float(final_exit_price), 2),
             "Result": result, "PnL": round(realized_points, 2),
+            "GrossPnL": round(gross_points, 2), "CostPoints": round(cost_points, 2),
             "T1_Hit": t1_hit, "T2_Hit": t2_hit, "T3_Hit": t3_hit,
             "ExitReason": exit_reason,
             "ExitTime": pd.to_datetime(exit_time).strftime("%d-%m-%Y %H:%M:%S") if pd.notna(exit_time) else "",
@@ -6915,7 +6947,19 @@ else:
 
 # Keep this above the OHLC no-data guard: the global/macro and Indian share
 # boards must continue to refresh even if the selected primary chart feed fails.
-if auto_refresh and AUTO_REFRESH_AVAILABLE:
+# A timer-driven rerun can cancel a button click that is still being processed (BUY / SELL / CLOSE), and a
+# slow rerun makes that very likely. So the timer is paused on pages where you act, not just watch.
+_EC_ACTION_PAGES = ("Portfolio", "Trade Replay", "AI Command Center", "Research Lab", "Reports", "Settings")
+_ec_pause_on_action = st.checkbox(
+    "⏸ Pause auto refresh on Portfolio / action pages (recommended — lets BUY, SELL and CLOSE work)",
+    value=True, key="ec_pause_refresh_on_action_pages",
+    help="Auto refresh keeps running on Dashboard, Market, Signals, Scanner and the other view pages. "
+         "On Portfolio, Trade Replay, AI, Research, Reports and Settings it waits, so a click is never cancelled by the timer."
+)
+_ec_timer_paused = bool(_ec_pause_on_action and _ec_active in _EC_ACTION_PAGES)
+if _ec_timer_paused and auto_refresh:
+    st.caption("⏸ Auto refresh is paused on this page so your clicks are not interrupted. Stops and targets are re-checked on every click and on the view pages.")
+if auto_refresh and AUTO_REFRESH_AVAILABLE and not _ec_timer_paused:
     st_autorefresh(interval=refresh_seconds * 1000, key="elite_live_market_board_refresh")
 
 def _ec_render_option_flow_signal_point(analysis):
@@ -6976,6 +7020,14 @@ with st.expander("Macro / Geo-political Bias Settings"):
     st.caption("Option flow adds at most +/-1 point (on top of the PCR point): day OI change decides the side, live Put/Call volume confirms or dampens it. Live only.")
     st.caption("Smart money adds at most +/-1 point to the live score (FII weighted 70%, DII 30%). Live only: not replayed in backtests.")
     st.caption("Macro adds at most +/-2 points to the live score. It is not replayed in backtests (no historical macro/news archive).")
+
+with st.expander("Backtest costs (configurable)"):
+    st.number_input(
+        "Cost per side (bps of price)", min_value=0.0, max_value=50.0, value=float(DEFAULT_BACKTEST_COST_BPS), step=0.5,
+        key="backtest_cost_bps",
+        help="Brokerage + STT/charges + slippage, charged on entry and again on exit. 0 = old behaviour (no costs). "
+             "Backtest PnL, win rate and AI training then reflect what you would really keep.")
+    st.caption("Without costs a short-timeframe backtest looks better than it will trade. Set 0 to compare with the old numbers.")
 
 with st.expander("Signal Engine Weights (configurable)"):
     st.caption("Multipliers applied to each scoring group before the BUY/SELL decision. 1.0 = default. Mandatory thresholds (ADX 20, MTF 2, min R:R 2.0) are applied separately and are not weight-dependent.")
@@ -7684,7 +7736,7 @@ try:
     _bt_hash = int(pd.util.hash_pandas_object(_bt_hash_src[["Open", "High", "Low", "Close", "Volume"]], index=True).sum()) if not _bt_hash_src.empty else 0
 except Exception:
     _bt_hash = len(backtest_data)
-_backtest_cache_key = f"{selected}|{timeframe}|{len(backtest_data)}|{_bt_hash}"
+_backtest_cache_key = f"{selected}|{timeframe}|{len(backtest_data)}|{_bt_hash}|cost{_backtest_cost_bps()}"
 _backtest_cache = st.session_state.get("backtest_result_cache")
 if isinstance(_backtest_cache, dict) and _backtest_cache.get("key") == _backtest_cache_key:
     wins, losses, total_trades, backtest_win_rate, backtest_trades_df = _backtest_cache["result"]
@@ -7972,7 +8024,9 @@ option_suggestion = suggest_option_strike(selected, analysis["close_price"], ana
 expiry_seconds = get_signal_expiry_remaining(selected, timeframe, analysis["signal_text"])
 
 _confidence_text = f"{analysis['confidence']}%" if analysis.get("confidence") is not None else "N/A (no approved setup)"
+_ci = _wilson_interval(analysis.get("win_chance"), analysis.get("win_chance_sample_size"))
 _win_rate_text = (f"{analysis['win_chance']:.1f}% from {analysis.get('win_chance_sample_size', 0)} comparable trades"
+                  + (f" (95% range {_ci[0]:.0f}-{_ci[1]:.0f}%)" if _ci else "")
                   if analysis.get("win_chance") is not None else "N/A (requires 30+ comparable trades)")
 alert_text = (
     f"{selected} | {timeframe} | {analysis['signal_text']} | "
@@ -8232,7 +8286,11 @@ Data Confidence: {confidence_label}
 """
         )   
 with top3:
-    st.metric("Backtest Win Rate", f"{analysis['win_chance']:.1f}%" if analysis.get("win_chance") is not None else "N/A")
+    _ci_m = _wilson_interval(analysis.get("win_chance"), analysis.get("win_chance_sample_size"))
+    st.metric("Backtest Win Rate", f"{analysis['win_chance']:.1f}%" if analysis.get("win_chance") is not None else "N/A",
+              help=(f"95% range {_ci_m[0]:.0f}-{_ci_m[1]:.0f}% from {analysis.get('win_chance_sample_size', 0)} trades "
+                    f"(after {_backtest_cost_bps():g} bps/side costs). A small sample is far less certain than the single number."
+                    if _ci_m else "Needs 30+ comparable trades."))
 with top4:
     st.metric("Setup Confidence", f"{analysis['confidence']}%" if analysis.get("confidence") is not None else "N/A")
 st.caption("Setup confidence is a structural score, not a predicted probability. Backtest win rate is shown only after 30+ comparable same-engine trades.")
