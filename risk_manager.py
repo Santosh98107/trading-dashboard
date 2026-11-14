@@ -529,8 +529,21 @@ def auto_paper_trade_exit(current_price, symbol=None, atr=None):
                     q_exit = current_remaining
                 else:
                     q_exit = min(current_remaining, max(1, int(round(initial_qty * fraction))))
-                if _paper_partial_exit(idx, target, q_exit, target_flag=flag):
-                    partial_count += 1
+                # A position too small to scale out (1-2 units) used to be closed completely at T1/T2.
+                # Keep the runner instead: mark the target as hit, protect it below, and let T3 / stop finish it.
+                _cannot_scale = fraction < 1.0 and q_exit >= current_remaining
+                if _cannot_scale:
+                    journal = load_journal()
+                    journal.at[idx, flag] = True
+                    journal.at[idx, "LastPrice"] = float(target)
+                    journal.at[idx, "LastUpdateTime"] = now_str()
+                    save_journal(journal)
+                    _scaled_ok = True
+                else:
+                    _scaled_ok = _paper_partial_exit(idx, target, q_exit, target_flag=flag)
+                if _scaled_ok:
+                    if not _cannot_scale:
+                        partial_count += 1
                     # After T1 protect the remainder around breakeven; after T2 protect T1.
                     journal = load_journal()
                     if idx in journal.index and str(journal.at[idx, "Status"]).upper() == "OPEN":
