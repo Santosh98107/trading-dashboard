@@ -120,7 +120,7 @@ def _ec_export(mod):
 
 _install_streamlit_compat()
 # Visible deployment marker: confirms which source file Streamlit Cloud is running.
-APP_BUILD_ID = "2026-11-15-STRICT"
+APP_BUILD_ID = "2026-11-15-TIMING"
 # Optional integrations: Yahoo mode must still start if Angel SDK/TOTP or
 # the auto-refresh helper is not installed.
 try:
@@ -3835,6 +3835,47 @@ def _wilson_interval(win_pct, n, z=1.96):
         return None
 
 
+def _timing_guard(journal, timeframe, now_dt):
+    """Trade-timing guard for manual paper orders.
+    Returns {"warnings": [...], "block": message or None}.
+    1) Data-driven: if YOUR closed paper trades in this timeframe and this clock hour have >= 15 samples and a
+       non-positive average net P&L, that slot is a proven loser -> block (Settings: "Trade timing guard").
+    2) Fixed windows: first 15 min and last 20 min of the NSE session are noisy -> warn always, block only if enabled."""
+    out = {"warnings": [], "block": None}
+    try:
+        data_on = bool(st.session_state.get("timing_guard_data", True))
+        windows_block = bool(st.session_state.get("timing_guard_windows", False))
+        minutes = now_dt.hour * 60 + now_dt.minute
+        if 9 * 60 + 15 <= minutes < 9 * 60 + 30:
+            msg = "Opening 15 minutes (09:15-09:30): spreads and whipsaws are largest."
+            out["warnings"].append(msg)
+            if windows_block:
+                out["block"] = msg + " Blocked by the timing guard."
+        elif 15 * 60 + 10 <= minutes <= 15 * 60 + 30:
+            msg = "Last 20 minutes (15:10-15:30): fast, erratic closing moves."
+            out["warnings"].append(msg)
+            if windows_block:
+                out["block"] = msg + " Blocked by the timing guard."
+        if data_on and journal is not None and not journal.empty and {"Status", "PnL", "Timeframe", "DateTime"}.issubset(journal.columns):
+            closed = journal[journal["Status"].astype(str).str.upper() == "CLOSED"].copy()
+            closed = closed[closed["Timeframe"].astype(str) == str(timeframe)]
+            when = pd.to_datetime(closed["DateTime"], format="%d-%m-%Y %H:%M:%S", errors="coerce")
+            pnl = pd.to_numeric(closed["PnL"], errors="coerce")
+            ok = when.notna() & pnl.notna()
+            same_hour = ok & (when.dt.hour == now_dt.hour)
+            n = int(same_hour.sum())
+            if n >= 15:
+                avg = float(pnl[same_hour].mean())
+                if avg <= 0:
+                    msg = (f"Your {n} closed {timeframe} paper trades entered around {now_dt.hour:02d}:00 average "
+                           f"₹{avg:,.2f} per trade (net of costs). This time slot has not paid.")
+                    out["warnings"].append(msg)
+                    out["block"] = out["block"] or (msg + " Blocked by the timing guard.")
+    except Exception as exc:
+        log_app_error("timing_guard", exc)
+    return out
+
+
 def calculate_win_chance(backtest_win_rate, backtest_trade_count=0, backtest_is_comparable=False):
     """Return only a measured same-strategy historical rate; never a heuristic probability."""
     try:
@@ -7045,6 +7086,17 @@ with st.expander("Backtest costs (configurable)"):
         key="paper_cost_bps",
         help="Charged on every paper exit (entry leg + exit leg of the closed units), so paper P&L is not better than live would be. 0 = old behaviour.")
 
+with st.expander("Trade timing guard"):
+    st.checkbox(
+        "Block paper orders in time slots that have lost money (needs 15+ closed trades in that hour and timeframe)",
+        value=True, key="timing_guard_data",
+        help="Uses your own closed paper trades, net of costs. Does nothing until enough trades exist, then stops you repeating a losing slot.")
+    st.checkbox(
+        "Also block entries in the first 15 and last 20 minutes of the session",
+        value=False, key="timing_guard_windows",
+        help="Off = only a warning is shown in those windows. On = BUY/SELL is refused then.")
+    st.caption("The guard only affects manual paper BUY / SELL clicks. Signals, scanner and alerts are not changed. Closing positions is never blocked.")
+
 with st.expander("Strict STRONG signal rule (optional)"):
     st.checkbox(
         "Require higher-timeframe agreement for STRONG BUY / STRONG SELL", value=False, key="strict_strong_htf",
@@ -8540,6 +8592,10 @@ with order_cols[0]:
 with order_cols[1]:
     sell_clicked = st.button("SELL / SHORT", type="secondary", use_container_width=True, key="paper_sell_order")
 
+_timing = _timing_guard(paper_journal, timeframe, ist_now())
+for _tw in _timing["warnings"]:
+    st.warning("⏱ " + _tw)
+
 if buy_clicked or sell_clicked:
     order_side = "BUY" if buy_clicked else "SELL"
     order_plan = get_suggested_paper_levels(analysis, order_side, current_display_price)
@@ -8549,6 +8605,8 @@ if buy_clicked or sell_clicked:
         st.error("Paper order blocked: this setup matches a repeated historical losing pattern. Turn off the optional block only if you have reviewed the risk.")
     elif not risk_ok:
         st.error(f"Paper order blocked by risk controls: {risk_msg}")
+    elif _timing["block"]:
+        st.error("Paper order blocked: " + _timing["block"] + " Turn the guard off in Settings → Trade timing guard if you want to override it.")
     elif required_margin > paper_balance:
         st.error(f"Insufficient virtual cash. Required margin ₹{required_margin:,.2f}; available ₹{paper_balance:,.2f}.")
     elif not (order_plan["stop_loss"] > 0 and order_plan["target1"] > 0 and order_plan["target2"] > 0 and order_plan["target3"] > 0):
