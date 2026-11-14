@@ -183,8 +183,19 @@ def paper_trade_entry(price, quantity, side="BUY"):
 
 
 
+DEFAULT_PAPER_COST_BPS = 2.0   # per side: brokerage + STT/charges + slippage
+
+
+def _paper_cost_bps():
+    """Per-side paper-trading cost (Settings -> Paper trading costs). 0 = old behaviour (free, perfect fills)."""
+    try:
+        return max(0.0, float(st.session_state.get("paper_cost_bps", DEFAULT_PAPER_COST_BPS)))
+    except Exception:
+        return DEFAULT_PAPER_COST_BPS
+
+
 def paper_trade_exit(entry_price, exit_price, quantity, signal, final_close=True):
-    """Release reserved notional and credit/debit simulated P&L."""
+    """Release reserved notional and credit/debit simulated P&L (net of costs and slippage)."""
     state = load_paper_state()
     bal = float(state.loc[0, "Balance"])
     used = float(state.loc[0, "UsedMargin"])
@@ -194,6 +205,8 @@ def paper_trade_exit(entry_price, exit_price, quantity, signal, final_close=True
     reserved = entry_price * quantity
     is_long = "BUY" in str(signal).upper() or "CALL" in str(signal).upper()
     pnl = (exit_price - entry_price) * quantity if is_long else (entry_price - exit_price) * quantity
+    # Entry leg + exit leg of the units being closed, so partial exits are charged in proportion.
+    pnl -= (entry_price + exit_price) * quantity * _paper_cost_bps() / 1e4
     state.loc[0, "Balance"] = bal + reserved + pnl
     state.loc[0, "UsedMargin"] = max(0.0, used - reserved)
     state.loc[0, "OpenPositions"] = max(0, int(state.loc[0, "OpenPositions"]) - (1 if final_close and quantity > 0 else 0))
