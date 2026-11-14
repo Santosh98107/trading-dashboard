@@ -120,7 +120,7 @@ def _ec_export(mod):
 
 _install_streamlit_compat()
 # Visible deployment marker: confirms which source file Streamlit Cloud is running.
-APP_BUILD_ID = "2026-11-13-COSTS"
+APP_BUILD_ID = "2026-11-15-PAPERCOST"
 # Optional integrations: Yahoo mode must still start if Angel SDK/TOTP or
 # the auto-refresh helper is not installed.
 try:
@@ -7028,6 +7028,10 @@ with st.expander("Backtest costs (configurable)"):
         help="Brokerage + STT/charges + slippage, charged on entry and again on exit. 0 = old behaviour (no costs). "
              "Backtest PnL, win rate and AI training then reflect what you would really keep.")
     st.caption("Without costs a short-timeframe backtest looks better than it will trade. Set 0 to compare with the old numbers.")
+    st.number_input(
+        "Paper trading cost + slippage per side (bps of price)", min_value=0.0, max_value=50.0, value=2.0, step=0.5,
+        key="paper_cost_bps",
+        help="Charged on every paper exit (entry leg + exit leg of the closed units), so paper P&L is not better than live would be. 0 = old behaviour.")
 
 with st.expander("Signal Engine Weights (configurable)"):
     st.caption("Multipliers applied to each scoring group before the BUY/SELL decision. 1.0 = default. Mandatory thresholds (ADX 20, MTF 2, min R:R 2.0) are applied separately and are not weight-dependent.")
