@@ -120,7 +120,7 @@ def _ec_export(mod):
 
 _install_streamlit_compat()
 # Visible deployment marker: confirms which source file Streamlit Cloud is running.
-APP_BUILD_ID = "2026-11-15-TIMING"
+APP_BUILD_ID = "2026-11-15-SAFE"
 # Optional integrations: Yahoo mode must still start if Angel SDK/TOTP or
 # the auto-refresh helper is not installed.
 try:
@@ -6128,6 +6128,13 @@ def get_mtf_setup_metrics(data_source, selected, ticker, tf, angel_creds):
         for out_key, col in (("ema9", "EMA9"), ("ema21", "EMA21"), ("ema50", "EMA50"),
                              ("rsi", "RSI"), ("adx", "ADX"), ("relative_volume", "RelativeVolume")):
             result[out_key] = _safe_num(row.get(col))
+        # Extra context for the stricter early alert (not used by the confirmed / strong tiers).
+        result["close"] = _safe_num(row.get("Close"))
+        result["vwap"] = _safe_num(row.get("VWAP"))
+        try:
+            result["adx_prev"] = _safe_num(frame["ADX"].iloc[-4])
+        except Exception:
+            result["adx_prev"] = np.nan
         result["available"] = all(np.isfinite(result[k]) for k in ("ema9", "ema21", "ema50", "rsi", "adx"))
         if result["available"]:
             result["trend"] = "Bullish" if result["ema9"] > result["ema21"] else "Bearish" if result["ema9"] < result["ema21"] else "Neutral"
@@ -6147,11 +6154,28 @@ def apply_tiered_early_alerts(analysis, metrics_by_tf):
     r3 = _safe_num(m3.get("rsi")); a3 = _safe_num(m3.get("adx")); v3 = _safe_num(m3.get("relative_volume"))
     r5 = _safe_num(m5.get("rsi")); a5 = _safe_num(m5.get("adx")); v5 = _safe_num(m5.get("relative_volume"))
     # Early alert is deliberately a watch state, not an entry approval.
-    buy_early = bullish(m3) and np.isfinite(r3) and r3 > 50
+    # Stricter early alert (Settings, default ON): EMA9>EMA21 and RSI>50 fire constantly in sideways markets, so also
+    # require price on the right side of VWAP and ADX that is rising from a non-flat level. A missing value never blocks.
+    def _early_ok(m, side):
+        try:
+            if not bool(st.session_state.get("strict_early_alert", True)):
+                return True
+            c, vw = _safe_num(m.get("close")), _safe_num(m.get("vwap"))
+            if np.isfinite(c) and np.isfinite(vw) and ((c < vw) if side == "BUY" else (c > vw)):
+                return False
+            ad, ap = _safe_num(m.get("adx")), _safe_num(m.get("adx_prev"))
+            if np.isfinite(ad) and ad < 15:
+                return False
+            if np.isfinite(ad) and np.isfinite(ap) and ad < ap:
+                return False
+            return True
+        except Exception:
+            return True
+    buy_early = bullish(m3) and np.isfinite(r3) and r3 > 50 and _early_ok(m3, "BUY")
     buy_confirmed = bullish(m3) and bullish(m5) and r3 > 55 and a3 > 20 and np.isfinite(v3) and v3 > 1.5
     buy_strong = (stacked_bull(m3) and stacked_bull(m5) and stacked_bull(m15)
                   and r3 > 60 and a3 > 25 and np.isfinite(v3) and v3 > 1.8)
-    sell_early = bearish(m3) and np.isfinite(r3) and r3 < 50
+    sell_early = bearish(m3) and np.isfinite(r3) and r3 < 50 and _early_ok(m3, "SELL")
     sell_confirmed = bearish(m3) and bearish(m5) and r3 < 45 and a3 > 20 and np.isfinite(v3) and v3 > 1.5
     sell_strong = (stacked_bear(m3) and stacked_bear(m5) and stacked_bear(m15)
                    and r3 < 40 and a3 > 25 and np.isfinite(v3) and v3 > 1.8)
@@ -7085,6 +7109,88 @@ with st.expander("Backtest costs (configurable)"):
         "Paper trading cost + slippage per side (bps of price)", min_value=0.0, max_value=50.0, value=2.0, step=0.5,
         key="paper_cost_bps",
         help="Charged on every paper exit (entry leg + exit leg of the closed units), so paper P&L is not better than live would be. 0 = old behaviour.")
+
+def _ec_make_db_backup_bytes():
+    """Consistent snapshot of elite.db (journal, users, paper account, risk state ...) as bytes, via SQLite's backup API."""
+    import sqlite3 as _sq, tempfile as _tf
+    src = _db_connect()
+    tmp = _tf.NamedTemporaryFile(suffix=".db", delete=False)
+    tmp.close()
+    try:
+        dst = _sq.connect(tmp.name)
+        with dst:
+            src.backup(dst)
+        dst.close()
+        with open(tmp.name, "rb") as fh:
+            return fh.read()
+    finally:
+        try:
+            src.close()
+        except Exception:
+            pass
+        try:
+            os.remove(tmp.name)
+        except Exception:
+            pass
+
+
+def _ec_restore_db_from_bytes(data):
+    """Validate an uploaded elite.db and copy it over the live database. A safety copy of the current one is kept first."""
+    import sqlite3 as _sq, tempfile as _tf
+    tmp = _tf.NamedTemporaryFile(suffix=".db", delete=False)
+    tmp.write(data); tmp.close()
+    try:
+        chk = _sq.connect(tmp.name)
+        ok = chk.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        tables = {r[0] for r in chk.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        chk.close()
+        if not ok or not tables:
+            return False, "That file is not a healthy Elite database (integrity check failed or no tables)."
+        try:
+            backup_file(DB_FILE)          # keeps the current database before it is replaced
+        except Exception:
+            pass
+        up = _sq.connect(tmp.name)
+        live = _db_connect()
+        with _DB_LOCK:
+            up.backup(live)
+        live.close(); up.close()
+        return True, f"Restored {len(tables)} tables. Reloading..."
+    except Exception as exc:
+        log_app_error("restore_db", exc)
+        return False, f"Restore failed: {exc}"
+    finally:
+        try:
+            os.remove(tmp.name)
+        except Exception:
+            pass
+
+
+with st.expander("Backup & restore (journal, paper account, users)"):
+    st.caption("Streamlit Cloud wipes its disk on redeploy or reboot. Download a backup now and then; after a reset, upload it here to get everything back.")
+    try:
+        st.download_button(
+            "⬇ Download backup (elite_backup.db)", data=_ec_make_db_backup_bytes(),
+            file_name=f"elite_backup_{ist_now().strftime('%Y%m%d_%H%M')}.db", mime="application/octet-stream",
+            key="ec_db_backup_download")
+    except Exception as _bk_err:
+        log_app_error("backup_download", _bk_err)
+        st.warning(f"Could not prepare the backup: {_bk_err}")
+    _restore_file = st.file_uploader("Restore from a backup file (.db)", type=["db"], key="ec_db_restore_file")
+    if _restore_file is not None:
+        st.warning("Restoring replaces the current journal, paper account and users with the backup. A copy of the current data is kept first.")
+        if st.button("Restore this backup now", key="ec_db_restore_btn"):
+            _ok, _msg = _ec_restore_db_from_bytes(_restore_file.getvalue())
+            (st.success if _ok else st.error)(_msg)
+            if _ok:
+                st.rerun()
+
+with st.expander("Early alert strictness"):
+    st.checkbox(
+        "Stricter EARLY ALERT: price on the right side of VWAP and ADX rising (above 15)",
+        value=True, key="strict_early_alert",
+        help="On (default) = fewer false early alerts in sideways markets. Off = old rule (EMA9 vs EMA21 and RSI only). "
+             "Confirmed and Strong alerts are unchanged.")
 
 with st.expander("Trade timing guard"):
     st.checkbox(
