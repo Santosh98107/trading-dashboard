@@ -1200,6 +1200,141 @@ def _al_money(v):
     return f"{v:,.2f}" if np.isfinite(v) else "n/a"
 
 
+AUDIT_OUTCOME_COLUMNS = ["Outcome", "OutcomeR", "BarsToOutcome", "ResolvedAt"]
+
+
+def ai_lab_resolve_audit(audit, data, symbol, timeframe, horizon=12, cost_bps=0.0, max_rows=400):
+    """Forward-test every logged BUY/SELL signal with the candles that came AFTER it (triple barrier):
+    T1 reached first -> "T1", stop reached first -> "STOP", neither within `horizon` bars -> "TIMEOUT" (marked at the
+    last bar's close). If one bar touches both, the stop is assumed first (pessimistic). R is net of costs.
+    Returns (updated_audit, number_of_rows_resolved_now). Signals whose bars have not all arrived stay unresolved."""
+    if audit is None or audit.empty or data is None or data.empty:
+        return audit, 0
+    a = audit.copy()
+    for col in AUDIT_OUTCOME_COLUMNS:
+        if col not in a.columns:
+            a[col] = np.nan if col in ("OutcomeR", "BarsToOutcome") else ""
+    need = ("Symbol", "Timeframe", "SignalType", "DateTime", "Price", "StopLoss", "Target1")
+    if any(c not in a.columns for c in need):
+        return a, 0
+    # Storage turns an empty text cell into NaN; make the three outcome columns plain object/float so any pandas version accepts text.
+    a["Outcome"] = a["Outcome"].astype(object).where(a["Outcome"].notna(), "").astype(object)
+    a["Outcome"] = a["Outcome"].map(lambda v: "" if str(v) in ("nan", "None", "<NA>") else v).astype(object)
+    a["OutcomeR"] = pd.to_numeric(a["OutcomeR"], errors="coerce").astype(float)
+    a["BarsToOutcome"] = pd.to_numeric(a["BarsToOutcome"], errors="coerce").astype(float)
+    a["ResolvedAt"] = a["ResolvedAt"].astype(object).where(a["ResolvedAt"].notna(), "").astype(object)
+    unresolved = a["Outcome"].astype(str).eq("")
+    mask = (a["Symbol"].astype(str) == str(symbol)) & (a["Timeframe"].astype(str) == str(timeframe)) & \
+           a["SignalType"].astype(str).str.lower().isin(["buy", "sell"]) & unresolved
+    if not mask.any():
+        return a, 0
+    idx = pd.DatetimeIndex(pd.to_datetime(data.index))
+    hi, lo, cl = data["High"].to_numpy(float), data["Low"].to_numpy(float), data["Close"].to_numpy(float)
+    done = 0
+    for i in list(a.index[mask])[-max_rows:]:
+        dt = _al_parse_dt(pd.Series([a.at[i, "DateTime"]])).iloc[0]
+        entry, sl, t1 = _al_num(a.at[i, "Price"]), _al_num(a.at[i, "StopLoss"]), _al_num(a.at[i, "Target1"])
+        if pd.isna(dt) or not (np.isfinite(entry) and np.isfinite(sl) and np.isfinite(t1)) or abs(entry - sl) <= 0:
+            a.at[i, "Outcome"] = "SKIPPED"          # old row without levels: never re-scanned
+            continue
+        is_buy = str(a.at[i, "SignalType"]).lower() == "buy"
+        risk = abs(entry - sl)
+        pos = int(idx.searchsorted(dt, side="right"))
+        n_avail = max(0, min(horizon, len(idx) - pos))
+        outcome, bars_used, r_gross = "", 0, np.nan
+        for k in range(n_avail):
+            h, l = hi[pos + k], lo[pos + k]
+            hit_sl = (l <= sl) if is_buy else (h >= sl)
+            hit_t1 = (h >= t1) if is_buy else (l <= t1)
+            if hit_sl:
+                outcome, bars_used, r_gross = "STOP", k + 1, -1.0
+                break
+            if hit_t1:
+                outcome, bars_used, r_gross = "T1", k + 1, abs(t1 - entry) / risk
+                break
+        if not outcome and n_avail >= horizon:
+            move = (cl[pos + horizon - 1] - entry) if is_buy else (entry - cl[pos + horizon - 1])
+            outcome, bars_used, r_gross = "TIMEOUT", horizon, move / risk
+        if not outcome:
+            continue                                  # still pending
+        cost_r = (2.0 * float(cost_bps) / 1e4 * entry) / risk
+        a.at[i, "Outcome"], a.at[i, "BarsToOutcome"] = outcome, bars_used
+        a.at[i, "OutcomeR"] = round(float(r_gross) - cost_r, 3)
+        a.at[i, "ResolvedAt"] = (datetime.utcnow() + timedelta(hours=5, minutes=30)).strftime(AI_LAB_DT_FMT)
+        done += 1
+    return a, done
+
+
+def ai_lab_audit_summary(audit, by=None):
+    """Hit rate (with 95% interval), average net R and expectancy of resolved signals, optionally grouped."""
+    if audit is None or audit.empty or "Outcome" not in audit.columns:
+        return pd.DataFrame()
+    r = audit[audit["Outcome"].fillna("").astype(str).isin(["T1", "STOP", "TIMEOUT"])].copy()
+    if r.empty:
+        return pd.DataFrame()
+    r["R"] = pd.to_numeric(r["OutcomeR"], errors="coerce")
+    r = r.dropna(subset=["R"])
+    if r.empty:
+        return pd.DataFrame()
+    r["Win"] = r["R"] > 0
+    groups = [("All signals", r)] if not by else [(str(k), g) for k, g in r.groupby(by, dropna=False)]
+    rows = []
+    for key, g in groups:
+        n, w = len(g), int(g["Win"].sum())
+        lb = _al_wilson_lb(w, n) * 100
+        z, p = 1.96, w / n
+        den = 1 + z * z / n
+        hi = min(1.0, (p + z * z / (2 * n) + z * math.sqrt((p * (1 - p) + z * z / (4 * n)) / n)) / den) * 100
+        rows.append({"Group": key, "Signals": n, "Win %": round(p * 100, 1), "95% range": f"{lb:.0f}-{hi:.0f}%",
+                     "Avg R (net)": round(float(g["R"].mean()), 3), "Total R": round(float(g["R"].sum()), 2),
+                     "T1 / STOP / TIMEOUT": f"{int((g['Outcome'] == 'T1').sum())} / {int((g['Outcome'] == 'STOP').sum())} / {int((g['Outcome'] == 'TIMEOUT').sum())}"})
+    return pd.DataFrame(rows).sort_values("Signals", ascending=False).reset_index(drop=True)
+
+
+def _al_edge_stats(g):
+    n, w = len(g), int((g["R"] > 0).sum())
+    z, p = 1.96, w / n
+    den = 1 + z * z / n
+    centre = p + z * z / (2 * n)
+    margin = z * math.sqrt((p * (1 - p) + z * z / (4 * n)) / n)
+    avg_r = float(g["R"].mean())
+    return {"n": n, "win_pct": round(p * 100, 1), "lo": round(max(0.0, (centre - margin) / den) * 100, 1),
+            "hi": round(min(1.0, (centre + margin) / den) * 100, 1), "avg_r": round(avg_r, 3), "total_r": round(float(g["R"].sum()), 2),
+            "verdict": "NEGATIVE" if avg_r <= 0 else ("WEAK" if avg_r < 0.1 else "POSITIVE")}
+
+
+def ai_lab_live_edge(audit, symbol, timeframe, side, regime=None, min_n=30):
+    """What happened to forward-tested signals like this one? Looks at resolved audit rows (shadow rows included) on three
+    levels, narrowest first: this symbol + timeframe + side + regime, then timeframe + side + regime for all symbols, then
+    timeframe + side. The first level with at least `min_n` resolved signals answers. Net R already includes costs."""
+    empty = {"status": "collecting", "n": 0, "needed": int(min_n)}
+    try:
+        if audit is None or audit.empty or "Outcome" not in audit.columns or "OutcomeR" not in audit.columns:
+            return empty
+        r = audit[audit["Outcome"].fillna("").astype(str).isin(["T1", "STOP", "TIMEOUT"])].copy()
+        r["R"] = pd.to_numeric(r["OutcomeR"], errors="coerce")
+        r = r.dropna(subset=["R"])
+        r = r[(r["Timeframe"].astype(str) == str(timeframe)) & (r["SignalType"].astype(str).str.lower() == str(side).lower())]
+        if r.empty:
+            return empty
+        reg = r["Regime"].astype(str) == str(regime) if (regime and "Regime" in r.columns) else pd.Series(True, index=r.index)
+        levels = [("this symbol, timeframe, side and regime", (r["Symbol"].astype(str) == str(symbol)) & reg),
+                  ("all symbols, this timeframe, side and regime", reg),
+                  ("all symbols, this timeframe and side", pd.Series(True, index=r.index))]
+        best = 0
+        for label, m in levels:
+            g = r[m]
+            best = max(best, len(g))
+            if len(g) >= int(min_n):
+                out = _al_edge_stats(g)
+                out.update({"status": "ready", "level": label, "needed": int(min_n)})
+                return out
+        empty["n"] = best
+        return empty
+    except Exception:
+        return empty
+
+
 def render_ai_lab(selected, timeframe, data, analysis, backtest_trades_df, view="all", show_header=True):
     """view = 'all' renders the 12 tabs together; otherwise only the tabs that belong on that page."""
     global _AL_ACTIVE
