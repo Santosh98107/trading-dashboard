@@ -34,6 +34,19 @@ _STATE = {
 
 
 # ---------------------------------------------------------------- configuration
+def normalize_supabase_url(url):
+    """Accept whatever was pasted (…supabase.co, …supabase.co/, …supabase.co/rest/v1/, no https://) and keep only
+    scheme://host. The Storage API lives under /storage/v1 of that host; an extra /rest/v1 path makes every call 404."""
+    from urllib.parse import urlparse
+    u = str(url or "").strip().strip('"').strip("'")
+    if not u:
+        return ""
+    if "://" not in u:
+        u = "https://" + u
+    p = urlparse(u)
+    return f"{p.scheme}://{p.netloc}" if p.netloc else u
+
+
 def _config_path():
     return os.path.join(os.environ.get("ELITE_DATA_DIR", "elite_data"), "durable_config.json")
 
@@ -51,7 +64,7 @@ def load_local_config():
 def save_local_config(url=None, key=None, bucket=None, enabled=None):
     cfg = load_local_config()
     if url is not None:
-        cfg["SUPABASE_URL"] = str(url).strip()
+        cfg["SUPABASE_URL"] = normalize_supabase_url(url)
     if key is not None and str(key).strip():
         cfg["SUPABASE_SERVICE_KEY"] = str(key).strip()      # an empty box keeps the saved key
     if bucket is not None:
@@ -99,7 +112,7 @@ def _backend(ignore_enabled=False):
         return FolderBackend(folder)
     url, key = _secret("SUPABASE_URL"), _secret("SUPABASE_SERVICE_KEY")
     if url and key:
-        return SupabaseBackend(url, key, _secret("SUPABASE_BUCKET") or "elite-backups")
+        return SupabaseBackend(normalize_supabase_url(url), key, _secret("SUPABASE_BUCKET") or "elite-backups")
     return None
 
 
@@ -361,8 +374,10 @@ def test_connection():
         return True, "Connection works: a test file was written to and read from the bucket."
     except Exception as exc:
         msg = str(exc)
-        if "401" in msg or "403" in msg or "Invalid" in msg:
+        if "(401)" in msg or "(403)" in msg or "Invalid API key" in msg or "Invalid JWT" in msg:
             hint = " (the key is wrong - use the service_role key, not anon)"
+        elif "(404)" in msg and "Bucket not found" not in msg:
+            hint = " (the URL is probably wrong - use only https://<project>.supabase.co, without /rest/v1)"
         elif "Name or service not known" in msg or "getaddrinfo" in msg or "Max retries" in msg or "Invalid URL" in msg:
             hint = " (the URL looks wrong - it should look like https://xxxx.supabase.co)"
         else:
