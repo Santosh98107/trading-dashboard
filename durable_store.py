@@ -34,6 +34,45 @@ _STATE = {
 
 
 # ---------------------------------------------------------------- configuration
+def _config_path():
+    return os.path.join(os.environ.get("ELITE_DATA_DIR", "elite_data"), "durable_config.json")
+
+
+def load_local_config():
+    """Settings typed into the app (Settings -> Permanent storage). Lives on the local disk only."""
+    try:
+        with open(_config_path(), "r", encoding="utf-8") as fh:
+            cfg = json.load(fh)
+        return cfg if isinstance(cfg, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_local_config(url=None, key=None, bucket=None, enabled=None):
+    cfg = load_local_config()
+    if url is not None:
+        cfg["SUPABASE_URL"] = str(url).strip()
+    if key is not None and str(key).strip():
+        cfg["SUPABASE_SERVICE_KEY"] = str(key).strip()      # an empty box keeps the saved key
+    if bucket is not None:
+        cfg["SUPABASE_BUCKET"] = str(bucket).strip()
+    if enabled is not None:
+        cfg["enabled"] = bool(enabled)
+    os.makedirs(os.path.dirname(_config_path()), exist_ok=True)
+    tmp = _config_path() + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(cfg, fh)
+    try:
+        os.chmod(tmp, 0o600)
+    except Exception:
+        pass
+    os.replace(tmp, _config_path())
+
+
+def is_enabled():
+    return bool(load_local_config().get("enabled", True))
+
+
 def _secret(name):
     val = os.environ.get(name)
     if val:
@@ -41,16 +80,20 @@ def _secret(name):
     try:
         import streamlit as st
         v = st.secrets.get(name)          # raises when no secrets file exists
-        return str(v).strip() if v else ""
+        if v:
+            return str(v).strip()
     except Exception:
-        return ""
+        pass
+    return str(load_local_config().get(name, "") or "").strip()      # typed into the Settings page
 
 
 def default_db_file():
     return os.path.join(os.environ.get("ELITE_DATA_DIR", "elite_data"), "elite.db")
 
 
-def _backend():
+def _backend(ignore_enabled=False):
+    if not ignore_enabled and not is_enabled():
+        return None                       # switched OFF in Settings
     folder = _secret("DURABLE_DIR")
     if folder:
         return FolderBackend(folder)
@@ -304,9 +347,34 @@ def maybe_push(db_file=None):
         _STATE["last_error"] = f"Scheduler error: {exc}"
 
 
+def test_connection():
+    """Write a tiny object and read it back, so a wrong URL / key / bucket shows a clear message."""
+    backend = _backend(ignore_enabled=True)
+    if backend is None:
+        return False, "Enter the Supabase URL and the service_role key first (or add them to Secrets)."
+    try:
+        stamp = _now_text().encode()
+        backend.put("elite_ping.txt", stamp)
+        back = backend.get("elite_ping.txt")
+        if back != stamp:
+            return False, "Connected, but the test file did not read back correctly."
+        return True, "Connection works: a test file was written to and read from the bucket."
+    except Exception as exc:
+        msg = str(exc)
+        if "401" in msg or "403" in msg or "Invalid" in msg:
+            hint = " (the key is wrong - use the service_role key, not anon)"
+        elif "Name or service not known" in msg or "getaddrinfo" in msg or "Max retries" in msg or "Invalid URL" in msg:
+            hint = " (the URL looks wrong - it should look like https://xxxx.supabase.co)"
+        else:
+            hint = ""
+        return False, f"Connection failed: {msg[:200]}{hint}"
+
+
 def status():
     backend = _backend()
     return {
+        "enabled": is_enabled(),
+        "has_credentials": _backend(ignore_enabled=True) is not None,
         "configured": backend is not None,
         "backend": backend.name if backend else "none",
         "last_ok": _STATE["last_ok"], "last_error": _STATE["last_error"], "restored": _STATE["restored"],
