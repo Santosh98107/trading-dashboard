@@ -120,7 +120,7 @@ def _ec_export(mod):
 
 _install_streamlit_compat()
 # Visible deployment marker: confirms which source file Streamlit Cloud is running.
-APP_BUILD_ID = "2026-11-15-AUTOLOAD"
+APP_BUILD_ID = "2026-11-15-EDGE"
 # Optional integrations: Yahoo mode must still start if Angel SDK/TOTP or
 # the auto-refresh helper is not installed.
 try:
@@ -4950,7 +4950,132 @@ def train_trade_success_model(min_trades=30):
 # =========================================================
 # SIGNAL AUDIT / DUPLICATE / EXPIRY
 # =========================================================
-def add_signal_audit(symbol, timeframe, analysis):
+def _strategy_version(analysis=None):
+    """Short fingerprint of everything that changes what a signal means (weights, strict switches, costs, code build).
+    Two signals with the same fingerprint came from the same rules, so results can be compared and rolled back."""
+    try:
+        parts = {
+            "weights": (analysis or {}).get("signal_weights"),
+            "strict_strong": bool(st.session_state.get("strict_strong_htf", False)),
+            "strict_early": bool(st.session_state.get("strict_early_alert", True)),
+            "only_strong": bool(globals().get("STRICT_TRADE_ONLY_STRONG", False)),
+            "build": str(globals().get("APP_BUILD_ID", "")),
+        }
+        return hashlib.sha1(json.dumps(parts, sort_keys=True, default=str).encode()).hexdigest()[:8]
+    except Exception:
+        return ""
+
+
+def resolve_signal_audit_outcomes(symbol, timeframe, data):
+    """Check logged signals of this symbol/timeframe against the candles that followed (at most once a minute)."""
+    try:
+        key = f"_audit_resolve_ts_{symbol}_{timeframe}"
+        if pytime.time() - float(st.session_state.get(key, 0)) < 60:
+            return
+        st.session_state[key] = pytime.time()
+        audit = load_signal_audit()
+        updated, n = ai_lab_resolve_audit(audit, data, symbol, timeframe, horizon=12, cost_bps=_backtest_cost_bps())
+        changed = n > 0 or (isinstance(updated, pd.DataFrame) and "Outcome" in updated.columns and
+                            (audit is None or "Outcome" not in audit.columns or
+                             not updated["Outcome"].fillna("").astype(str).equals(audit["Outcome"].fillna("").astype(str))))
+        if changed:
+            save_signal_audit(updated)
+    except Exception as exc:
+        log_app_error("resolve_signal_audit_outcomes", exc)
+
+
+def _ec_render_signal_audit_report():
+    st.subheader("📒 Signal audit — forward results")
+    st.caption("Every BUY/SELL signal is logged the moment it appears, together with the numbers the engine saw. Later the candles "
+               "that followed decide whether target 1 or the stop came first (stop first if one bar touched both), net of your backtest "
+               "cost setting. This is the honest record of how the live engine really performs; it grows as you use the app.")
+    audit = load_signal_audit()
+    if audit is not None and "Outcome" in audit.columns:
+        audit = audit.copy()
+        audit["Outcome"] = audit["Outcome"].fillna("").astype(str)
+    if audit is None or audit.empty or "Outcome" not in audit.columns:
+        st.info("No signals have been resolved yet. Keep the app open on a symbol; results appear once enough candles have formed after a signal.")
+        return
+    n_all = int(audit["SignalType"].astype(str).str.lower().isin(["buy", "sell"]).sum())
+    audit["Outcome"] = audit["Outcome"].astype(str)
+    resolved = audit[audit["Outcome"].astype(str).isin(["T1", "STOP", "TIMEOUT"])]
+    c = st.columns(3)
+    c[0].metric("Signals logged", n_all)
+    c[1].metric("Resolved", len(resolved))
+    c[2].metric("Waiting for candles", max(0, n_all - len(resolved) - int((audit["Outcome"].astype(str) == "SKIPPED").sum())))
+    overall = ai_lab_audit_summary(audit)
+    if overall.empty:
+        st.info("Nothing resolved yet.")
+        return
+    st.dataframe(overall, use_container_width=True, hide_index=True)
+    if int(overall["Signals"].iloc[0]) < 30:
+        st.warning("Fewer than 30 resolved signals: the win rate and its 95% range are still very uncertain. Do not trade real money on this yet.")
+    for label, col in (("By signal", "Signal"), ("By regime", "Regime"), ("By grade", "StrategyGrade"),
+                       ("By time of day", "TimeBucket"), ("By symbol", "Symbol"), ("By rule version", "StrategyVersion")):
+        if col in resolved.columns:
+            tab = ai_lab_audit_summary(audit, by=col)
+            if not tab.empty:
+                with st.expander(label):
+                    st.dataframe(tab.rename(columns={"Group": col}), use_container_width=True, hide_index=True)
+
+
+def apply_live_edge_gate(analysis, symbol, timeframe):
+    """Link the forward-tested signal record to the live signal.
+    * Always attaches analysis["live_edge"]: how similar past signals really turned out (needs 30+ resolved ones).
+    * If the gate is ON and the record is NEGATIVE (average net R <= 0) the BUY/SELL becomes NO TRADE, exactly like the
+      existing 'AI Block'. The blocked signal is kept as a SHADOW row so it still gets resolved and the record can
+      recover; otherwise a blocked setup could never prove itself again.
+    It can only tighten a signal, never relax one."""
+    try:
+        side = analysis.get("signal_type")
+        if side not in ("buy", "sell"):
+            analysis["live_edge"] = None
+            return analysis
+        min_n = int(st.session_state.get("live_edge_min_n", 30))
+        edge = ai_lab_live_edge(load_signal_audit(), symbol, timeframe, side, analysis.get("market_regime"), min_n=min_n)
+        analysis["live_edge"] = edge
+        if edge.get("status") == "ready" and edge.get("verdict") == "NEGATIVE" and bool(st.session_state.get("live_edge_gate", True)):
+            analysis["_edge_shadow"] = dict(analysis)          # original signal + levels, for the shadow audit row
+            reason = (f"Forward record: {edge['n']} similar signals ({edge['level']}) averaged {edge['avg_r']:+.2f}R "
+                      f"with a {edge['win_pct']:.0f}% win rate (95% range {edge['lo']:.0f}-{edge['hi']:.0f}%)")
+            analysis["signal_text"], analysis["signal_type"] = "NO TRADE", "neutral"
+            analysis.setdefault("no_trade_reasons", []).append("Live edge gate: " + reason)
+            analysis["no_trade_reason"] = "; ".join(analysis["no_trade_reasons"])
+            for k in ("stop_loss", "target1", "target2", "target3", "partial_exit", "trailing_stop", "rr_ratio"):
+                analysis[k] = None
+            analysis["strength"], analysis["confidence"], analysis["trade_quality_score"] = "Low", None, 0
+            analysis["trade_allowed"] = False
+            analysis["live_edge_blocked"] = True
+    except Exception as exc:
+        log_app_error("live_edge_gate", exc)
+    return analysis
+
+
+def _ec_render_live_edge_card(analysis):
+    edge = analysis.get("live_edge") if isinstance(analysis, dict) else None
+    shadow = analysis.get("_edge_shadow") if isinstance(analysis, dict) else None
+    with st.expander("🧪 Live edge check — how similar signals really turned out", expanded=bool(analysis.get("live_edge_blocked"))):
+        if edge is None and not shadow:
+            st.caption("Shown when a BUY or SELL signal is active. It compares it with your own forward-tested signal record.")
+            return
+        if edge and edge.get("status") != "ready":
+            st.info(f"Collecting data: {edge.get('n', 0)} of {edge.get('needed', 30)} resolved similar signals so far. "
+                    "Until then this check only displays and does not block anything.")
+            return
+        if edge:
+            icon = {"POSITIVE": "✅", "WEAK": "⚠️", "NEGATIVE": "⛔"}.get(edge["verdict"], "")
+            c = st.columns(4)
+            c[0].metric("Verdict", f"{icon} {edge['verdict'].title()}")
+            c[1].metric("Similar signals", edge["n"])
+            c[2].metric("Win rate", f"{edge['win_pct']:.0f}%", f"95% range {edge['lo']:.0f}-{edge['hi']:.0f}%", delta_color="off")
+            c[3].metric("Average R (net)", f"{edge['avg_r']:+.2f}", f"total {edge['total_r']:+.1f}R", delta_color="off")
+            st.caption(f"Based on {edge['level']}. R is measured in units of the planned stop distance, after your backtest cost setting.")
+        if analysis.get("live_edge_blocked"):
+            st.error("This signal was turned into NO TRADE by the live edge gate. It is still logged as a shadow signal and resolved, "
+                     "so the record can recover. Turn the gate off in Settings → Live edge gate to see the original signal.")
+
+
+def add_signal_audit(symbol, timeframe, analysis, blocked=""):
     try:
         audit = load_signal_audit()
         expiry_time = ist_now() + timedelta(minutes=SIGNAL_EXPIRY_MINUTES)
@@ -4972,7 +5097,24 @@ def add_signal_audit(symbol, timeframe, analysis):
             "ATR": round(float(analysis["atr"]), 4) if analysis.get("atr") is not None else np.nan,
             "Target1": round(float(analysis["target1"]), 2) if analysis.get("target1") is not None else np.nan,
             "StopLoss": round(float(analysis["stop_loss"]), 2) if analysis.get("stop_loss") is not None else np.nan,
-            "Regime": analysis.get("market_regime", "")
+            "Regime": analysis.get("market_regime", ""),
+            # point-in-time context for forward testing (every value is what the engine saw at this moment)
+            "StrategyVersion": _strategy_version(analysis),
+            "ADX": _safe_num(analysis.get("adx")), "RSI": _safe_num(analysis.get("rsi")),
+            "VWAPDistPct": (round((float(analysis["close_price"]) - float(analysis["vwap"])) / float(analysis["vwap"]) * 100, 3)
+                            if _safe_num(analysis.get("vwap")) not in (0, np.nan) and np.isfinite(_safe_num(analysis.get("vwap"))) else np.nan),
+            "Bullish": _safe_num(analysis.get("bullish_score")), "Bearish": _safe_num(analysis.get("bearish_score")),
+            "DirectionalEdge": _safe_num(analysis.get("directional_edge")),
+            "TrendVotes": int(analysis.get("buy_trend_votes", 0) if analysis.get("signal_type") == "buy" else analysis.get("sell_trend_votes", 0)),
+            "MTFAvailable": int(analysis.get("mtf_available_count", 0) or 0),
+            "MTFAligned": bool(analysis.get("mtf_bull_ok") if analysis.get("signal_type") == "buy" else analysis.get("mtf_bear_ok")),
+            "VolumeSpike": bool(analysis.get("volume_spike")), "Breakout": bool(analysis.get("breakout") or analysis.get("breakdown")),
+            "SmartMoneyPts": _safe_num(analysis.get("smart_money_points")), "OptionFlowPts": _safe_num(analysis.get("option_flow_points")),
+            "MacroPts": _safe_num(analysis.get("macro_points")), "InstitutionalScore": _safe_num(analysis.get("institutional_score")),
+            "OIBias": str(analysis.get("oi_bias", "")), "TimeBucket": f"{ist_now().hour:02d}:00",
+            "DataSource": str(globals().get("data_source", "")),
+            "Outcome": "", "OutcomeR": np.nan, "BarsToOutcome": np.nan, "ResolvedAt": "",
+            "Blocked": str(blocked or ""),
         }
         audit = pd.concat([audit, pd.DataFrame([row])], ignore_index=True)
         save_signal_audit(audit)
@@ -6969,6 +7111,12 @@ def _ec_render_ai_lab_pages(selected, timeframe, data, analysis, backtest_trades
         except Exception as _lab_err:
             log_app_error(f"ai_lab_{view}", _lab_err)
             st.error(f"AI Lab error: {type(_lab_err).__name__}: {_lab_err}")
+        if page == "Reports":
+            try:
+                _ec_render_signal_audit_report()
+            except Exception as _aud_err:
+                log_app_error("signal_audit_report", _aud_err)
+                st.warning(f"Signal audit report could not be shown: {type(_aud_err).__name__}: {_aud_err}")
 
 
 _ec_section("__always__")
@@ -7288,6 +7436,14 @@ with st.expander("Backup & restore (journal, paper account, users)"):
             (st.success if _ok else st.error)(_msg)
             if _ok:
                 st.rerun()
+
+with st.expander("Live edge gate (forward-tested record)"):
+    st.checkbox("Block BUY / SELL signals whose forward-tested record is negative", value=True, key="live_edge_gate",
+                help="Uses the Signal audit results (Reports page). A signal is turned into NO TRADE only when at least the minimum number "
+                     "of similar resolved signals exists AND their average net R is zero or negative. Blocked signals are still logged "
+                     "as shadow signals, so the record can recover. OFF = display only.")
+    st.number_input("Minimum resolved similar signals before the gate may act", min_value=20, max_value=200, value=30, step=5, key="live_edge_min_n")
+    st.caption("With fewer similar signals than this, the Signals page only shows 'collecting data' and nothing is blocked.")
 
 with st.expander("Auto-load pages"):
     st.checkbox("Load the NIFTY Top 30 scanner and Top Opportunities automatically when their page opens", value=True,
@@ -8101,6 +8257,7 @@ analysis = apply_adaptive_signal_intelligence(
     mtf_available_count=mtf_available_count
 )
 analysis = apply_tiered_early_alerts(analysis, tiered_tf_metrics)
+analysis = apply_live_edge_gate(analysis, selected, timeframe)     # forward-tested record -> live signal (can only tighten)
 # An approved trainer profile can gate paper eligibility only. Original score values
 # and BUY/SELL scoring weights remain untouched.
 _trainer_profile = st.session_state.get("approved_ai_trainer_profile")
@@ -8115,6 +8272,7 @@ equity_curve_df, max_drawdown = compute_equity_curve_from_trades(backtest_trades
 _ec_section("Signals")
 _ec_render_smart_money_signal_point(analysis)   # Smart Money point, shown on the Signals page
 _ec_render_option_flow_signal_point(analysis)    # Option flow point (OI change + live Put/Call volume)
+_ec_render_live_edge_card(analysis)               # forward-tested record for signals like this one
 with st.expander("🏛️ Institutional Signal Participation Audit", expanded=False):
     _inst_audit = analysis.get("institutional_participation_audit", {})
     if _inst_audit:
@@ -8340,6 +8498,9 @@ if os.path.exists(SIGNAL_STATE_FILE):
 signal_is_duplicate = is_duplicate_signal(selected, timeframe, analysis)
 if analysis["signal_type"] in ["buy", "sell"] and not signal_is_duplicate:
     add_signal_audit(selected, timeframe, analysis)
+elif analysis.get("_edge_shadow") and not is_duplicate_signal(selected, timeframe, analysis["_edge_shadow"]):
+    add_signal_audit(selected, timeframe, analysis["_edge_shadow"], blocked="EDGE")      # shadow row: keeps the record updating
+resolve_signal_audit_outcomes(selected, timeframe, data)
 
 if telegram_enabled and telegram_bot_token and telegram_chat_id:
     if st.button("Send Telegram Alert Now"):
