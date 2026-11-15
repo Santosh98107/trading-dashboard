@@ -120,7 +120,7 @@ def _ec_export(mod):
 
 _install_streamlit_compat()
 # Visible deployment marker: confirms which source file Streamlit Cloud is running.
-APP_BUILD_ID = "2026-11-15-EDGE2"
+APP_BUILD_ID = "2026-11-15-SPEED"
 # Optional integrations: Yahoo mode must still start if Angel SDK/TOTP or
 # the auto-refresh helper is not installed.
 try:
@@ -1628,12 +1628,19 @@ def convert_to_heikin_ashi(df):
     if ha.empty:
         return ha
     ha["HA_Close"] = (ha["Open"] + ha["High"] + ha["Low"] + ha["Close"]) / 4
-    ha_open = [(ha["Open"].iloc[0] + ha["Close"].iloc[0]) / 2]
-    for i in range(1, len(ha)):
-        ha_open.append((ha_open[i - 1] + ha["HA_Close"].iloc[i - 1]) / 2)
+    # Same recursion as before, on plain Python floats instead of thousands of pandas .iloc reads (this ran once per
+    # backtest bar and was the single biggest cost of the page).
+    _o0, _c0 = float(ha["Open"].iloc[0]), float(ha["Close"].iloc[0])
+    _hc = ha["HA_Close"].to_numpy(dtype=float).tolist()
+    ha_open = [(_o0 + _c0) / 2]
+    for i in range(1, len(_hc)):
+        ha_open.append((ha_open[i - 1] + _hc[i - 1]) / 2)
     ha["HA_Open"] = ha_open
-    ha["HA_High"] = ha[["High", "HA_Open", "HA_Close"]].max(axis=1)
-    ha["HA_Low"] = ha[["Low", "HA_Open", "HA_Close"]].min(axis=1)
+    # fmax / fmin skip NaN exactly like DataFrame.max/min(axis=1) did, without building a transposed frame per call.
+    _ho = np.asarray(ha_open, dtype=float)
+    _hcn = ha["HA_Close"].to_numpy(dtype=float)
+    ha["HA_High"] = np.fmax(np.fmax(ha["High"].to_numpy(dtype=float), _ho), _hcn)
+    ha["HA_Low"] = np.fmin(np.fmin(ha["Low"].to_numpy(dtype=float), _ho), _hcn)
     return ha
 
 
@@ -3676,13 +3683,12 @@ def detect_gap_filter(df):
         work.index = idx[~idx.isna()]
         if len(work) < 2:
             return neutral
-        dates = pd.Series([x.date() for x in work.index], index=work.index)
-        unique_dates = list(pd.unique(dates))
+        # One calendar-day code per candle, in order of first appearance (vectorised; was a Python loop of x.date()).
+        _day_codes, _day_uniques = pd.factorize(work.index.normalize())
+        unique_dates = list(range(len(_day_uniques)))
         if len(unique_dates) >= 2:
-            current_date = unique_dates[-1]
-            previous_date = unique_dates[-2]
-            current_session = work.loc[dates == current_date]
-            previous_session = work.loc[dates == previous_date]
+            current_session = work.loc[_day_codes == (len(_day_uniques) - 1)]
+            previous_session = work.loc[_day_codes == (len(_day_uniques) - 2)]
             current_open = float(current_session["Open"].iloc[0])
             previous_close = float(previous_session["Close"].iloc[-1])
         else:
@@ -4982,6 +4988,55 @@ def resolve_signal_audit_outcomes(symbol, timeframe, data):
             save_signal_audit(updated)
     except Exception as exc:
         log_app_error("resolve_signal_audit_outcomes", exc)
+
+
+def get_backtest_result(symbol, timeframe, backtest_data, cache_key, option_metrics, news_info):
+    """Backtest with stale-while-revalidate.
+    * Same candles as last time -> cached result, instantly.
+    * New candle and an older result for this symbol/timeframe exists -> show that result NOW and recompute in the
+      background (it needs ~5-10 s, which used to freeze the whole page at every new candle). The fresh result is
+      picked up on a later refresh.
+    * Nothing cached yet -> compute once, with a spinner (first visit only).
+    Returns (result_tuple, is_stale)."""
+    cache = st.session_state.get("backtest_result_cache")
+    if isinstance(cache, dict) and cache.get("key") == cache_key and "result" in cache:
+        return cache["result"], False
+    pending = getattr(rs, "BACKTEST_PENDING", None)
+    if pending is None:
+        pending = rs.BACKTEST_PENDING = {}
+    pkey = (symbol, timeframe)
+    cost = _backtest_cost_bps()
+    job = pending.get(pkey)
+    if job is not None and job["future"].done():
+        pending.pop(pkey, None)
+        try:
+            res = job["future"].result()
+            cache = {"key": job["key"], "result": res, "calculated_at": now_str(), "symbol": symbol, "timeframe": timeframe, "cost": job["cost"]}
+            st.session_state["backtest_result_cache"] = cache
+            if job["key"] == cache_key:
+                return res, False
+        except Exception as exc:
+            log_app_error("background_backtest", exc)
+            cooldown = getattr(rs, "BACKTEST_FAIL_UNTIL", None)
+            if cooldown is None:
+                cooldown = rs.BACKTEST_FAIL_UNTIL = {}
+            cooldown[pkey] = pytime.time() + 120          # do not retry a failing backtest on every refresh
+        job = None
+    have_prev = (isinstance(cache, dict) and "result" in cache and cache.get("symbol") == symbol
+                 and cache.get("timeframe") == timeframe and cache.get("cost", cost) == cost)
+    if have_prev:
+        if job is None and pytime.time() >= getattr(rs, "BACKTEST_FAIL_UNTIL", {}).get(pkey, 0):
+            fut = rs.FETCH_POOL.submit(simple_backtest, backtest_data.copy(), symbol=symbol, timeframe_label=timeframe,
+                                       option_metrics=dict(option_metrics) if isinstance(option_metrics, dict) else option_metrics,
+                                       news_info=news_info, cost_bps=cost)
+            pending[pkey] = {"future": fut, "key": cache_key, "cost": cost}
+        return cache["result"], True
+    with st.spinner("Calculating recent-history backtest…"):
+        res = simple_backtest(backtest_data, symbol=symbol, timeframe_label=timeframe,
+                              option_metrics=option_metrics, news_info=news_info, cost_bps=cost)
+    st.session_state["backtest_result_cache"] = {"key": cache_key, "result": res, "calculated_at": now_str(),
+                                                  "symbol": symbol, "timeframe": timeframe, "cost": cost}
+    return res, False
 
 
 def resolve_pending_audit_all(max_pairs=6):
@@ -8232,24 +8287,10 @@ try:
 except Exception:
     _bt_hash = len(backtest_data)
 _backtest_cache_key = f"{selected}|{timeframe}|{len(backtest_data)}|{_bt_hash}|cost{_backtest_cost_bps()}"
-_backtest_cache = st.session_state.get("backtest_result_cache")
-if isinstance(_backtest_cache, dict) and _backtest_cache.get("key") == _backtest_cache_key:
-    wins, losses, total_trades, backtest_win_rate, backtest_trades_df = _backtest_cache["result"]
-else:
-    with st.spinner("Calculating recent-history backtest…"):
-        _backtest_result = simple_backtest(
-            backtest_data,
-            symbol=selected,
-            timeframe_label=timeframe,
-            option_metrics=option_metrics,
-            news_info=historical_news_context
-        )
-    wins, losses, total_trades, backtest_win_rate, backtest_trades_df = _backtest_result
-    st.session_state["backtest_result_cache"] = {
-        "key": _backtest_cache_key,
-        "result": _backtest_result,
-        "calculated_at": now_str(),
-    }
+_backtest_result, _backtest_is_stale = get_backtest_result(
+    selected, timeframe, backtest_data, _backtest_cache_key, option_metrics, historical_news_context)
+st.session_state["backtest_is_stale"] = bool(_backtest_is_stale)
+wins, losses, total_trades, backtest_win_rate, backtest_trades_df = _backtest_result
 
 backtest_is_comparable = bool(
     total_trades >= 30 and
