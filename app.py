@@ -76,6 +76,10 @@ _ec_preflight()
 import yfinance as yf
 import institutional_upgrades as inst
 import runtime_state as rs   # state that must survive Streamlit reruns
+try:
+    import background_jobs as bgj   # slow scanner / ranking work runs here, off the page
+except Exception:
+    bgj = None
 import inspect as _inspect
 
 
@@ -120,7 +124,7 @@ def _ec_export(mod):
 
 _install_streamlit_compat()
 # Visible deployment marker: confirms which source file Streamlit Cloud is running.
-APP_BUILD_ID = "2026-11-15-LOADFIX"
+APP_BUILD_ID = "2026-11-15-BGJOBS"
 # Optional integrations: Yahoo mode must still start if Angel SDK/TOTP or
 # the auto-refresh helper is not installed.
 try:
@@ -2920,20 +2924,35 @@ def scanner_breadth_summary(scanner_df):
 
 
 def _ec_auto_scan_nifty30():
-    """Fill the NIFTY Top 30 table when the Scanner page is open, instead of waiting for the button.
-    Only runs on the Scanner page, retries at most once a minute, and refreshes every 3 minutes."""
+    """Scanner page: the NIFTY Top 30 table is built by a background worker and only READ here, so the page never waits
+    and a timer rerun cannot cancel it. Falls back to the old direct load if the worker module is missing."""
     try:
         if _ec_active != "Scanner" or not bool(st.session_state.get("auto_load_pages", True)):
             return
-        now_ts = pytime.time()
-        res = st.session_state.get("nifty30_scanner_result")
-        have = isinstance(res, pd.DataFrame) and not res.empty and "CMP" in res.columns and bool(res["CMP"].notna().any())
-        age = now_ts - float(st.session_state.get("_nifty30_auto_ts", 0))
-        if (not have and age > 60) or (have and age > 180):
-            st.session_state["_nifty30_auto_ts"] = now_ts
-            with st.spinner("Loading NIFTY Top 30 (3m / 5m / 10m / 15m)…"):
-                st.session_state["nifty30_scanner_result"] = build_nifty_top30_scanner()
-            st.session_state["nifty30_scanner_last_run"] = now_str()
+        if bgj is None:
+            now_ts = pytime.time()
+            res = st.session_state.get("nifty30_scanner_result")
+            have = isinstance(res, pd.DataFrame) and not res.empty and "CMP" in res.columns and bool(res["CMP"].notna().any())
+            age = now_ts - float(st.session_state.get("_nifty30_auto_ts", 0))
+            if (not have and age > 60) or (have and age > 180):
+                st.session_state["_nifty30_auto_ts"] = now_ts
+                with st.spinner("Loading NIFTY Top 30 (3m / 5m / 10m / 15m)…"):
+                    st.session_state["nifty30_scanner_result"] = build_nifty_top30_scanner()
+                st.session_state["nifty30_scanner_last_run"] = now_str()
+            return
+        st_ = bgj.request("nifty30", build_nifty_top30_scanner, max_age=180, retry_after=45)
+        val = st_["value"]
+        if isinstance(val, pd.DataFrame) and not val.empty and st_["age"] is not None:
+            cur = st.session_state.get("_nifty30_bg_stamp")
+            stamp = round(pytime.time() - st_["age"], 0)
+            if cur != stamp:
+                st.session_state["_nifty30_bg_stamp"] = stamp
+                st.session_state["nifty30_scanner_result"] = val
+                st.session_state["nifty30_scanner_last_run"] = now_str()
+        if st_["running"] and st_["value"] is None:
+            st.info("⏳ Loading NIFTY Top 30 in the background (about 20-60 s). The page stays usable and fills in by itself.")
+        elif st_["error"] and st_["value"] is None:
+            st.warning(f"Scanner load failed ({st_['error']}). It retries automatically; you can also press the button.")
     except Exception as exc:
         log_app_error("nifty30_auto_scan", exc)
 
@@ -7075,33 +7094,53 @@ def _ec_run_feature_validation(analysis, data_source):
 
 
 def _ec_render_top_opportunities():
+    """Top Opportunities: ranking is computed by a background worker (about 10-20 s of Yahoo + indicators) and only read here."""
     res = st.session_state.get("al_opps")
-    # Rank automatically when this page opens (and every 5 minutes), instead of waiting for the button.
-    _auto_due = False
-    try:
-        _age = pytime.time() - float(st.session_state.get("_opps_auto_ts", 0))
-        _auto_due = bool(st.session_state.get("auto_load_pages", True)) and (
-            (not res and _age > 60) or (res is not None and _age > 300))
-        if _auto_due:
-            st.session_state["_opps_auto_ts"] = pytime.time()
-    except Exception:
-        _auto_due = False
-    if st.button("Rank / refresh top opportunities", key="ec_top_opp_btn") or _auto_due:
+    _auto = bool(st.session_state.get("auto_load_pages", True))
+    _clicked = st.button("Rank / refresh top opportunities", key="ec_top_opp_btn")
+    if bgj is not None and (_auto or _clicked):
+        try:
+            _j = load_journal()
+            _args = (ai_lab_get_model(_j), _al_closed_trades(_j), dict(stocks))
+            st_ = bgj.request("opps", ai_lab_rank_opportunities, args=_args, max_age=300, retry_after=45, force=_clicked)
+            if st_["value"] is not None and st_["age"] is not None:
+                _df, _missing = st_["value"]
+                _stamp = round(pytime.time() - st_["age"], 0)
+                if st.session_state.get("_opps_bg_stamp") != _stamp:
+                    st.session_state["_opps_bg_stamp"] = _stamp
+                    res = {"df": _df, "missing": _missing, "at": now_str()}
+                    st.session_state["al_opps"] = res        # shared with the AI Lab Opportunities tab
+            if st_["running"] and not res:
+                st.info("⏳ Ranking the watchlist in the background (about 10-20 s). This page fills in by itself.")
+            elif st_["error"] and not res:
+                st.warning(f"Ranking failed ({st_['error']}). It retries automatically.")
+        except Exception as exc:
+            log_app_error("top_opps_bg", exc)
+    elif _clicked:
         with st.spinner("Scoring NIFTY, BANKNIFTY, SENSEX and stocks..."):
             _j = load_journal()
             _df, _missing = ai_lab_rank_opportunities(ai_lab_get_model(_j), _al_closed_trades(_j), dict(stocks))
         res = {"df": _df, "missing": _missing, "at": now_str()}
-        st.session_state["al_opps"] = res        # shared with the AI Lab Opportunities tab
+        st.session_state["al_opps"] = res
     if not res:
-        st.info("Press the button to rank the watchlist (about 10-20 s). The same ranking is available on the Scanner page.")
+        if bgj is None:
+            st.info("Press the button to rank the watchlist (about 10-20 s).")
         return
     df_ = res["df"]
     if df_ is None or df_.empty:
         st.warning("No symbol could be scored (price feed unavailable).")
         return
-    view = df_.head(7)[["Rank", "Symbol", "Score"] + [c for c in ("Direction", "Grade") if c in df_.columns]]
-    st.dataframe(view, use_container_width=True, hide_index=True)
-    st.caption(f"Ranked at {res.get('at')} | Score blends setup quality, risk:reward and learned probability. A screening aid, not a trade instruction.")
+    st.caption(f"Ranked at {res.get('at')}")
+    top = df_[df_["Direction"] != "NEUTRAL"].head(5)
+    if not top.empty:
+        cols = st.columns(len(top))
+        for col, (_, r) in zip(cols, top.iterrows()):
+            col.metric(f"#{int(r['Rank'])} {r['Symbol']} - {r['Direction']}", f"Quality {r['Quality']:.0f} ({r['Grade']})",
+                       f"RR {r['RR']:.1f}" + (f" | P {r['Probability %']:.0f}%" if pd.notna(r["Probability %"]) else " | P n/a"))
+    st.dataframe(df_, use_container_width=True, hide_index=True)
+    if res.get("missing"):
+        st.caption("No usable data for: " + ", ".join(res["missing"]))
+    st.caption("Score blends setup quality, risk:reward and learned probability. A screening aid, not a trade instruction.")
 
 
 def _ec_render_system_health(analysis, data):
@@ -7329,18 +7368,6 @@ _ec_pause_on_action = st.checkbox(
          "On Portfolio, Trade Replay, AI, Research, Reports and Settings it waits, so a click is never cancelled by the timer."
 )
 _ec_timer_paused = bool(_ec_pause_on_action and _ec_active in _EC_ACTION_PAGES)
-# Scanner / Top Opportunities need 20-60 s to load the first time. A 15 s timer rerun cancels that load before it
-# finishes, so the page stayed blank forever. Hold the timer only until the data is on screen.
-try:
-    if auto_refresh and not _ec_timer_paused and st.session_state.get("auto_load_pages", True):
-        if _ec_active == "Scanner":
-            _r30 = st.session_state.get("nifty30_scanner_result")
-            if not (isinstance(_r30, pd.DataFrame) and not _r30.empty and "CMP" in _r30.columns and bool(_r30["CMP"].notna().any())):
-                _ec_timer_paused = True
-        elif _ec_active == "Top Opportunities" and not st.session_state.get("al_opps"):
-            _ec_timer_paused = True
-except Exception:
-    pass
 if _ec_timer_paused and auto_refresh:
     st.caption("⏸ Auto refresh is paused on this page so your clicks are not interrupted. Stops and targets are re-checked on every click and on the view pages.")
 if auto_refresh and AUTO_REFRESH_AVAILABLE and not _ec_timer_paused:
@@ -9898,6 +9925,23 @@ st.session_state["ec_last_run_secs"] = round(pytime.time() - _EC_RUN_T0, 1)
 if _EC_DASH_PROGRESS is not None and _ec_active == "Dashboard":
     _EC_DASH_PROGRESS.caption(f"✅ Updated in {st.session_state['ec_last_run_secs']}s (network waits {st.session_state.get('_ec_wait_used', 0):.1f}s)")
 # Permanent storage: schedule a background upload of the database (no-op when not configured; never blocks this run).
+
+def _ec_bg_warmup():
+    """Keep Scanner and Top Opportunities warm in the background while any other page is open, so they open already filled.
+    Never blocks and never raises; skipped when the Settings switch 'Auto-load pages' is off."""
+    try:
+        if bgj is None or not bool(st.session_state.get("auto_load_pages", True)) or _ec_active in ("Scanner", "Top Opportunities"):
+            return
+        bgj.request("nifty30", build_nifty_top30_scanner, max_age=300, retry_after=120)
+        _j = load_journal()
+        bgj.request("opps", ai_lab_rank_opportunities, args=(ai_lab_get_model(_j), _al_closed_trades(_j), dict(stocks)),
+                    max_age=600, retry_after=120)
+    except Exception as exc:
+        log_app_error("bg_warmup", exc)
+
+
+_ec_bg_warmup()
+
 try:
     if durable_store is not None:
         durable_store.maybe_push()
