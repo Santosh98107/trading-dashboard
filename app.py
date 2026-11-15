@@ -120,7 +120,7 @@ def _ec_export(mod):
 
 _install_streamlit_compat()
 # Visible deployment marker: confirms which source file Streamlit Cloud is running.
-APP_BUILD_ID = "2026-11-15-EDGE"
+APP_BUILD_ID = "2026-11-15-EDGE2"
 # Optional integrations: Yahoo mode must still start if Angel SDK/TOTP or
 # the auto-refresh helper is not installed.
 try:
@@ -4984,11 +4984,58 @@ def resolve_signal_audit_outcomes(symbol, timeframe, data):
         log_app_error("resolve_signal_audit_outcomes", exc)
 
 
+def resolve_pending_audit_all(max_pairs=6):
+    """Resolve waiting signals of EVERY symbol/timeframe in the audit, not just the one on screen, by loading their candles
+    (Yahoo). Each load is time-boxed by the app's normal fetch budget. Returns (signals_resolved, pairs_checked, pairs_without_data)."""
+    audit = load_signal_audit()
+    if audit is None or audit.empty or "Outcome" not in audit.columns:
+        return 0, 0, 0
+    audit = audit.copy()
+    audit["Outcome"] = audit["Outcome"].fillna("").astype(str)
+    pend = audit[(audit["Outcome"] == "") & audit["SignalType"].astype(str).str.lower().isin(["buy", "sell"])]
+    pairs = list(dict.fromkeys(zip(pend["Symbol"].astype(str), pend["Timeframe"].astype(str))))[:max_pairs]
+    total, no_data = 0, 0
+    for sym, tf in pairs:
+        ticker = stocks.get(sym)
+        if not ticker:
+            continue
+        try:
+            frame = get_data_for_timeframe("Yahoo", sym, ticker, tf, None)
+        except Exception as exc:
+            log_app_error("resolve_pending_audit_all", exc)
+            frame = None
+        if frame is None or frame.empty:
+            no_data += 1
+            continue
+        audit, n = ai_lab_resolve_audit(audit, frame, sym, tf, horizon=12, cost_bps=_backtest_cost_bps())
+        total += n
+    save_signal_audit(audit)
+    return total, len(pairs), no_data
+
+
 def _ec_render_signal_audit_report():
     st.subheader("📒 Signal audit — forward results")
     st.caption("Every BUY/SELL signal is logged the moment it appears, together with the numbers the engine saw. Later the candles "
                "that followed decide whether target 1 or the stop came first (stop first if one bar touched both), net of your backtest "
                "cost setting. This is the honest record of how the live engine really performs; it grows as you use the app.")
+    _rc1, _rc2 = st.columns([1, 2])
+    with _rc1:
+        _force_resolve = st.button("🔄 Resolve waiting signals (all symbols)", key="ec_audit_resolve_all_btn", use_container_width=True)
+    with _rc2:
+        st.caption("Opens the candles of every symbol that has waiting signals, so results do not depend on which symbol you happen to be viewing. "
+                   "Also runs by itself when this page opens (every 10 minutes at most). Signals older than the available candle history "
+                   "(about 7 days on 3m, 30 days on 5m) can no longer be resolved and are marked NO_DATA.")
+    try:
+        if _force_resolve or (bool(st.session_state.get("auto_load_pages", True)) and
+                              pytime.time() - float(st.session_state.get("_audit_resolve_all_ts", 0)) > 600):
+            st.session_state["_audit_resolve_all_ts"] = pytime.time()
+            with st.spinner("Checking waiting signals against their candles…"):
+                _done, _pairs, _nodata = resolve_pending_audit_all()
+            if _force_resolve:
+                st.success(f"Resolved {_done} signal(s) from {_pairs} symbol/timeframe pair(s)."
+                           + (f" {_nodata} pair(s) had no candles right now." if _nodata else ""))
+    except Exception as exc:
+        log_app_error("resolve_pending_audit_all_ui", exc)
     audit = load_signal_audit()
     if audit is not None and "Outcome" in audit.columns:
         audit = audit.copy()
@@ -5002,7 +5049,7 @@ def _ec_render_signal_audit_report():
     c = st.columns(3)
     c[0].metric("Signals logged", n_all)
     c[1].metric("Resolved", len(resolved))
-    c[2].metric("Waiting for candles", max(0, n_all - len(resolved) - int((audit["Outcome"].astype(str) == "SKIPPED").sum())))
+    c[2].metric("Waiting for candles", max(0, n_all - len(resolved) - int(audit["Outcome"].astype(str).isin(["SKIPPED", "NO_DATA"]).sum())))
     overall = ai_lab_audit_summary(audit)
     if overall.empty:
         st.info("Nothing resolved yet.")
