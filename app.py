@@ -120,7 +120,7 @@ def _ec_export(mod):
 
 _install_streamlit_compat()
 # Visible deployment marker: confirms which source file Streamlit Cloud is running.
-APP_BUILD_ID = "2026-11-15-SPEED"
+APP_BUILD_ID = "2026-11-15-LOADFIX"
 # Optional integrations: Yahoo mode must still start if Angel SDK/TOTP or
 # the auto-refresh helper is not installed.
 try:
@@ -7329,6 +7329,18 @@ _ec_pause_on_action = st.checkbox(
          "On Portfolio, Trade Replay, AI, Research, Reports and Settings it waits, so a click is never cancelled by the timer."
 )
 _ec_timer_paused = bool(_ec_pause_on_action and _ec_active in _EC_ACTION_PAGES)
+# Scanner / Top Opportunities need 20-60 s to load the first time. A 15 s timer rerun cancels that load before it
+# finishes, so the page stayed blank forever. Hold the timer only until the data is on screen.
+try:
+    if auto_refresh and not _ec_timer_paused and st.session_state.get("auto_load_pages", True):
+        if _ec_active == "Scanner":
+            _r30 = st.session_state.get("nifty30_scanner_result")
+            if not (isinstance(_r30, pd.DataFrame) and not _r30.empty and "CMP" in _r30.columns and bool(_r30["CMP"].notna().any())):
+                _ec_timer_paused = True
+        elif _ec_active == "Top Opportunities" and not st.session_state.get("al_opps"):
+            _ec_timer_paused = True
+except Exception:
+    pass
 if _ec_timer_paused and auto_refresh:
     st.caption("⏸ Auto refresh is paused on this page so your clicks are not interrupted. Stops and targets are re-checked on every click and on the view pages.")
 if auto_refresh and AUTO_REFRESH_AVAILABLE and not _ec_timer_paused:
