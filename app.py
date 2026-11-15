@@ -124,7 +124,7 @@ def _ec_export(mod):
 
 _install_streamlit_compat()
 # Visible deployment marker: confirms which source file Streamlit Cloud is running.
-APP_BUILD_ID = "2026-11-15-INDEXOPP2"
+APP_BUILD_ID = "2026-11-15-DQ"
 # Optional integrations: Yahoo mode must still start if Angel SDK/TOTP or
 # the auto-refresh helper is not installed.
 try:
@@ -3895,6 +3895,45 @@ def _wilson_interval(win_pct, n, z=1.96):
         return None
 
 
+def _exposure_group(symbol):
+    """Instruments that move together share a group: all three indices are one bet, other names group by sector."""
+    sym = str(symbol).upper()
+    if sym in ("NIFTY", "BANKNIFTY", "SENSEX", "FINNIFTY"):
+        return "Indices"
+    try:
+        return ai_engine.AL_SECTOR_MAP.get(str(symbol), "Other")
+    except Exception:
+        return "Other"
+
+
+def _exposure_guard(journal, symbol, side):
+    """Correlated-position check for a NEW paper order. Returns {"warning": str, "block": str}.
+    Counts open positions in the same group AND the same direction (BUY+BUY in two banks is one bet, not two).
+    Warns by default; only refuses when Settings -> Correlated exposure -> 'Refuse' is on. Never raises."""
+    out = {"warning": "", "block": ""}
+    try:
+        if not bool(st.session_state.get("exposure_guard_on", True)):
+            return out
+        limit = int(st.session_state.get("exposure_guard_max", 2))
+        pos = ai_engine.ai_lab_open_positions(journal)
+        if pos is None or pos.empty:
+            return out
+        grp = _exposure_group(symbol)
+        side = str(side).upper()
+        same = pos[(pos["Symbol"].map(_exposure_group) == grp) & (pos["Side"].astype(str).str.upper() == side)]
+        n = len(same)
+        if n >= limit:
+            names = ", ".join(sorted(set(same["Symbol"].astype(str))))
+            msg = (f"You already hold {n} open {side} position(s) in the same group '{grp}' ({names}). "
+                   f"These move together, so a new one adds risk without adding diversification.")
+            out["warning"] = msg
+            if bool(st.session_state.get("exposure_guard_block", False)):
+                out["block"] = msg
+    except Exception as exc:
+        log_app_error("exposure_guard", exc)
+    return out
+
+
 def _timing_guard(journal, timeframe, now_dt):
     """Trade-timing guard for manual paper orders.
     Returns {"warnings": [...], "block": message or None}.
@@ -7189,6 +7228,56 @@ def _ec_render_top_opportunities():
     st.caption("Score blends setup quality, risk:reward and learned probability. A screening aid, not a trade instruction.")
 
 
+def _validate_candles(df, timeframe="5m"):
+    """Data-quality checks on the candles the signal engine is using. Read-only: returns [(check, PASS|WARN|FAIL, detail)].
+    Bad candles never change a signal here; this only tells you when the data deserves doubt."""
+    out = []
+    try:
+        if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+            return [("Candles present", "FAIL", "no data")]
+        need = [c for c in ("Open", "High", "Low", "Close") if c in df.columns]
+        if len(need) < 4:
+            return [("OHLC columns", "FAIL", "missing " + ", ".join(sorted({"Open", "High", "Low", "Close"} - set(df.columns))))]
+        o, h, l, c = (pd.to_numeric(df[k], errors="coerce") for k in ("Open", "High", "Low", "Close"))
+        n = len(df)
+        nan_rows = int(pd.concat([o, h, l, c], axis=1).isna().any(axis=1).sum())
+        out.append(("Missing prices", "PASS" if nan_rows == 0 else ("WARN" if nan_rows / n < 0.02 else "FAIL"), f"{nan_rows} of {n} candles have a blank price"))
+        nonpos = int(((o <= 0) | (h <= 0) | (l <= 0) | (c <= 0)).sum())
+        out.append(("Zero / negative prices", "PASS" if nonpos == 0 else "FAIL", f"{nonpos} candles"))
+        bad_hl = int(((h < pd.concat([o, c], axis=1).max(axis=1) - 1e-9) | (l > pd.concat([o, c], axis=1).min(axis=1) + 1e-9)).sum())
+        out.append(("High/Low consistent with Open/Close", "PASS" if bad_hl == 0 else ("WARN" if bad_hl / n < 0.02 else "FAIL"), f"{bad_hl} candles break High>=max(O,C) or Low<=min(O,C)"))
+        idx = df.index
+        if isinstance(idx, pd.DatetimeIndex):
+            dups = int(idx.duplicated().sum())
+            out.append(("Duplicate timestamps", "PASS" if dups == 0 else "WARN", f"{dups} duplicates"))
+            out.append(("Sorted by time", "PASS" if idx.is_monotonic_increasing else "FAIL", "timestamps in order" if idx.is_monotonic_increasing else "timestamps out of order"))
+        ret = c.pct_change().abs()
+        jumps = int((ret > 0.08).sum())
+        out.append(("Extreme 1-candle jumps (>8%)", "PASS" if jumps == 0 else "WARN", f"{jumps} candles (bad tick or a real gap)"))
+        if "Volume" in df.columns:
+            v = pd.to_numeric(df["Volume"], errors="coerce")
+            zero_share = float((v.fillna(0) <= 0).mean())
+            out.append(("Volume present", "PASS" if zero_share < 0.5 else "WARN", f"{zero_share * 100:.0f}% of candles have zero volume (normal for indices)"))
+        try:
+            mins = {"1m": 1, "3m": 3, "5m": 5, "10m": 10, "15m": 15, "30m": 30, "1h": 60, "1d": 1440}.get(str(timeframe), 5)
+            if isinstance(idx, pd.DatetimeIndex) and mins < 1440:
+                last = idx[-1]
+                now = pd.Timestamp(ist_now())
+                last_naive = last.tz_localize(None) if getattr(last, "tzinfo", None) else last
+                age_min = (now.tz_localize(None) - last_naive).total_seconds() / 60.0
+                nowt = ist_now()
+                live = nowt.weekday() < 5 and (9 * 60 + 15) <= nowt.hour * 60 + nowt.minute <= (15 * 60 + 30)
+                if live:
+                    out.append(("Last candle fresh", "PASS" if age_min <= 3 * mins + 2 else "WARN", f"last candle is {age_min:.0f} min old"))
+                else:
+                    out.append(("Last candle fresh", "PASS", "market closed, age not checked"))
+        except Exception:
+            pass
+    except Exception as exc:
+        out.append(("Validation ran", "WARN", f"{type(exc).__name__}: {exc}"))
+    return out
+
+
 def _ec_render_system_health(analysis, data):
     try:
         err = safe_read_csv(ERROR_LOG_FILE, pd.DataFrame(columns=["DateTime", "Source", "Message"]))
@@ -7225,6 +7314,23 @@ def _ec_render_system_health(analysis, data):
     if not err.empty:
         with st.expander("Last 5 logged errors"):
             st.dataframe(err.tail(5), use_container_width=True, hide_index=True)
+    try:
+        _dq = _validate_candles(data, globals().get("timeframe", "5m"))
+        _bad = sum(1 for r in _dq if r[1] == "FAIL"); _warn = sum(1 for r in _dq if r[1] == "WARN")
+        with st.expander(f"Data quality — {'all clear' if not (_bad or _warn) else f'{_bad} fail, {_warn} warn'}", expanded=bool(_bad)):
+            st.dataframe(pd.DataFrame(_dq, columns=["Check", "Result", "Detail"]), use_container_width=True, hide_index=True)
+            st.caption("Read-only checks on the candles in use. They never change a signal; they tell you when the data deserves doubt.")
+    except Exception as _dq_err:
+        log_app_error("data_quality_panel", _dq_err)
+    try:
+        if bgj is not None:
+            _bg = [(k, bgj.peek(k)) for k in ("nifty30", "opps", "opps_idx")]
+            with st.expander("Background jobs (scanner / opportunities)"):
+                st.dataframe(pd.DataFrame([{"Job": k, "Last finished (s ago)": (round(v["age"]) if v["age"] is not None else None),
+                                            "Running": v["running"], "Last run took (s)": round(v["seconds"], 1), "Last error": v["error"] or ""}
+                                           for k, v in _bg]), use_container_width=True, hide_index=True)
+    except Exception as _bg_err:
+        log_app_error("bg_status_panel", _bg_err)
 
 
 def _ec_render_validation_and_readiness(analysis):
@@ -7655,6 +7761,14 @@ with st.expander("Trade timing guard"):
         value=False, key="timing_guard_windows",
         help="Off = only a warning is shown in those windows. On = BUY/SELL is refused then.")
     st.caption("The guard only affects manual paper BUY / SELL clicks. Signals, scanner and alerts are not changed. Closing positions is never blocked.")
+
+with st.expander("Correlated exposure"):
+    st.checkbox("Warn when a new paper order would stack on open positions that move together", value=True, key="exposure_guard_on",
+                help="Same direction + same group (all indices are one group; stocks group by sector). Warning only, unless 'Refuse' below is on.")
+    st.number_input("Warn at this many open positions in the same group and direction", 1, 10, 2, key="exposure_guard_max")
+    st.checkbox("Refuse the order instead of only warning", value=False, key="exposure_guard_block",
+                help="Off (default) = warning only. On = BUY/SELL is refused when the limit is reached. Closing is never blocked.")
+    st.caption("Only affects manual paper BUY / SELL clicks. Signals, scanner and alerts are unchanged.")
 
 with st.expander("Strict STRONG signal rule (optional)"):
     st.checkbox(
@@ -9145,6 +9259,14 @@ with order_cols[1]:
 _timing = _timing_guard(paper_journal, timeframe, ist_now())
 for _tw in _timing["warnings"]:
     st.warning("⏱ " + _tw)
+_exposure = {"warning": "", "block": ""}
+try:
+    _exp_side = "BUY" if (buy_clicked or not sell_clicked) else "SELL"
+    _exposure = _exposure_guard(paper_journal, selected, _exp_side)
+    if _exposure["warning"]:
+        st.warning("🔗 " + _exposure["warning"])
+except Exception as _exp_err:
+    log_app_error("exposure_guard_ui", _exp_err)
 
 if buy_clicked or sell_clicked:
     order_side = "BUY" if buy_clicked else "SELL"
@@ -9155,6 +9277,8 @@ if buy_clicked or sell_clicked:
         st.error("Paper order blocked: this setup matches a repeated historical losing pattern. Turn off the optional block only if you have reviewed the risk.")
     elif not risk_ok:
         st.error(f"Paper order blocked by risk controls: {risk_msg}")
+    elif _exposure["block"]:
+        st.error("Paper order blocked: " + _exposure["block"] + " Turn 'Refuse' off in Settings → Correlated exposure to override.")
     elif _timing["block"]:
         st.error("Paper order blocked: " + _timing["block"] + " Turn the guard off in Settings → Trade timing guard if you want to override it.")
     elif required_margin > paper_balance:
