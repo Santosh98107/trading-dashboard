@@ -120,7 +120,7 @@ def _ec_export(mod):
 
 _install_streamlit_compat()
 # Visible deployment marker: confirms which source file Streamlit Cloud is running.
-APP_BUILD_ID = "2026-11-15-DURABLE"
+APP_BUILD_ID = "2026-11-15-AUTOLOAD"
 # Optional integrations: Yahoo mode must still start if Angel SDK/TOTP or
 # the auto-refresh helper is not installed.
 try:
@@ -342,9 +342,16 @@ def login_panel():
             st.sidebar.warning("Default password (admin123) is active. Open 'Change / Reset Password' below to set your own.")
     except Exception:
         pass
+    try:
+        _durable_on = bool(durable_store is not None and durable_store.status().get("configured"))
+    except Exception:
+        _durable_on = False
     if not STORAGE_IS_CONFIGURED and os.path.exists("/mount/src"):
-        st.sidebar.warning("Journal and paper account are stored on temporary disk and will be erased on restart. "
-                           "Set ELITE_DATA_DIR to a persistent volume.")
+        if _durable_on:
+            st.sidebar.caption("☁ Permanent storage is ON: your journal and paper account are saved to the cloud and restored after a restart.")
+        else:
+            st.sidebar.warning("Journal and paper account are stored on temporary disk and will be erased on restart. "
+                               "Set up Permanent storage in Settings (or ELITE_DATA_DIR on a persistent volume).")
 
     # Password reset/change is available only inside an authenticated session.
     # The current password is verified before the stored hash is replaced.
@@ -2903,6 +2910,25 @@ def scanner_breadth_summary(scanner_df):
                    "Bearish %":round(100*bear/total,1) if total else 0.0,"Coverage":total})
     return pd.DataFrame(result)
 
+
+
+def _ec_auto_scan_nifty30():
+    """Fill the NIFTY Top 30 table when the Scanner page is open, instead of waiting for the button.
+    Only runs on the Scanner page, retries at most once a minute, and refreshes every 3 minutes."""
+    try:
+        if _ec_active != "Scanner" or not bool(st.session_state.get("auto_load_pages", True)):
+            return
+        now_ts = pytime.time()
+        res = st.session_state.get("nifty30_scanner_result")
+        have = isinstance(res, pd.DataFrame) and not res.empty and "CMP" in res.columns and bool(res["CMP"].notna().any())
+        age = now_ts - float(st.session_state.get("_nifty30_auto_ts", 0))
+        if (not have and age > 60) or (have and age > 180):
+            st.session_state["_nifty30_auto_ts"] = now_ts
+            with st.spinner("Loading NIFTY Top 30 (3m / 5m / 10m / 15m)…"):
+                st.session_state["nifty30_scanner_result"] = build_nifty_top30_scanner()
+            st.session_state["nifty30_scanner_last_run"] = now_str()
+    except Exception as exc:
+        log_app_error("nifty30_auto_scan", exc)
 
 
 def blank_nifty_scanner_frame():
@@ -6806,7 +6832,17 @@ def _ec_run_feature_validation(analysis, data_source):
 
 def _ec_render_top_opportunities():
     res = st.session_state.get("al_opps")
-    if st.button("Rank / refresh top opportunities", key="ec_top_opp_btn"):
+    # Rank automatically when this page opens (and every 5 minutes), instead of waiting for the button.
+    _auto_due = False
+    try:
+        _age = pytime.time() - float(st.session_state.get("_opps_auto_ts", 0))
+        _auto_due = bool(st.session_state.get("auto_load_pages", True)) and (
+            (not res and _age > 60) or (res is not None and _age > 300))
+        if _auto_due:
+            st.session_state["_opps_auto_ts"] = pytime.time()
+    except Exception:
+        _auto_due = False
+    if st.button("Rank / refresh top opportunities", key="ec_top_opp_btn") or _auto_due:
         with st.spinner("Scoring NIFTY, BANKNIFTY, SENSEX and stocks..."):
             _j = load_journal()
             _df, _missing = ai_lab_rank_opportunities(ai_lab_get_model(_j), _al_closed_trades(_j), dict(stocks))
@@ -7181,9 +7217,37 @@ with st.expander("Permanent storage (survives redeploy / reboot)"):
                    + str(globals().get("_DURABLE_IMPORT_ERROR", "")))
     else:
         _ds = durable_store.status()
-        if not _ds["configured"]:
-            st.info("Not set up yet. Add SUPABASE_URL and SUPABASE_SERVICE_KEY in Streamlit Cloud → App settings → Secrets, then reboot. "
-                    "Until then your data lives only on Streamlit's temporary disk (use the manual backup below).")
+        _ds_cfg = durable_store.load_local_config()
+        _ds_on = st.toggle("Permanent storage ON", value=bool(_ds_cfg.get("enabled", True)), key="ec_durable_toggle",
+                           help="OFF = nothing is saved to or restored from the cloud. The URL and key are kept so you can switch it back ON.")
+        if _ds_on != bool(_ds_cfg.get("enabled", True)):
+            durable_store.save_local_config(enabled=_ds_on)
+            st.rerun()
+        with st.expander("Supabase connection (type it here, or put it in Streamlit Secrets)", expanded=not _ds["has_credentials"]):
+            _in_url = st.text_input("Supabase Project URL", value=str(_ds_cfg.get("SUPABASE_URL", "")), key="ec_durable_url",
+                                    placeholder="https://xxxxxxxx.supabase.co")
+            _in_key = st.text_input("Supabase service_role key", value="", type="password", key="ec_durable_key",
+                                    placeholder="saved - leave empty to keep it" if _ds_cfg.get("SUPABASE_SERVICE_KEY") else "eyJ...",
+                                    help="Project Settings -> API -> service_role. Never share it or put it in GitHub.")
+            _in_bucket = st.text_input("Bucket name", value=str(_ds_cfg.get("SUPABASE_BUCKET", "") or "elite-backups"), key="ec_durable_bucket")
+            _b1, _b2 = st.columns(2)
+            with _b1:
+                if st.button("💾 Save connection", key="ec_durable_save_cfg", use_container_width=True):
+                    durable_store.save_local_config(url=_in_url, key=_in_key, bucket=_in_bucket)
+                    st.success("Saved.")
+                    st.rerun()
+            with _b2:
+                if st.button("🔌 Test connection", key="ec_durable_test_btn", use_container_width=True):
+                    durable_store.save_local_config(url=_in_url, key=_in_key, bucket=_in_bucket)
+                    _ok, _msg = durable_store.test_connection()
+                    (st.success if _ok else st.error)(_msg)
+            st.caption("⚠ A connection typed here is stored on this app's temporary disk, so it is lost when the disk is wiped. "
+                       "For an automatic restore after every reboot, put the same two values in Streamlit Cloud → Settings → Secrets "
+                       "(SUPABASE_URL and SUPABASE_SERVICE_KEY).")
+        if not _ds_on:
+            st.warning("Permanent storage is OFF. Your data lives only on Streamlit's temporary disk (use the manual backup below).")
+        elif not _ds["configured"]:
+            st.info("Not connected yet. Fill in the Supabase connection above and press Test connection.")
         else:
             st.success(f"Permanent storage is ON ({_ds['backend']}). The database is saved automatically about every 30 seconds when something changed.")
             if _ds["restored"]:
@@ -7224,6 +7288,12 @@ with st.expander("Backup & restore (journal, paper account, users)"):
             (st.success if _ok else st.error)(_msg)
             if _ok:
                 st.rerun()
+
+with st.expander("Auto-load pages"):
+    st.checkbox("Load the NIFTY Top 30 scanner and Top Opportunities automatically when their page opens", value=True,
+                key="auto_load_pages",
+                help="ON (default): the tables fill themselves (scanner refreshes every 3 min, opportunities every 5 min, only while that page is open). "
+                     "OFF: press the Run / Rank button yourself, as before.")
 
 with st.expander("Early alert strictness"):
     st.checkbox(
@@ -8901,6 +8971,7 @@ if st.button("Run / refresh NIFTY Top 30 scanner", key="run_scanner_with_main_da
     except Exception as scanner_error:
         st.error(f"Scanner error: {scanner_error}")
         log_app_error("nifty_top30_scanner_ui", scanner_error)
+_ec_auto_scan_nifty30()
 scanner_result = st.session_state.get("nifty30_scanner_result")
 if isinstance(scanner_result, pd.DataFrame) and not scanner_result.empty:
     st.caption("Last scanner run: " + str(st.session_state.get("nifty30_scanner_last_run", "unknown")))
