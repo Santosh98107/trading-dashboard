@@ -1240,6 +1240,9 @@ def ai_lab_resolve_audit(audit, data, symbol, timeframe, horizon=12, cost_bps=0.
         is_buy = str(a.at[i, "SignalType"]).lower() == "buy"
         risk = abs(entry - sl)
         pos = int(idx.searchsorted(dt, side="right"))
+        if len(idx) and dt < idx[0]:
+            a.at[i, "Outcome"] = "NO_DATA"             # the candles that followed this signal are no longer available
+            continue
         n_avail = max(0, min(horizon, len(idx) - pos))
         outcome, bars_used, r_gross = "", 0, np.nan
         for k in range(n_avail):
