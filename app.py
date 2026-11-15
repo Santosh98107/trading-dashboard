@@ -124,7 +124,7 @@ def _ec_export(mod):
 
 _install_streamlit_compat()
 # Visible deployment marker: confirms which source file Streamlit Cloud is running.
-APP_BUILD_ID = "2026-11-15-BGJOBS"
+APP_BUILD_ID = "2026-11-15-INDEXOPP2"
 # Optional integrations: Yahoo mode must still start if Angel SDK/TOTP or
 # the auto-refresh helper is not installed.
 try:
@@ -7093,38 +7093,33 @@ def _ec_run_feature_validation(analysis, data_source):
     return out
 
 
-def _ec_render_top_opportunities():
-    """Top Opportunities: ranking is computed by a background worker (about 10-20 s of Yahoo + indicators) and only read here."""
-    res = st.session_state.get("al_opps")
-    _auto = bool(st.session_state.get("auto_load_pages", True))
-    _clicked = st.button("Rank / refresh top opportunities", key="ec_top_opp_btn")
-    if bgj is not None and (_auto or _clicked):
-        try:
-            _j = load_journal()
-            _args = (ai_lab_get_model(_j), _al_closed_trades(_j), dict(stocks))
-            st_ = bgj.request("opps", ai_lab_rank_opportunities, args=_args, max_age=300, retry_after=45, force=_clicked)
-            if st_["value"] is not None and st_["age"] is not None:
-                _df, _missing = st_["value"]
-                _stamp = round(pytime.time() - st_["age"], 0)
-                if st.session_state.get("_opps_bg_stamp") != _stamp:
-                    st.session_state["_opps_bg_stamp"] = _stamp
-                    res = {"df": _df, "missing": _missing, "at": now_str()}
-                    st.session_state["al_opps"] = res        # shared with the AI Lab Opportunities tab
-            if st_["running"] and not res:
-                st.info("⏳ Ranking the watchlist in the background (about 10-20 s). This page fills in by itself.")
-            elif st_["error"] and not res:
-                st.warning(f"Ranking failed ({st_['error']}). It retries automatically.")
-        except Exception as exc:
-            log_app_error("top_opps_bg", exc)
-    elif _clicked:
-        with st.spinner("Scoring NIFTY, BANKNIFTY, SENSEX and stocks..."):
-            _j = load_journal()
-            _df, _missing = ai_lab_rank_opportunities(ai_lab_get_model(_j), _al_closed_trades(_j), dict(stocks))
-        res = {"df": _df, "missing": _missing, "at": now_str()}
-        st.session_state["al_opps"] = res
+# Market-wide view: the indices only (the stock list stays in the second table). Yahoo codes; an index Yahoo does not
+# serve simply shows under "No usable data for".
+INDEX_OPP_UNIVERSE = {"NIFTY": "^NSEI", "BANKNIFTY": "^NSEBANK", "SENSEX": "^BSESN",
+                      "FINNIFTY": "NIFTY_FIN_SERVICE.NS", "SMALLCAP": "^CNXSC"}
+# Yahoo's code for the smallcap index is not confirmed, so alternates are tried when the first one returns nothing.
+INDEX_OPP_ALTERNATES = {"SMALLCAP": ("NIFTYSMLCAP100.NS", "NIFTY_SMLCAP_100.NS", "^CNXSMALLCAP")}
+
+
+def _ec_rank_indices(model, closed, universe):
+    """Rank the index universe; any index with no data is retried with its alternate Yahoo codes."""
+    df, missing = ai_lab_rank_opportunities(model, closed, dict(universe))
+    for sym in list(missing):
+        for alt in INDEX_OPP_ALTERNATES.get(sym, ()):
+            d2, m2 = ai_lab_rank_opportunities(model, closed, {sym: alt})
+            if d2 is not None and not d2.empty:
+                df = pd.concat([df, d2.drop(columns=["Rank"], errors="ignore")], ignore_index=True) if df is not None and not df.empty else d2
+                missing.remove(sym)
+                break
+    if df is not None and not df.empty:
+        df = df.drop(columns=["Rank"], errors="ignore").sort_values("Score", ascending=False).reset_index(drop=True)
+        df.insert(0, "Rank", np.arange(1, len(df) + 1))
+    return df, missing
+
+
+def _ec_opps_table(res, title):
+    st.subheader(title)
     if not res:
-        if bgj is None:
-            st.info("Press the button to rank the watchlist (about 10-20 s).")
         return
     df_ = res["df"]
     if df_ is None or df_.empty:
@@ -7140,6 +7135,57 @@ def _ec_render_top_opportunities():
     st.dataframe(df_, use_container_width=True, hide_index=True)
     if res.get("missing"):
         st.caption("No usable data for: " + ", ".join(res["missing"]))
+
+
+def _ec_opps_pull(key, universe, state_key, force, fn=None):
+    """Start/refresh one background ranking and copy a newly finished result into session_state. Returns (res, st_)."""
+    res = st.session_state.get(state_key)
+    _j = load_journal()
+    st_ = bgj.request(key, fn or ai_lab_rank_opportunities, args=(ai_lab_get_model(_j), _al_closed_trades(_j), dict(universe)),
+                      max_age=300, retry_after=45, force=force)
+    if st_["value"] is not None and st_["age"] is not None:
+        _df, _missing = st_["value"]
+        _stamp = round(pytime.time() - st_["age"], 0)
+        if st.session_state.get(state_key + "_stamp") != _stamp:
+            st.session_state[state_key + "_stamp"] = _stamp
+            res = {"df": _df, "missing": _missing, "at": now_str()}
+            st.session_state[state_key] = res
+    return res, st_
+
+
+def _ec_render_top_opportunities():
+    """Top Opportunities: (1) index ranking NIFTY / BANKNIFTY / SENSEX / FINNIFTY / SMALLCAP, (2) stock ranking.
+    Both are computed by background workers and only read here, so the page never waits."""
+    res = st.session_state.get("al_opps")
+    res_idx = st.session_state.get("al_opps_idx")
+    _auto = bool(st.session_state.get("auto_load_pages", True))
+    _clicked = st.button("Rank / refresh top opportunities", key="ec_top_opp_btn")
+    if bgj is not None and (_auto or _clicked):
+        try:
+            res_idx, st_i = _ec_opps_pull("opps_idx", INDEX_OPP_UNIVERSE, "al_opps_idx", _clicked, fn=_ec_rank_indices)
+            res, st_ = _ec_opps_pull("opps", stocks, "al_opps", _clicked)
+            if (st_["running"] or st_i["running"]) and not (res and res_idx):
+                st.info("⏳ Ranking in the background (about 10-20 s). This page fills in by itself.")
+            elif (st_["error"] and not res) or (st_i["error"] and not res_idx):
+                st.warning(f"Ranking failed ({st_['error'] or st_i['error']}). It retries automatically.")
+        except Exception as exc:
+            log_app_error("top_opps_bg", exc)
+    elif _clicked:
+        with st.spinner("Scoring indices and stocks..."):
+            _j = load_journal()
+            _m, _c = ai_lab_get_model(_j), _al_closed_trades(_j)
+            _df, _missing = _ec_rank_indices(_m, _c, INDEX_OPP_UNIVERSE)
+            res_idx = {"df": _df, "missing": _missing, "at": now_str()}
+            st.session_state["al_opps_idx"] = res_idx
+            _df, _missing = ai_lab_rank_opportunities(_m, _c, dict(stocks))
+            res = {"df": _df, "missing": _missing, "at": now_str()}
+            st.session_state["al_opps"] = res
+    if not res and not res_idx:
+        if bgj is None:
+            st.info("Press the button to rank (about 10-20 s).")
+        return
+    _ec_opps_table(res_idx, "Indices — NIFTY, BANKNIFTY, SENSEX, FINNIFTY, SMALLCAP")
+    _ec_opps_table(res, "Stocks — watchlist ranking")
     st.caption("Score blends setup quality, risk:reward and learned probability. A screening aid, not a trade instruction.")
 
 
@@ -9935,6 +9981,8 @@ def _ec_bg_warmup():
         bgj.request("nifty30", build_nifty_top30_scanner, max_age=300, retry_after=120)
         _j = load_journal()
         bgj.request("opps", ai_lab_rank_opportunities, args=(ai_lab_get_model(_j), _al_closed_trades(_j), dict(stocks)),
+                    max_age=600, retry_after=120)
+        bgj.request("opps_idx", _ec_rank_indices, args=(ai_lab_get_model(_j), _al_closed_trades(_j), dict(INDEX_OPP_UNIVERSE)),
                     max_age=600, retry_after=120)
     except Exception as exc:
         log_app_error("bg_warmup", exc)
