@@ -463,8 +463,87 @@ def _paper_partial_exit(index_id, exit_price, quantity, target_flag=None):
     return True
 
 
-def auto_paper_trade_exit(current_price, symbol=None, atr=None):
-    """Auto-manage only the currently selected symbol; scale out at T1/T2 and close at T3/SL."""
+# ---------------------------------------------------------
+# PROFIT LADDER (optional, paper only, default OFF): stops a trade that was in profit from turning into a loss
+# ---------------------------------------------------------
+LADDER_DEFAULTS = {
+    "profit_lock_on": False,
+    "pl_be_arm_r": 1.25,      # open profit (in R) at which the stop moves to entry + charges + buffer
+    "pl_be_buffer_r": 0.05,
+    "pl_gb_arm_r": 1.5,       # from here on, only a limited share of the peak profit may be given back
+    "pl_gb_low": 0.50,        # allowed give-back between gb_arm and +2R
+    "pl_gb_mid": 0.40,        # +2R to +3R
+    "pl_gb_high": 0.30,       # above +3R
+    "pl_lock2_r": 0.75,       # at +2R, lock this much profit (net of charges)
+    "pl_opp_exit_on": False,  # strong opposite signal: exit half of what is left
+    "pl_time_stop_on": False,
+    "pl_weak_r": 0.5,         # time stop only when open profit is below this many R
+}
+TIME_STOP_CANDLES = {"1m": 20, "3m": 15, "5m": 12, "10m": 10, "15m": 8}
+TF_MINUTES = {"1m": 1, "3m": 3, "5m": 5, "10m": 10, "15m": 15, "30m": 30}
+
+
+def _obj_col(journal, name):
+    """Make sure a text/flag column exists and can take any value (a column read back from CSV with only blanks is float)."""
+    if name not in journal.columns:
+        journal[name] = ""
+    journal[name] = journal[name].astype(object)
+    return journal
+
+
+def _ladder_cfg():
+    cfg = dict(LADDER_DEFAULTS)
+    try:
+        for k, v in LADDER_DEFAULTS.items():
+            if k in st.session_state:
+                cfg[k] = type(v)(st.session_state[k]) if not isinstance(v, bool) else bool(st.session_state[k])
+    except Exception:
+        pass
+    return cfg
+
+
+def ladder_stop_price(is_long, entry, risk, peak_price, cost_pts, cfg):
+    """Pure function. From the best price a trade has reached, return (protective stop price or None, stage label).
+    Every rule only moves the stop in the trade's favour, so combining them takes the tightest one."""
+    if not (np.isfinite(entry) and np.isfinite(risk) and risk > 0 and np.isfinite(peak_price)):
+        return None, ""
+    sgn = 1.0 if is_long else -1.0
+    peak_profit = sgn * (peak_price - entry)
+    pr = peak_profit / risk
+    levels, stages = [], []
+    if pr >= cfg["pl_be_arm_r"]:
+        levels.append(cost_pts + cfg["pl_be_buffer_r"] * risk); stages.append("BE")
+    if pr >= 2.0:
+        levels.append(cfg["pl_lock2_r"] * risk + cost_pts); stages.append("LOCK")
+    if pr >= cfg["pl_gb_arm_r"]:
+        gb = cfg["pl_gb_low"] if pr < 2.0 else cfg["pl_gb_mid"] if pr < 3.0 else cfg["pl_gb_high"]
+        levels.append(peak_profit * (1.0 - gb)); stages.append(f"GB{int(round(gb * 100))}")
+    if not levels:
+        return None, ""
+    best = max(levels)
+    return entry + sgn * best, "+".join(stages)
+
+
+def _time_stop_due(row, price, risk, cfg):
+    """True when a trade has run past its candle limit without reaching T1 and its open profit is still weak."""
+    try:
+        if _paper_bool(row.get("T1_Hit", False), False):
+            return False
+        tf = str(row.get("Timeframe", "5m"))
+        limit = TIME_STOP_CANDLES.get(tf, 8) * TF_MINUTES.get(tf, 5)
+        t0 = datetime.strptime(str(row.get("DateTime")), "%d-%m-%Y %H:%M:%S")
+        elapsed = (ist_now().replace(tzinfo=None) - t0).total_seconds() / 60.0
+        if elapsed < limit:
+            return False
+        entry = float(row["EntryPrice"]); sgn = 1.0 if str(row.get("Side", "BUY")).upper() == "BUY" else -1.0
+        return (sgn * (price - entry)) / risk < cfg["pl_weak_r"]
+    except Exception:
+        return False
+
+
+def auto_paper_trade_exit(current_price, symbol=None, atr=None, opposite_strong=None):
+    """Auto-manage only the currently selected symbol; scale out at T1/T2 and close at T3/SL.
+    opposite_strong: "buy" / "sell" when the live signal is a STRONG one of that side (used only by the optional profit ladder)."""
     try:
         price = float(current_price)
         if not np.isfinite(price) or price <= 0:
@@ -507,6 +586,24 @@ def auto_paper_trade_exit(current_price, symbol=None, atr=None):
                 new_trail = max(old_trail, price - trail_gap) if is_long else min(old_trail, price + trail_gap)
             else:
                 new_trail = old_trail
+            # Optional profit ladder: raises the trailing stop from the trade's best price. Never lowers it, never touches targets.
+            _cfg = _ladder_cfg()
+            _stage = ""
+            if _cfg["profit_lock_on"]:
+                try:
+                    _risk = abs(entry - float(row["StopLoss"]))
+                    _pk = row.get("PeakPrice", np.nan)
+                    _pk = float(_pk) if pd.notna(_pk) and str(_pk) != "" else entry
+                    _pk = max(_pk, price) if is_long else min(_pk, price)
+                    journal = _obj_col(journal, "LockStage")
+                    journal.at[idx, "PeakPrice"] = _pk
+                    _cost = 2.0 * entry * _paper_cost_bps() / 1e4
+                    _lp, _stage = ladder_stop_price(is_long, entry, _risk, _pk, _cost, _cfg)
+                    if _lp is not None:
+                        new_trail = max(new_trail, _lp) if is_long else min(new_trail, _lp)
+                        journal.at[idx, "LockStage"] = _stage
+                except Exception as _le:
+                    log_app_error("profit_ladder", _le)
             journal.at[idx, "TrailingStop"] = new_trail
             journal.at[idx, "LastPrice"] = price
             journal.at[idx, "LastUpdateTime"] = now_str()
@@ -516,10 +613,37 @@ def auto_paper_trade_exit(current_price, symbol=None, atr=None):
             effective_stop = max(stop_loss, new_trail) if is_long else min(stop_loss, new_trail)
             stop_hit = price <= effective_stop if is_long else price >= effective_stop
             if stop_hit:
-                ok, _ = close_paper_position(idx, price, "Auto Exit — Stop Loss / Trailing Stop")
+                _why = f"Auto Exit — Profit Lock ({_stage})" if _stage else "Auto Exit — Stop Loss / Trailing Stop"
+                ok, _ = close_paper_position(idx, price, _why)
                 if ok:
                     closed_count += 1
                 continue
+
+            if _cfg["profit_lock_on"]:
+                try:
+                    _risk2 = abs(entry - float(row["StopLoss"]))
+                    if _cfg["pl_time_stop_on"] and _risk2 > 0 and _time_stop_due(row, price, _risk2, _cfg):
+                        ok, _ = close_paper_position(idx, price, "Auto Exit — Time stop (no T1, weak profit)")
+                        if ok:
+                            closed_count += 1
+                        continue
+                    _opp_done = _paper_bool(row.get("OppExit_Done", False), False)
+                    if (_cfg["pl_opp_exit_on"] and opposite_strong in ("buy", "sell") and not _opp_done
+                            and ((is_long and opposite_strong == "sell") or ((not is_long) and opposite_strong == "buy"))):
+                        journal = _obj_col(load_journal(), "OppExit_Done")
+                        journal.at[idx, "OppExit_Done"] = True
+                        save_journal(journal)
+                        if rem_qty >= 2:
+                            if _paper_partial_exit(idx, price, max(1, rem_qty // 2)):
+                                partial_count += 1
+                        else:                                   # one unit cannot be halved: protect it at entry + charges
+                            journal = load_journal()
+                            _be = entry + (1.0 if is_long else -1.0) * 2.0 * entry * _paper_cost_bps() / 1e4
+                            cur = float(journal.at[idx, "TrailingStop"])
+                            journal.at[idx, "TrailingStop"] = max(cur, _be) if is_long else min(cur, _be)
+                            save_journal(journal)
+                except Exception as _oe:
+                    log_app_error("profit_ladder_extras", _oe)
 
             target_specs = [
                 ("T1_Hit", "Target1", 0.34),
