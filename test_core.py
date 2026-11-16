@@ -123,3 +123,18 @@ def test_meta_gate_silent_when_learning_or_neutral():
     assert a["signal_type"] == "buy" and "meta_prob" not in a
     n = _sig("neutral")
     assert _meta_ns(_active_model(), {})["apply_meta_gate"](n) is n and "meta_prob" not in n
+
+
+def test_fallback_stop_floor_depends_on_timeframe():
+    import risk_manager as rm
+    rm.st = types.SimpleNamespace(session_state={})
+    a = {"atr": 5.0, "signal_type": "neutral"}
+    old = rm.get_suggested_paper_levels(a, "SELL", 25000.0)                     # no timeframe = old flat 0.3%
+    m1 = rm.get_suggested_paper_levels(a, "SELL", 25000.0, timeframe="1m")
+    m15 = rm.get_suggested_paper_levels(a, "SELL", 25000.0, timeframe="15m")
+    assert abs((old["stop_loss"] - 25000.0) - 75.0) < 1e-6 and abs((m15["stop_loss"] - 25000.0) - 75.0) < 1e-6
+    assert abs((m1["stop_loss"] - 25000.0) - 25.0) < 1e-6 and abs((25000.0 - m1["target1"]) - 50.0) < 1e-6
+    b = rm.get_suggested_paper_levels(a, "BUY", 25000.0, timeframe="1m")
+    assert b["stop_loss"] < 25000.0 < b["target1"]                                # BUY mirrored
+    rm.st.session_state["paper_tf_floor"] = False
+    assert abs((rm.get_suggested_paper_levels(a, "SELL", 25000.0, timeframe="1m")["stop_loss"] - 25000.0) - 75.0) < 1e-6   # switch OFF = old
