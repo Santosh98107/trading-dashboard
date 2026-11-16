@@ -124,7 +124,7 @@ def _ec_export(mod):
 
 _install_streamlit_compat()
 # Visible deployment marker: confirms which source file Streamlit Cloud is running.
-APP_BUILD_ID = "2026-11-16-LADDER"
+APP_BUILD_ID = "2026-11-16-LADDER2"
 # Optional integrations: Yahoo mode must still start if Angel SDK/TOTP or
 # the auto-refresh helper is not installed.
 try:
@@ -3895,6 +3895,17 @@ def _wilson_interval(win_pct, n, z=1.96):
         return None
 
 
+def _call_compat(fn, *args, **kwargs):
+    """Call fn with the newer keyword arguments; if an older risk_manager.py is deployed beside this app.py (a file was not
+    uploaded), retry without the keywords the old version does not know, instead of crashing the page."""
+    try:
+        return fn(*args, **kwargs)
+    except TypeError as exc:
+        if "unexpected keyword" in str(exc):
+            return fn(*args)
+        raise
+
+
 def _exposure_group(symbol):
     """Instruments that move together share a group: all three indices are one bet, other names group by sector."""
     sym = str(symbol).upper()
@@ -5297,10 +5308,10 @@ def _ec_render_meta_card(analysis):
         mm = analysis.get("meta_model") if isinstance(analysis, dict) else None
         if not mm:
             st.caption("Shown when a BUY or SELL signal is active. Learns from your resolved signal record; needs "
-                       f"{META_MIN_SIGNALS}+ resolved signals and must beat a plain win-rate baseline on newer signals before it is used.")
+                       f"{globals().get('META_MIN_SIGNALS', 200)}+ resolved signals and must beat a plain win-rate baseline on newer signals before it is used.")
             return
         if mm.get("status") == "learning":
-            st.info(f"Collecting data: {mm.get('n', 0)} of {mm.get('need', META_MIN_SIGNALS)} resolved signals. Until then it shows nothing and blocks nothing.")
+            st.info(f"Collecting data: {mm.get('n', 0)} of {mm.get('need', 200)} resolved signals. Until then it shows nothing and blocks nothing.")
         elif mm.get("status") == "no_edge":
             st.warning("The model was trained but does not beat the plain win-rate baseline on newer signals, so it is switched off. " + str(mm.get("why", "")))
         elif analysis.get("meta_prob") is not None:
@@ -9325,7 +9336,7 @@ if paper_auto_exit_enabled:
             _opp_strong = "buy" if "BUY" in _st_txt else "sell"
     except Exception:
         _opp_strong = None
-    auto_result = auto_paper_trade_exit(current_display_price, symbol=selected, atr=analysis.get("atr"), opposite_strong=_opp_strong)
+    auto_result = _call_compat(auto_paper_trade_exit, current_display_price, symbol=selected, atr=analysis.get("atr"), opposite_strong=_opp_strong)
     if auto_result.get("closed", 0) or auto_result.get("partial", 0):
         st.success(
             f"Auto-exit manager: {auto_result.get('closed', 0)} position(s) fully closed; "
@@ -9354,7 +9365,7 @@ if paper_auto_exit_enabled:
 
 # Dashboard's suggested directional plan is selected from the stronger score. Both BUY and SELL can be placed manually.
 plan_side = "BUY" if int(analysis.get("bullish_score", 0)) >= int(analysis.get("bearish_score", 0)) else "SELL"
-paper_plan = get_suggested_paper_levels(analysis, plan_side, current_display_price, timeframe=timeframe)
+paper_plan = _call_compat(get_suggested_paper_levels, analysis, plan_side, current_display_price, timeframe=timeframe)
 recommended_qty_risk = calculate_position_size(current_display_price, paper_plan["stop_loss"], paper_balance)
 max_affordable_qty = int(max(0.0, paper_balance) // max(float(current_display_price), 0.01))
 recommended_qty = max(1, min(int(recommended_qty_risk), max(1, max_affordable_qty)))
@@ -9417,7 +9428,7 @@ except Exception as _exp_err:
 
 if buy_clicked or sell_clicked:
     order_side = "BUY" if buy_clicked else "SELL"
-    order_plan = get_suggested_paper_levels(analysis, order_side, current_display_price, timeframe=timeframe)
+    order_plan = _call_compat(get_suggested_paper_levels, analysis, order_side, current_display_price, timeframe=timeframe)
     order_qty_int = int(order_qty)
     required_margin = float(current_display_price) * order_qty_int
     if repeat_loss_block_active:
