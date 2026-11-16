@@ -124,7 +124,7 @@ def _ec_export(mod):
 
 _install_streamlit_compat()
 # Visible deployment marker: confirms which source file Streamlit Cloud is running.
-APP_BUILD_ID = "2026-11-16-LEAN"
+APP_BUILD_ID = "2026-11-16-TFSTOP"
 # Optional integrations: Yahoo mode must still start if Angel SDK/TOTP or
 # the auto-refresh helper is not installed.
 try:
@@ -7874,6 +7874,12 @@ with st.expander("Meta-label model"):
                 help="Off (default) = display only. On = only when the model has proved that its weakest third lost money on newer signals. Blocked signals are kept as shadow rows.")
     st.caption("It can only tighten a signal, never create or relax one.")
 
+with st.expander("Paper stop distance"):
+    st.checkbox("Use a timeframe-aware minimum stop for manual paper orders", value=True, key="paper_tf_floor",
+                help="ON (default): when the live signal does not give its own levels, the fallback stop is at least 0.1% (1m), 0.15% (3m), 0.2% (5m), "
+                     "0.25% (10m) or 0.3% (15m and up) of price. OFF: the old flat 0.3% for every timeframe.")
+    st.caption("Applies only to the fallback plan (manual BUY/SELL when the live signal is not that side). The signal's own stop and targets are unchanged.")
+
 with st.expander("Correlated exposure"):
     st.checkbox("Warn when a new paper order would stack on open positions that move together", value=True, key="exposure_guard_on",
                 help="Same direction + same group (all indices are one group; stocks group by sector). Warning only, unless 'Refuse' below is on.")
@@ -9321,7 +9327,7 @@ if paper_auto_exit_enabled:
 
 # Dashboard's suggested directional plan is selected from the stronger score. Both BUY and SELL can be placed manually.
 plan_side = "BUY" if int(analysis.get("bullish_score", 0)) >= int(analysis.get("bearish_score", 0)) else "SELL"
-paper_plan = get_suggested_paper_levels(analysis, plan_side, current_display_price)
+paper_plan = get_suggested_paper_levels(analysis, plan_side, current_display_price, timeframe=timeframe)
 recommended_qty_risk = calculate_position_size(current_display_price, paper_plan["stop_loss"], paper_balance)
 max_affordable_qty = int(max(0.0, paper_balance) // max(float(current_display_price), 0.01))
 recommended_qty = max(1, min(int(recommended_qty_risk), max(1, max_affordable_qty)))
@@ -9384,7 +9390,7 @@ except Exception as _exp_err:
 
 if buy_clicked or sell_clicked:
     order_side = "BUY" if buy_clicked else "SELL"
-    order_plan = get_suggested_paper_levels(analysis, order_side, current_display_price)
+    order_plan = get_suggested_paper_levels(analysis, order_side, current_display_price, timeframe=timeframe)
     order_qty_int = int(order_qty)
     required_margin = float(current_display_price) * order_qty_int
     if repeat_loss_block_active:
