@@ -79,3 +79,47 @@ def test_wilson_interval_sane():
     lo2, hi2 = ns["_wilson_interval"](60, 1000)
     assert (hi2 - lo2) < (hi - lo)            # more trades -> tighter range
     assert ns["_wilson_interval"](60, 0) is None
+
+
+def _meta_ns(model, state):
+    import ai_engine
+    class St: session_state = dict(state)
+    ns = dict(st=St(), np=np, pd=pd, rs=types.SimpleNamespace(META_MODEL_BOX={"n": 0, "model": model}), log_app_error=lambda *a: print("ERR", a),
+              load_signal_audit=lambda: pd.DataFrame(), ai_lab_train_meta=lambda a: model, ai_lab_meta_predict=ai_engine.ai_lab_meta_predict,
+              META_MIN_SIGNALS=200, ist_now=lambda: pd.Timestamp("2026-11-16 10:05"), _safe_num=lambda v: float(v) if v is not None else np.nan)
+    exec(_cut("def _meta_row_from_analysis", "def _ec_render_meta_card"), ns)
+    return ns
+
+
+def _sig(side="buy"):
+    return {"signal_type": side, "signal_text": "BUY", "close_price": 100.0, "vwap": 99.5, "adx": 12.0, "rsi": 55.0, "validation_score": 60,
+            "trade_quality_score": 70, "stop_loss": 99.0, "target1": 101.0, "target2": 102.0, "target3": 103.0, "rr_ratio": 2.0}
+
+
+def _active_model(cut=0.9, gate_ok=True):
+    import ai_engine as ae
+    feats = ae.META_FEATURES
+    return {"status": "active", "n": 500, "features": feats, "w": [0.0] * len(feats), "b": 0.0, "med": {f: 0.0 for f in feats},
+            "mu": {f: 0.0 for f in feats}, "sd": {f: 1.0 for f in feats}, "preq": {"auc": 0.6}, "gate_ok": gate_ok, "cut": cut}
+
+
+def test_meta_gate_display_only_by_default():
+    ns = _meta_ns(_active_model(), {})
+    a = ns["apply_meta_gate"](_sig())
+    assert abs(a["meta_prob"] - 0.5) < 1e-9 and a["signal_type"] == "buy" and not a.get("meta_blocked")
+
+
+def test_meta_gate_blocks_weak_signal_only_when_on_and_proven():
+    a = _meta_ns(_active_model(), {"meta_model_gate": True})["apply_meta_gate"](_sig())
+    assert a["signal_type"] == "neutral" and a["meta_blocked"] and a["_shadow_tag"] == "META" and a["_edge_shadow"]["signal_type"] == "buy"
+    a = _meta_ns(_active_model(gate_ok=False), {"meta_model_gate": True})["apply_meta_gate"](_sig())
+    assert a["signal_type"] == "buy"                       # gate not allowed unless the model proved the weak third lost money
+    a = _meta_ns(_active_model(cut=0.1), {"meta_model_gate": True})["apply_meta_gate"](_sig())
+    assert a["signal_type"] == "buy"                       # score above the cut: untouched
+
+
+def test_meta_gate_silent_when_learning_or_neutral():
+    a = _meta_ns({"status": "learning", "n": 10, "need": 200}, {"meta_model_gate": True})["apply_meta_gate"](_sig())
+    assert a["signal_type"] == "buy" and "meta_prob" not in a
+    n = _sig("neutral")
+    assert _meta_ns(_active_model(), {})["apply_meta_gate"](n) is n and "meta_prob" not in n
