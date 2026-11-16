@@ -1201,6 +1201,45 @@ def _al_money(v):
 
 
 AUDIT_OUTCOME_COLUMNS = ["Outcome", "OutcomeR", "BarsToOutcome", "ResolvedAt"]
+# Whole-horizon price path of each signal, in units of its own risk (entry-to-stop distance), BEFORE costs:
+# best move in favour, worst move against, and where the horizon's last close ended. Filled later, once all
+# `horizon` bars exist (a trade that hit its stop on bar 3 still needs the other bars to say what a wider stop would have done).
+AUDIT_PATH_COLUMNS = ["MFE_R", "MAE_R", "CloseR"]
+
+
+def ai_lab_backfill_audit_paths(a, data, symbol, timeframe, horizon=12):
+    """Fill MFE_R / MAE_R / CloseR for already-resolved signals of this symbol+timeframe once `horizon` later bars exist.
+    Never changes an outcome. Returns (audit, rows_filled)."""
+    for col in AUDIT_PATH_COLUMNS:
+        if col not in a.columns:
+            a[col] = np.nan
+        a[col] = pd.to_numeric(a[col], errors="coerce").astype(float)
+    if data is None or data.empty:
+        return a, 0
+    done_mask = a["Outcome"].astype(str).isin(["T1", "STOP", "TIMEOUT"])
+    m = (a["Symbol"].astype(str) == str(symbol)) & (a["Timeframe"].astype(str) == str(timeframe)) & done_mask & a["MFE_R"].isna()
+    if not m.any():
+        return a, 0
+    idx = pd.DatetimeIndex(pd.to_datetime(data.index))
+    hi, lo, cl = data["High"].to_numpy(float), data["Low"].to_numpy(float), data["Close"].to_numpy(float)
+    n_fill = 0
+    for i in list(a.index[m]):
+        dt = _al_parse_dt(pd.Series([a.at[i, "DateTime"]])).iloc[0]
+        entry, sl = _al_num(a.at[i, "Price"]), _al_num(a.at[i, "StopLoss"])
+        if pd.isna(dt) or not (np.isfinite(entry) and np.isfinite(sl)) or abs(entry - sl) <= 0 or (len(idx) and dt < idx[0]):
+            continue
+        pos = int(idx.searchsorted(dt, side="right"))
+        if len(idx) - pos < horizon:
+            continue                                   # the whole horizon has not arrived yet
+        is_buy = str(a.at[i, "SignalType"]).lower() == "buy"
+        risk = abs(entry - sl)
+        h, l = hi[pos:pos + horizon], lo[pos:pos + horizon]
+        mfe = (h.max() - entry) if is_buy else (entry - l.min())
+        mae = (l.min() - entry) if is_buy else (entry - h.max())          # <= 0 when price went against the trade
+        close = (cl[pos + horizon - 1] - entry) if is_buy else (entry - cl[pos + horizon - 1])
+        a.at[i, "MFE_R"], a.at[i, "MAE_R"], a.at[i, "CloseR"] = round(float(max(mfe, 0)) / risk, 3), round(float(min(mae, 0)) / risk, 3), round(float(close) / risk, 3)
+        n_fill += 1
+    return a, n_fill
 
 
 def ai_lab_resolve_audit(audit, data, symbol, timeframe, horizon=12, cost_bps=0.0, max_rows=400):
@@ -1227,6 +1266,7 @@ def ai_lab_resolve_audit(audit, data, symbol, timeframe, horizon=12, cost_bps=0.
     mask = (a["Symbol"].astype(str) == str(symbol)) & (a["Timeframe"].astype(str) == str(timeframe)) & \
            a["SignalType"].astype(str).str.lower().isin(["buy", "sell"]) & unresolved
     if not mask.any():
+        a, _ = ai_lab_backfill_audit_paths(a, data, symbol, timeframe, horizon)
         return a, 0
     idx = pd.DatetimeIndex(pd.to_datetime(data.index))
     hi, lo, cl = data["High"].to_numpy(float), data["Low"].to_numpy(float), data["Close"].to_numpy(float)
@@ -1265,7 +1305,194 @@ def ai_lab_resolve_audit(audit, data, symbol, timeframe, horizon=12, cost_bps=0.
         a.at[i, "OutcomeR"] = round(float(r_gross) - cost_r, 3)
         a.at[i, "ResolvedAt"] = (datetime.utcnow() + timedelta(hours=5, minutes=30)).strftime(AI_LAB_DT_FMT)
         done += 1
+    a, _ = ai_lab_backfill_audit_paths(a, data, symbol, timeframe, horizon)
     return a, done
+
+
+# ---------------------------------------------------------
+# META-LABEL MODEL: P(this BUY/SELL signal ends net-positive), learned from the forward-tested audit
+# ---------------------------------------------------------
+META_FEATURES = ["ValidationScore", "TradeQualityScore", "Confidence", "ADX", "RSIdir", "VWAPDirPct", "Bullish", "Bearish",
+                 "DirectionalEdge", "TrendVotes", "MTFAvailable", "MTFAligned", "VolumeSpike", "Breakout", "SmartMoneyPts",
+                 "OptionFlowPts", "MacroPts", "InstitutionalScore", "SideBuy", "Hour"]
+META_MIN_SIGNALS = 200
+
+
+def _meta_bool(v):
+    return 1.0 if str(v).strip().lower() in ("1", "1.0", "true", "yes") else 0.0
+
+
+def _meta_hour(bucket):
+    try:
+        return float(str(bucket).split(":")[0])
+    except Exception:
+        return np.nan
+
+
+def meta_matrix(rows):
+    """Audit rows (DataFrame, audit column names) -> numeric feature matrix. The side-aware columns flip sign for SELL so
+    'strength in the trade's direction' means the same thing for both sides."""
+    g = lambda c: pd.to_numeric(rows[c], errors="coerce") if c in rows.columns else pd.Series(np.nan, index=rows.index)
+    side_buy = rows["SignalType"].astype(str).str.lower().eq("buy") if "SignalType" in rows.columns else pd.Series(True, index=rows.index)
+    X = pd.DataFrame(index=rows.index)
+    for c in ("ValidationScore", "TradeQualityScore", "Confidence", "ADX", "Bullish", "Bearish", "DirectionalEdge", "TrendVotes",
+              "MTFAvailable", "SmartMoneyPts", "OptionFlowPts", "MacroPts", "InstitutionalScore"):
+        X[c] = g(c)
+    X["RSIdir"] = np.where(side_buy, g("RSI"), 100 - g("RSI"))
+    X["VWAPDirPct"] = np.where(side_buy, g("VWAPDistPct"), -g("VWAPDistPct"))
+    for c in ("MTFAligned", "VolumeSpike", "Breakout"):
+        X[c] = rows[c].map(_meta_bool) if c in rows.columns else 0.0
+    X["SideBuy"] = side_buy.astype(float)
+    X["Hour"] = rows["TimeBucket"].map(_meta_hour) if "TimeBucket" in rows.columns else np.nan
+    return X[META_FEATURES].astype(float)
+
+
+def _auc(p, y):
+    """Probability that a random winner is scored above a random loser (rank based; ties count half)."""
+    p, y = np.asarray(p, float), np.asarray(y, float)
+    pos, neg = p[y == 1], p[y == 0]
+    if len(pos) == 0 or len(neg) == 0:
+        return float("nan")
+    order = pd.Series(np.concatenate([pos, neg])).rank().to_numpy()
+    return float((order[:len(pos)].sum() - len(pos) * (len(pos) + 1) / 2) / (len(pos) * len(neg)))
+
+
+def ai_lab_train_meta(audit, min_n=META_MIN_SIGNALS):
+    """Train on resolved signals (shadow rows included, so a blocked setup can still prove itself). The model only becomes
+    'active' if, when tested walk-forward (train on older, predict the next newer block), it beats the plain win-rate baseline
+    on Brier score AND ranks winners above losers (AUC >= 0.55). Otherwise it reports 'no_edge' and is never used."""
+    if audit is None or audit.empty or "Outcome" not in audit.columns or "OutcomeR" not in audit.columns:
+        return {"status": "learning", "n": 0, "need": min_n}
+    r = audit[audit["Outcome"].fillna("").astype(str).isin(["T1", "STOP", "TIMEOUT"])].copy()
+    r["R"] = pd.to_numeric(r["OutcomeR"], errors="coerce")
+    r = r.dropna(subset=["R"])
+    if "DateTime" in r.columns:
+        r["_dt"] = _al_parse_dt(r["DateTime"])
+        r = r.sort_values("_dt")
+    r = r.tail(1500).reset_index(drop=True)
+    n = len(r)
+    if n < min_n:
+        return {"status": "learning", "n": n, "need": min_n}
+    X, y, R = meta_matrix(r), (r["R"] > 0).astype(float).to_numpy(), r["R"].to_numpy(float)
+    start = int(n * 0.6)
+    step = max(10, (n - start) // 6)
+    oos_p, oos_y, oos_r, oos_base = [], [], [], []
+    k = start
+    while k < n:
+        e = min(n, k + step)
+        med, mu, sd = _al_standardise(X.iloc[:k])
+        Zk = ((X.iloc[:k].fillna(med) - mu) / sd).to_numpy(float)
+        w, b = _al_fit_logit(Zk, y[:k], iters=200)
+        Zt = np.clip(((X.iloc[k:e].fillna(med) - mu) / sd).to_numpy(float), -3, 3)
+        oos_p += list(1.0 / (1.0 + np.exp(-np.clip(Zt @ w + b, -30, 30))))
+        oos_y += list(y[k:e]); oos_r += list(R[k:e]); oos_base += [float(y[:k].mean())] * (e - k)
+        k = e
+    oos_p, oos_y, oos_r, oos_base = map(np.array, (oos_p, oos_y, oos_r, oos_base))
+    brier, base_brier = float(((oos_p - oos_y) ** 2).mean()), float(((oos_base - oos_y) ** 2).mean())
+    auc = _auc(oos_p, oos_y)
+    cut = float(np.quantile(oos_p, 0.33))
+    low = oos_p <= cut
+    avg_r_low = float(oos_r[low].mean()) if low.any() else float("nan")
+    avg_r_high = float(oos_r[~low].mean()) if (~low).any() else float("nan")
+    preq = {"n": int(len(oos_p)), "auc": auc, "brier": brier, "base_brier": base_brier, "cut": cut,
+            "avg_r_below_cut": avg_r_low, "avg_r_above_cut": avg_r_high}
+    ok = len(oos_p) >= 50 and np.isfinite(auc) and auc >= 0.55 and brier < base_brier and avg_r_high > avg_r_low
+    if not ok:
+        return {"status": "no_edge", "n": n, "preq": preq,
+                "why": "Tested on newer signals it does not beat the plain win-rate baseline, so it is not used."}
+    med, mu, sd = _al_standardise(X)
+    Z = ((X.fillna(med) - mu) / sd).to_numpy(float)
+    w, b = _al_fit_logit(Z, y, iters=300)
+    return {"status": "active", "n": n, "features": META_FEATURES, "w": [float(v) for v in w], "b": float(b),
+            "med": {k_: float(v) for k_, v in med.items()}, "mu": {k_: float(v) for k_, v in mu.items()},
+            "sd": {k_: float(v) for k_, v in sd.items()}, "base_rate": float(y.mean()), "preq": preq,
+            "gate_ok": bool(np.isfinite(avg_r_low) and avg_r_low < 0), "cut": cut, "updated_at": now_str()}
+
+
+def ai_lab_meta_predict(model, row):
+    """row: dict with the audit column names for ONE signal. Returns P(win) in 0-1 or None when the model is not active."""
+    if not isinstance(model, dict) or model.get("status") != "active":
+        return None
+    X = meta_matrix(pd.DataFrame([row]))
+    z = []
+    for name in model["features"]:
+        v = float(X[name].iloc[0])
+        if not np.isfinite(v):
+            v = model["med"][name]
+        z.append(max(-3.0, min(3.0, (v - model["mu"][name]) / (model["sd"][name] or 1.0))))
+    sc = float(np.dot(np.array(z), np.array(model["w"])) + model["b"])
+    return float(1.0 / (1.0 + math.exp(-max(-30, min(30, sc)))))
+
+
+EXIT_FIT_STOPS = (0.5, 0.75, 1.0, 1.25, 1.5)
+EXIT_FIT_TARGETS = (0.75, 1.0, 1.5, 2.0, 2.5, 3.0)
+
+
+def _exit_fit_prepare(audit, cost_bps=0.0):
+    """Rows that have a full-horizon path, with net cost expressed in the signal's own risk units."""
+    if audit is None or audit.empty or any(c not in audit.columns for c in AUDIT_PATH_COLUMNS):
+        return pd.DataFrame()
+    r = audit[audit["Outcome"].fillna("").astype(str).isin(["T1", "STOP", "TIMEOUT"])].copy()
+    for c in AUDIT_PATH_COLUMNS + ["Price", "StopLoss", "OutcomeR"]:
+        r[c] = pd.to_numeric(r[c], errors="coerce")
+    r = r.dropna(subset=AUDIT_PATH_COLUMNS + ["Price", "StopLoss"])
+    r = r[(r["Price"] - r["StopLoss"]).abs() > 0]
+    if r.empty:
+        return r
+    risk = (r["Price"] - r["StopLoss"]).abs()
+    r["CostR"] = (2.0 * float(cost_bps) / 1e4 * r["Price"]) / risk
+    r["_dt"] = _al_parse_dt(r["DateTime"]) if "DateTime" in r.columns else pd.NaT
+    return r.sort_values("_dt").reset_index(drop=True)
+
+
+def _exit_fit_eval(r, stop_r, target_r):
+    """Average net result PER UNIT OF RISK TAKEN for one stop/target pair, using each signal's own path.
+    Stop is assumed first when one path touched both levels (pessimistic, the same rule as the audit)."""
+    mae, mfe, close = r["MAE_R"].to_numpy(float), r["MFE_R"].to_numpy(float), r["CloseR"].to_numpy(float)
+    res = np.where(mae <= -stop_r, -stop_r, np.where(mfe >= target_r, target_r, close))
+    net = (res - r["CostR"].to_numpy(float)) / stop_r
+    se = float(np.std(net, ddof=1) / np.sqrt(len(net))) if len(net) > 1 else float("inf")
+    return float(np.mean(net)), se
+
+
+def ai_lab_fit_exits(audit, cost_bps=0.0, min_n=50, by=None):
+    """Report-only: which stop distance and target distance (in multiples of the engine's own stop) would have paid best on the
+    signals that already finished. The best pair is chosen on the older 60% of signals and then checked on the newer 40%, so a
+    pair that only fits old luck is shown as such. Nothing is applied to live trading. Returns a list of dict rows."""
+    r_all = _exit_fit_prepare(audit, cost_bps)
+    if r_all.empty:
+        return []
+    groups = [("All signals", r_all)] if not by else [(str(k), g.reset_index(drop=True)) for k, g in r_all.groupby(by, dropna=False)]
+    out = []
+    for key, r in groups:
+        n = len(r)
+        row = {"Group": key, "Signals with path": n, "Status": "", "Current (avg R per risk)": np.nan,
+               "Best stop (x)": np.nan, "Best target (x)": np.nan, "Older 60%": np.nan, "Newer 40% (out of sample)": np.nan, "Verdict": ""}
+        base_r = float(np.mean((r["MAE_R"].to_numpy(float) <= -1.0) * -1.0 + (r["MAE_R"].to_numpy(float) > -1.0) * r["CloseR"].to_numpy(float)) - np.mean(r["CostR"]))
+        row["Current (avg R per risk)"] = round(base_r, 3)
+        if n < min_n:
+            row["Status"] = f"Need {min_n - n} more"; row["Verdict"] = "Too few signals to fit anything"
+            out.append(row); continue
+        cut = int(n * 0.6)
+        train, test = r.iloc[:cut], r.iloc[cut:]
+        best = None
+        for sr in EXIT_FIT_STOPS:
+            for tr in EXIT_FIT_TARGETS:
+                v, _ = _exit_fit_eval(train, sr, tr)
+                if best is None or v > best[0]:
+                    best = (v, sr, tr)
+        t_v, t_se = _exit_fit_eval(test, best[1], best[2])
+        row.update({"Status": "Fitted", "Best stop (x)": best[1], "Best target (x)": best[2],
+                    "Older 60%": round(best[0], 3), "Newer 40% (out of sample)": round(t_v, 3)})
+        # one-sided 95%: the newer signals' average must be above zero even after allowing for sampling noise
+        if (t_v - 1.645 * t_se) > 0 and t_v > base_r + 0.05 and len(test) >= 30:
+            row["Verdict"] = "Holds on newer signals; worth a paper test"
+        elif t_v > 0:
+            row["Verdict"] = "Positive but no clear gain over the current exit"
+        else:
+            row["Verdict"] = "Does not hold on newer signals; ignore"
+        out.append(row)
+    return out
 
 
 def ai_lab_audit_summary(audit, by=None):
