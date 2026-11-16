@@ -215,12 +215,28 @@ def paper_trade_exit(entry_price, exit_price, quantity, signal, final_close=True
 
 
 
-def get_suggested_paper_levels(analysis, side, entry_price):
-    """Return side-correct suggested levels; ATR fallback is explicitly a simulation plan."""
+# Minimum stop distance (share of price) for the fallback plan, by timeframe. The old flat 0.3% suited 15m and above but made
+# a 1-minute NIFTY stop ~75 points wide with a target ~150 points away, which a 1m trade almost never reaches.
+TF_STOP_FLOOR_PCT = {"1m": 0.001, "3m": 0.0015, "5m": 0.002, "10m": 0.0025}
+DEFAULT_STOP_FLOOR_PCT = 0.003
+
+
+def _stop_floor_pct(timeframe=None):
+    try:
+        if timeframe is not None and bool(st.session_state.get("paper_tf_floor", True)):
+            return TF_STOP_FLOOR_PCT.get(str(timeframe), DEFAULT_STOP_FLOOR_PCT)
+    except Exception:
+        pass
+    return DEFAULT_STOP_FLOOR_PCT
+
+
+def get_suggested_paper_levels(analysis, side, entry_price, timeframe=None):
+    """Return side-correct suggested levels; ATR fallback is explicitly a simulation plan.
+    `timeframe` (optional) lowers the fallback's minimum stop distance on short timeframes; without it the old 0.3% floor applies."""
     side = str(side).upper()
     entry = float(entry_price)
     atr = float(analysis.get("atr") or 0.0)
-    risk = min(max(atr if np.isfinite(atr) else 0.0, entry * 0.003, 0.01), entry * 0.20)
+    risk = min(max(atr if np.isfinite(atr) else 0.0, entry * _stop_floor_pct(timeframe), 0.01), entry * 0.20)
     same_signal = (side == "BUY" and analysis.get("signal_type") == "buy") or (side == "SELL" and analysis.get("signal_type") == "sell")
     if same_signal:
         sl = analysis.get("stop_loss")
