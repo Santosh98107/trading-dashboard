@@ -124,7 +124,7 @@ def _ec_export(mod):
 
 _install_streamlit_compat()
 # Visible deployment marker: confirms which source file Streamlit Cloud is running.
-APP_BUILD_ID = "2026-11-16-TFSTOP"
+APP_BUILD_ID = "2026-11-16-LADDER"
 # Optional integrations: Yahoo mode must still start if Angel SDK/TOTP or
 # the auto-refresh helper is not installed.
 try:
@@ -7874,6 +7874,26 @@ with st.expander("Meta-label model"):
                 help="Off (default) = display only. On = only when the model has proved that its weakest third lost money on newer signals. Blocked signals are kept as shadow rows.")
     st.caption("It can only tighten a signal, never create or relax one.")
 
+with st.expander("Profit ladder (stops profit turning into loss)"):
+    st.checkbox("Turn the profit ladder ON for auto-exit paper trades", value=False, key="profit_lock_on",
+                help="OFF (default) = exits work exactly as before. ON = the trailing stop is raised from each trade's best price, in the steps below. "
+                     "It only ever tightens a stop; targets T1/T2/T3 and quantities are unchanged.")
+    c1, c2 = st.columns(2)
+    c1.number_input("Stop to entry + charges at (R profit)", 0.5, 3.0, 1.25, 0.05, key="pl_be_arm_r")
+    c2.number_input("...plus this buffer (R)", 0.0, 0.5, 0.05, 0.01, key="pl_be_buffer_r")
+    c1.number_input("Give-back protection starts at (R)", 0.5, 4.0, 1.5, 0.05, key="pl_gb_arm_r")
+    c2.number_input("At +2R lock this much profit (R, after charges)", 0.0, 2.0, 0.75, 0.05, key="pl_lock2_r")
+    c1.number_input("Allowed give-back below +2R (share of peak profit)", 0.1, 0.9, 0.50, 0.05, key="pl_gb_low")
+    c2.number_input("Allowed give-back +2R to +3R", 0.1, 0.9, 0.40, 0.05, key="pl_gb_mid")
+    c1.number_input("Allowed give-back above +3R", 0.1, 0.9, 0.30, 0.05, key="pl_gb_high")
+    st.checkbox("Strong opposite signal: exit half of what is left", value=False, key="pl_opp_exit_on",
+                help="Only for a STRONG signal on the selected symbol. A single unit cannot be halved, so it is protected at entry + charges instead.")
+    st.checkbox("Time stop: close a trade that has not reached T1 and has weak profit", value=False, key="pl_time_stop_on",
+                help="Candle limits: 1m 20, 3m 15, 5m 12, 10m 10, 15m 8, other 8.")
+    st.number_input("Weak profit means below (R)", 0.0, 2.0, 0.5, 0.05, key="pl_weak_r")
+    st.caption("Starting numbers are my choices, not tested on your data. Compare ON vs OFF in paper for 1-2 weeks. Price is checked only when the page refreshes, "
+               "so the stop can trigger late until an always-on worker exists. Applies to auto-exit paper trades only.")
+
 with st.expander("Paper stop distance"):
     st.checkbox("Use a timeframe-aware minimum stop for manual paper orders", value=True, key="paper_tf_floor",
                 help="ON (default): when the live signal does not give its own levels, the fallback stop is at least 0.1% (1m), 0.15% (3m), 0.2% (5m), "
@@ -9298,7 +9318,14 @@ paper_auto_exit_enabled = render_paper_exit_mode_selector()
 paper_journal = sync_open_position_auto_exit(paper_auto_exit_enabled, paper_journal)
 
 if paper_auto_exit_enabled:
-    auto_result = auto_paper_trade_exit(current_display_price, symbol=selected, atr=analysis.get("atr"))
+    _opp_strong = None
+    try:
+        _st_txt = str(analysis.get("signal_text", "")).upper()
+        if _st_txt.startswith("STRONG"):
+            _opp_strong = "buy" if "BUY" in _st_txt else "sell"
+    except Exception:
+        _opp_strong = None
+    auto_result = auto_paper_trade_exit(current_display_price, symbol=selected, atr=analysis.get("atr"), opposite_strong=_opp_strong)
     if auto_result.get("closed", 0) or auto_result.get("partial", 0):
         st.success(
             f"Auto-exit manager: {auto_result.get('closed', 0)} position(s) fully closed; "
