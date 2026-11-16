@@ -124,7 +124,7 @@ def _ec_export(mod):
 
 _install_streamlit_compat()
 # Visible deployment marker: confirms which source file Streamlit Cloud is running.
-APP_BUILD_ID = "2026-11-15-DQ"
+APP_BUILD_ID = "2026-11-16-LEAN"
 # Optional integrations: Yahoo mode must still start if Angel SDK/TOTP or
 # the auto-refresh helper is not installed.
 try:
@@ -5178,6 +5178,20 @@ def _ec_render_signal_audit_report():
                 with st.expander(label):
                     st.dataframe(tab.rename(columns={"Group": col}), use_container_width=True, hide_index=True)
 
+    # ---- exit fitting (report only; nothing here changes a live stop or target) ----
+    try:
+        with st.expander("Exit fitting — would a different stop / target have paid better? (report only)"):
+            fit = ai_lab_fit_exits(audit, cost_bps=_backtest_cost_bps(), min_n=50, by="Timeframe")
+            if not fit:
+                st.info("No path data yet. Each resolved signal gets its best / worst move once 12 candles have formed after it; this table fills from then on.")
+            else:
+                st.dataframe(pd.DataFrame(fit), use_container_width=True, hide_index=True)
+                st.caption("Stop and target are in multiples of the engine's own stop distance (1.0 = the stop as it is now). The best pair is picked on the "
+                           "older 60% of signals and re-tested on the newer 40%. Only 'worth a paper test' means the gain survived that test, and even then "
+                           "try it in paper first. Needs 50+ signals with path data per timeframe. Nothing is applied automatically.")
+    except Exception as _fit_err:
+        log_app_error("exit_fit_report", _fit_err)
+
 
 def apply_live_edge_gate(analysis, symbol, timeframe):
     """Link the forward-tested signal record to the live signal.
@@ -5209,6 +5223,94 @@ def apply_live_edge_gate(analysis, symbol, timeframe):
     except Exception as exc:
         log_app_error("live_edge_gate", exc)
     return analysis
+
+
+def _meta_row_from_analysis(analysis):
+    """The live signal in the same column names the audit log uses, so the meta model sees train and live values alike."""
+    side_buy = analysis.get("signal_type") == "buy"
+    vw, cp = _safe_num(analysis.get("vwap")), _safe_num(analysis.get("close_price"))
+    return {
+        "SignalType": analysis.get("signal_type"), "ValidationScore": analysis.get("validation_score", 0),
+        "TradeQualityScore": analysis.get("trade_quality_score", 0),
+        "Confidence": analysis.get("confidence") if analysis.get("confidence") is not None else np.nan,
+        "ADX": _safe_num(analysis.get("adx")), "RSI": _safe_num(analysis.get("rsi")),
+        "VWAPDistPct": ((cp - vw) / vw * 100) if (np.isfinite(vw) and vw != 0 and np.isfinite(cp)) else np.nan,
+        "Bullish": _safe_num(analysis.get("bullish_score")), "Bearish": _safe_num(analysis.get("bearish_score")),
+        "DirectionalEdge": _safe_num(analysis.get("directional_edge")),
+        "TrendVotes": int(analysis.get("buy_trend_votes", 0) if side_buy else analysis.get("sell_trend_votes", 0)),
+        "MTFAvailable": int(analysis.get("mtf_available_count", 0) or 0),
+        "MTFAligned": bool(analysis.get("mtf_bull_ok") if side_buy else analysis.get("mtf_bear_ok")),
+        "VolumeSpike": bool(analysis.get("volume_spike")), "Breakout": bool(analysis.get("breakout") or analysis.get("breakdown")),
+        "SmartMoneyPts": _safe_num(analysis.get("smart_money_points")), "OptionFlowPts": _safe_num(analysis.get("option_flow_points")),
+        "MacroPts": _safe_num(analysis.get("macro_points")), "InstitutionalScore": _safe_num(analysis.get("institutional_score")),
+        "TimeBucket": f"{ist_now().hour:02d}:00",
+    }
+
+
+def _meta_model_cached():
+    """Retrain only when the audit has grown by 10+ rows (training takes a moment; the record changes slowly)."""
+    audit = load_signal_audit()
+    n = 0 if audit is None else len(audit)
+    box = getattr(rs, "META_MODEL_BOX", None)
+    if box is None:
+        box = rs.META_MODEL_BOX = {"n": -999, "model": None}
+    if abs(n - box["n"]) >= 10 or box["model"] is None:
+        box["model"] = ai_lab_train_meta(audit)
+        box["n"] = n
+    return box["model"]
+
+
+def apply_meta_gate(analysis):
+    """Attach P(win) from the meta-label model to a live BUY/SELL. Display only, unless Settings -> Meta-label model -> Gate is ON
+    AND the model proved (walk-forward) that its lowest-scored third lost money; then those signals become NO TRADE (and are kept as
+    shadow rows). It can only tighten a signal. Inactive or untrained = does nothing."""
+    try:
+        if analysis.get("signal_type") not in ("buy", "sell") or not bool(st.session_state.get("meta_model_on", True)):
+            return analysis
+        model = _meta_model_cached()
+        analysis["meta_model"] = {k: model.get(k) for k in ("status", "n", "need", "why")}
+        if model.get("status") == "active":
+            analysis["meta_model"]["preq"] = model.get("preq")
+        p = ai_lab_meta_predict(model, _meta_row_from_analysis(analysis))
+        if p is None:
+            return analysis
+        analysis["meta_prob"] = p
+        if bool(st.session_state.get("meta_model_gate", False)) and model.get("gate_ok") and p < float(model.get("cut", 0.0)):
+            analysis["_edge_shadow"] = dict(analysis)
+            analysis["_shadow_tag"] = "META"
+            analysis["signal_text"], analysis["signal_type"] = "NO TRADE", "neutral"
+            analysis.setdefault("no_trade_reasons", []).append(
+                f"Meta-label model: win chance {p * 100:.0f}% is in the model's weakest third (those lost money on newer signals)")
+            analysis["no_trade_reason"] = "; ".join(analysis["no_trade_reasons"])
+            for k in ("stop_loss", "target1", "target2", "target3", "partial_exit", "trailing_stop", "rr_ratio"):
+                analysis[k] = None
+            analysis["strength"], analysis["confidence"], analysis["trade_quality_score"] = "Low", None, 0
+            analysis["trade_allowed"] = False
+            analysis["meta_blocked"] = True
+    except Exception as exc:
+        log_app_error("meta_gate", exc)
+    return analysis
+
+
+def _ec_render_meta_card(analysis):
+    with st.expander("🤖 Meta-label model — learned win chance of this signal"):
+        mm = analysis.get("meta_model") if isinstance(analysis, dict) else None
+        if not mm:
+            st.caption("Shown when a BUY or SELL signal is active. Learns from your resolved signal record; needs "
+                       f"{META_MIN_SIGNALS}+ resolved signals and must beat a plain win-rate baseline on newer signals before it is used.")
+            return
+        if mm.get("status") == "learning":
+            st.info(f"Collecting data: {mm.get('n', 0)} of {mm.get('need', META_MIN_SIGNALS)} resolved signals. Until then it shows nothing and blocks nothing.")
+        elif mm.get("status") == "no_edge":
+            st.warning("The model was trained but does not beat the plain win-rate baseline on newer signals, so it is switched off. " + str(mm.get("why", "")))
+        elif analysis.get("meta_prob") is not None:
+            pq = mm.get("preq") or {}
+            c = st.columns(3)
+            c[0].metric("Learned win chance", f"{analysis['meta_prob'] * 100:.0f}%")
+            c[1].metric("Ranking skill (AUC)", f"{pq.get('auc', float('nan')):.2f}", "0.5 = no skill", delta_color="off")
+            c[2].metric("Trained on", f"{mm.get('n', 0)} signals")
+            if analysis.get("meta_blocked"):
+                st.error("Turned into NO TRADE by the meta-label gate (Settings → Meta-label model). It is still logged as a shadow signal.")
 
 
 def _ec_render_live_edge_card(analysis):
@@ -7743,6 +7845,9 @@ with st.expander("Auto-load pages"):
                 key="auto_load_pages",
                 help="ON (default): the tables fill themselves (scanner refreshes every 3 min, opportunities every 5 min, only while that page is open). "
                      "OFF: press the Run / Rank button yourself, as before.")
+    st.checkbox("Also pre-load them in the background while another page is open (uses CPU; can slow the app)", value=False, key="bg_prewarm",
+                help="OFF (default): they load only when you open their page. ON: ~35 stocks are fetched and scored in the background every 5-10 minutes, "
+                     "which competes with the live page for the server's CPU.")
 
 with st.expander("Early alert strictness"):
     st.checkbox(
@@ -7761,6 +7866,13 @@ with st.expander("Trade timing guard"):
         value=False, key="timing_guard_windows",
         help="Off = only a warning is shown in those windows. On = BUY/SELL is refused then.")
     st.caption("The guard only affects manual paper BUY / SELL clicks. Signals, scanner and alerts are not changed. Closing positions is never blocked.")
+
+with st.expander("Meta-label model"):
+    st.checkbox("Show the learned win chance on live BUY / SELL signals", value=True, key="meta_model_on",
+                help="Learns from your own resolved signal record. Stays silent until 200+ signals are resolved and it beats a plain win-rate baseline on newer signals.")
+    st.checkbox("Gate: turn the model's weakest-third signals into NO TRADE", value=False, key="meta_model_gate",
+                help="Off (default) = display only. On = only when the model has proved that its weakest third lost money on newer signals. Blocked signals are kept as shadow rows.")
+    st.caption("It can only tighten a signal, never create or relax one.")
 
 with st.expander("Correlated exposure"):
     st.checkbox("Warn when a new paper order would stack on open positions that move together", value=True, key="exposure_guard_on",
@@ -8545,6 +8657,7 @@ analysis = apply_adaptive_signal_intelligence(
 )
 analysis = apply_tiered_early_alerts(analysis, tiered_tf_metrics)
 analysis = apply_live_edge_gate(analysis, selected, timeframe)     # forward-tested record -> live signal (can only tighten)
+analysis = apply_meta_gate(analysis)                                 # learned win chance; display, optional gate (default OFF)
 # An approved trainer profile can gate paper eligibility only. Original score values
 # and BUY/SELL scoring weights remain untouched.
 _trainer_profile = st.session_state.get("approved_ai_trainer_profile")
@@ -8560,6 +8673,7 @@ _ec_section("Signals")
 _ec_render_smart_money_signal_point(analysis)   # Smart Money point, shown on the Signals page
 _ec_render_option_flow_signal_point(analysis)    # Option flow point (OI change + live Put/Call volume)
 _ec_render_live_edge_card(analysis)               # forward-tested record for signals like this one
+_ec_render_meta_card(analysis)
 with st.expander("🏛️ Institutional Signal Participation Audit", expanded=False):
     _inst_audit = analysis.get("institutional_participation_audit", {})
     if _inst_audit:
@@ -8786,7 +8900,7 @@ signal_is_duplicate = is_duplicate_signal(selected, timeframe, analysis)
 if analysis["signal_type"] in ["buy", "sell"] and not signal_is_duplicate:
     add_signal_audit(selected, timeframe, analysis)
 elif analysis.get("_edge_shadow") and not is_duplicate_signal(selected, timeframe, analysis["_edge_shadow"]):
-    add_signal_audit(selected, timeframe, analysis["_edge_shadow"], blocked="EDGE")      # shadow row: keeps the record updating
+    add_signal_audit(selected, timeframe, analysis["_edge_shadow"], blocked=analysis.get("_shadow_tag", "EDGE"))      # shadow row: keeps the record updating
 resolve_signal_audit_outcomes(selected, timeframe, data)
 
 if telegram_enabled and telegram_bot_token and telegram_chat_id:
@@ -10100,7 +10214,8 @@ def _ec_bg_warmup():
     """Keep Scanner and Top Opportunities warm in the background while any other page is open, so they open already filled.
     Never blocks and never raises; skipped when the Settings switch 'Auto-load pages' is off."""
     try:
-        if bgj is None or not bool(st.session_state.get("auto_load_pages", True)) or _ec_active in ("Scanner", "Top Opportunities"):
+        if (bgj is None or not bool(st.session_state.get("auto_load_pages", True))
+                or not bool(st.session_state.get("bg_prewarm", False)) or _ec_active in ("Scanner", "Top Opportunities")):
             return
         bgj.request("nifty30", build_nifty_top30_scanner, max_age=300, retry_after=120)
         _j = load_journal()
