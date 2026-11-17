@@ -78,3 +78,44 @@ def test_full_flow_profit_does_not_turn_into_loss(tmp_path):
     assert off[0] == "CLOSED" and float(off[1]) < 0            # today: the profit is lost and the trade ends in a loss
     assert on[0] == "CLOSED" and float(on[1]) > 0              # ladder: the same path ends in a profit
     assert "Profit Lock" in out["True"]
+
+
+def test_auto_exit_mode_survives_widget_state_loss(tmp_path):
+    """Streamlit drops a widget's value on a run where it is not drawn. The mode must not fall back to Manual."""
+    script = textwrap.dedent(f"""
+        import os, sys, types
+        from unittest.mock import MagicMock
+        os.environ["ELITE_DATA_DIR"] = r"{tmp_path}"
+        sys.path.insert(0, r"{ROOT}")
+        for m in ("plotly", "plotly.graph_objects", "plotly.express", "streamlit"):
+            sys.modules[m] = MagicMock()
+        import risk_manager as rm
+        ss = {{}}
+        class St:
+            session_state = ss
+            def radio(self, label, options=None, key=None, **k): return ss[key]
+            def success(self, *a, **k): pass
+            def info(self, *a, **k): pass
+        rm.st = St()
+        rm.LOSS_FEATURE_COLUMNS = []; rm.classify_trade_loss = lambda *a, **k: "t"
+        rm.init_journal(); rm.init_paper_state()
+        print("fresh", rm.render_paper_exit_mode_selector())                       # new session, nothing open -> Manual
+        ss["paper_exit_mode"] = "Auto Exit (Enabled)"                                # user picks Auto
+        print("picked", rm.render_paper_exit_mode_selector())
+        del ss["paper_exit_mode"]                                                    # Streamlit forgets the widget on a run without it
+        print("after_loss", rm.render_paper_exit_mode_selector())
+        entry = 25249.6; risk = 75.7488
+        rm.add_trade_to_journal("NIFTY", "5m", "SELL", entry, 10, entry + risk, entry - 2*risk, entry - 3*risk, entry - 4*risk, entry + risk,
+                                {{"signal_text": "SELL", "atr": 20.0}}, auto_exit=True)
+        print("active", rm.paper_auto_exit_active())
+        ss.clear()                                                                   # brand-new browser session
+        print("new_session", rm.render_paper_exit_mode_selector())                  # open trade carries AutoExitEnabled=True -> Auto
+        ss.clear(); ss["paper_exit_mode"] = "Manual Exit"; rm.render_paper_exit_mode_selector()
+        print("manual_wins", rm.paper_auto_exit_active())
+    """)
+    res = subprocess.run([sys.executable, "-I", "-c", script], capture_output=True, text=True, timeout=120)
+    assert res.returncode == 0, res.stderr[-800:]
+    out = dict(l.split(" ", 1) for l in res.stdout.strip().splitlines())
+    assert out["fresh"] == "False" and out["picked"] == "True"
+    assert out["after_loss"] == "True"            # the bug: this used to be False (reset to Manual)
+    assert out["active"] == "True" and out["new_session"] == "True" and out["manual_wins"] == "False"
