@@ -3,6 +3,8 @@ targets, trailing stops and the auto-exit engine.  Split out of app.py; behaviou
 import os
 import json
 import math
+import threading
+import functools
 from datetime import datetime, timedelta
 
 import numpy as np
@@ -186,8 +188,40 @@ def paper_trade_entry(price, quantity, side="BUY"):
 DEFAULT_PAPER_COST_BPS = 2.0   # per side: brokerage + STT/charges + slippage
 
 
+# --- background worker support -------------------------------------------------------------------------
+# A background thread has no st.session_state, so the worker installs a thread-local settings snapshot.
+# Every journal-changing function is wrapped in JOURNAL_LOCK so the page and the worker never interleave
+# their load -> modify -> save cycles.
+_TLS = threading.local()
+JOURNAL_LOCK = threading.RLock()
+
+
+def set_thread_cfg(cfg):
+    """Install (dict) or clear (None) a settings snapshot used instead of st.session_state on this thread."""
+    _TLS.cfg = dict(cfg) if cfg else None
+
+
+def _thread_cfg():
+    return getattr(_TLS, "cfg", None)
+
+
+def _locked(fn):
+    @functools.wraps(fn)
+    def wrapper(*a, **k):
+        with JOURNAL_LOCK:
+            return fn(*a, **k)
+    wrapper.__wrapped__ = fn
+    return wrapper
+
+
 def _paper_cost_bps():
     """Per-side paper-trading cost (Settings -> Paper trading costs). 0 = old behaviour (free, perfect fills)."""
+    _t = _thread_cfg()
+    if _t is not None:
+        try:
+            return max(0.0, float(_t.get("paper_cost_bps", DEFAULT_PAPER_COST_BPS)))
+        except Exception:
+            return DEFAULT_PAPER_COST_BPS
     try:
         return max(0.0, float(st.session_state.get("paper_cost_bps", DEFAULT_PAPER_COST_BPS)))
     except Exception:
@@ -531,9 +565,12 @@ def _obj_col(journal, name):
 def _ladder_cfg():
     cfg = dict(LADDER_DEFAULTS)
     try:
+        _src = _thread_cfg()
+        if _src is None:
+            _src = st.session_state
         for k, v in LADDER_DEFAULTS.items():
-            if k in st.session_state:
-                cfg[k] = type(v)(st.session_state[k]) if not isinstance(v, bool) else bool(st.session_state[k])
+            if k in _src:
+                cfg[k] = type(v)(_src[k]) if not isinstance(v, bool) else bool(_src[k])
     except Exception:
         pass
     return cfg
@@ -738,3 +775,10 @@ def auto_paper_trade_exit(current_price, symbol=None, atr=None, opposite_strong=
     except Exception as exc:
         log_app_error("auto_paper_trade_exit", exc)
         return {"closed": 0, "partial": 0, "updated": 0}
+
+
+# Serialise every journal writer (page thread and exit worker). Must stay at the end of the module.
+for _n in ("add_trade_to_journal", "close_paper_position", "_paper_partial_exit", "auto_paper_trade_exit",
+           "sync_open_position_auto_exit", "paper_trade_entry"):
+    if _n in globals() and not hasattr(globals()[_n], "__wrapped__"):
+        globals()[_n] = _locked(globals()[_n])
