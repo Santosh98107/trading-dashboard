@@ -84,6 +84,10 @@ try:
     import exit_worker as exw       # background Auto-Exit executor (paper trades); optional file
 except Exception:
     exw = None
+try:
+    import trade_health as thl      # Exit Score / Trend Health (optional file)
+except Exception:
+    thl = None
 import inspect as _inspect
 
 
@@ -128,7 +132,7 @@ def _ec_export(mod):
 
 _install_streamlit_compat()
 # Visible deployment marker: confirms which source file Streamlit Cloud is running.
-APP_BUILD_ID = "2026-11-17-BGEXIT"
+APP_BUILD_ID = "2026-11-17-HEALTH"
 # Optional integrations: Yahoo mode must still start if Angel SDK/TOTP or
 # the auto-refresh helper is not installed.
 try:
@@ -7952,8 +7956,21 @@ with st.expander("Profit ladder (stops profit turning into loss)"):
     st.checkbox("Time stop: close a trade that has not reached T1 and has weak profit", value=False, key="pl_time_stop_on",
                 help="Candle limits: 1m 20, 3m 15, 5m 12, 10m 10, 15m 8, other 8.")
     st.number_input("Weak profit means below (R)", 0.0, 2.0, 0.5, 0.05, key="pl_weak_r")
-    st.caption("Starting numbers are my choices, not tested on your data. Compare ON vs OFF in paper for 1-2 weeks. Price is checked only when the page refreshes, "
-               "so the stop can trigger late until an always-on worker exists. Applies to auto-exit paper trades only.")
+    st.caption("Starting numbers are my choices, not tested on your data. Compare ON vs OFF in paper for 1-2 weeks. The background exit worker (if ON) checks the stop about every 15 s "
+               "while the app server is awake; otherwise only on page refresh. Applies to auto-exit paper trades only.")
+
+with st.expander("Trend-ride exit (Exit Score, EMA20 trail, SuperTrend)"):
+    st.checkbox("Turn Trend-ride mode ON for auto-exit paper trades", value=False, key="tr_ride_on",
+                help="OFF (default) = Trend Health and Exit Score are shown as advice only and exits work exactly as before. "
+                     "ON = for Auto Exit trades the stop is tightened by the Exit Score reading (EMA20 trail, breakeven, last swing) and the trade is closed on "
+                     "Exit Recommended (Exit Score above the limit, structure break or SuperTrend against). Stops only ever tighten. The initial ATR stop is unchanged.")
+    st.checkbox("Also skip the fixed T1 / T2 / T3 scale-outs while a fresh reading manages the trade", value=False, key="tr_ride_no_targets",
+                help="ON = no partial exits at T1/T2/T3; the trade ends by trailing stop or Exit Recommended. OFF = targets work as before.")
+    th1, th2 = st.columns(2)
+    th1.number_input("Hold below this Exit Score", 10.0, 60.0, 40.0, 1.0, key="th_hold_max")
+    th2.number_input("Exit Recommended at / above", 50.0, 95.0, 70.0, 1.0, key="th_exit_min")
+    st.caption("Needs trade_health.py. A reading older than 10 minutes is ignored. The background worker computes its own reading from Yahoo 1-minute candles, "
+               "so Trend-ride works without a page open (server awake). Starting numbers are design choices, not tested on your data - compare in paper first.")
 
 with st.expander("Paper stop distance"):
     st.checkbox("Use a timeframe-aware minimum stop for manual paper orders", value=True, key="paper_tf_floor",
@@ -9373,6 +9390,54 @@ if not open_paper.empty:
         side_now = str(pos.get("Side", pos.get("Signal", "BUY"))).upper()
         unrealized_selected += _paper_side_pnl(float(pos["EntryPrice"]), float(current_display_price), qty_now, side_now)
 
+def _ec_assess(df, side, entry=None):
+    """Trend Health / Exit Score reading for the current candles. {"ok": False} when unavailable."""
+    if thl is None:
+        return {"ok": False, "reason": "trade_health.py is not uploaded"}
+    try:
+        h = thl.assess(df, side, entry=entry, cfg={"hold_max": float(st.session_state.get("th_hold_max", 40.0)),
+                                                   "exit_min": float(st.session_state.get("th_exit_min", 70.0))}, history=5)
+        h["ts"] = pytime.time()
+        return h
+    except Exception as exc:
+        log_app_error("trade_health", exc)
+        return {"ok": False, "reason": str(exc)}
+
+
+def _ec_health_strip(label, values):
+    return f"{label}: " + " → ".join(str(v) for v in values)
+
+
+def _ec_render_health(h, side, entry=None, stop=None, show_levels=True):
+    """One compact Trend Health card (used at signal time and on every open position)."""
+    if not h.get("ok"):
+        st.caption("Trend Health: " + str(h.get("reason", "not available")))
+        return
+    up = str(side).upper() == "BUY"
+    c1, c2, c3, c4 = st.columns(4)
+    if entry is not None:
+        c1.metric("Entry", round(float(entry), 2))
+    c2.metric("Bullish Above" if up else "Bearish Below", round(h["valid_level"], 2))
+    c3.metric("Trend Health", f"{h['health']}%")
+    c4.metric("Exit Score", f"{h['score']} / 100")
+    st.markdown(f"**{h['label']}** — {h['message']}" + (f"  \n_Reason: {h['exit_reason']}_" if h.get("exit_reason") else ""))
+    if h.get("history"):
+        st.caption(_ec_health_strip("Trend Health", [x["health"] for x in h["history"]]) + "   |   "
+                   + _ec_health_strip("Exit Score", [x["score"] for x in h["history"]]) + "   (oldest → latest bar)")
+    if show_levels and stop is not None and thl is not None:
+        try:
+            sug = thl.suggest_stop(side, float(entry if entry is not None else h["price"]), float(stop), float(h["price"]), h["levels"], h["state"],
+                                   2.0 * float(entry if entry is not None else h["price"]) * float(st.session_state.get("paper_cost_bps", 2.0)) / 1e4)
+            st.caption(f"Suggested tighter stop: ₹{sug:,.2f}" if sug is not None else "Suggested stop: current stop is already tighter or no safe level yet.")
+        except Exception:
+            pass
+    with st.expander("How this score was made"):
+        comp = h["components"]
+        st.write({k: ("n/a (feed has no volume)" if v is None else f"{v}% danger") for k, v in comp.items()})
+        st.caption("Weights: Momentum 30%, Trend 25%, Volume 20%, Structure 15%, Volatility 10% (volume is left out when the feed has none, e.g. Yahoo indices). "
+                   "0-40 hold · 40-70 protect · 70+ exit, or a structure break / SuperTrend flip. Starting values, not fitted to your data.")
+
+
 paper_auto_exit_enabled = render_paper_exit_mode_selector()
 
 # The selected mode immediately arms or disarms every open virtual position.
@@ -9386,7 +9451,20 @@ if paper_auto_exit_enabled:
             _opp_strong = "buy" if "BUY" in _st_txt else "sell"
     except Exception:
         _opp_strong = None
-    auto_result = _call_compat(auto_paper_trade_exit, current_display_price, symbol=selected, atr=analysis.get("atr"), opposite_strong=_opp_strong)
+    _ec_health_map = {}
+    try:
+        if st.session_state.get("tr_ride_on", False) and thl is not None and paper_journal is not None and not paper_journal.empty:
+            _om = paper_journal["Status"].astype(str).str.upper().eq("OPEN") & paper_journal["Symbol"].astype(str).eq(str(selected))
+            for _, _pr in paper_journal[_om].iterrows():
+                if str(_pr.get("Timeframe", "")) == str(timeframe):
+                    _sd = str(_pr.get("Side", _pr.get("Signal", "BUY"))).upper()
+                    _hh = _ec_assess(data, _sd)
+                    if _hh.get("ok"):
+                        _ec_health_map[f"{_sd}|{timeframe}"] = _hh
+    except Exception as _he:
+        log_app_error("trend_ride_health", _he)
+    auto_result = _call_compat(auto_paper_trade_exit, current_display_price, symbol=selected, atr=analysis.get("atr"), opposite_strong=_opp_strong,
+                               health=_ec_health_map or None)
     if auto_result.get("closed", 0) or auto_result.get("partial", 0):
         st.success(
             f"Auto-exit manager: {auto_result.get('closed', 0)} position(s) fully closed; "
@@ -9439,6 +9517,15 @@ with pm7:
 
 st.markdown(f"**Suggested plan direction:** {plan_side} / {'LONG' if plan_side == 'BUY' else 'SHORT'}  ·  **Current signal:** {analysis['signal_text']}")
 st.caption("When the signal is NO TRADE, the levels below are an ATR-based paper-planning reference only; they do not convert the signal into a live recommendation.")
+try:
+    _sig_t = str(analysis.get("signal_type", "")).lower()
+    _h_side = "BUY" if _sig_t == "buy" else "SELL" if _sig_t == "sell" else plan_side
+    with st.expander(f"📈 Trend Health & Exit Score — {_h_side} plan" + ("" if _sig_t in ("buy", "sell") else " (no live signal; reference only)"), expanded=(_sig_t in ("buy", "sell"))):
+        _ec_render_health(_ec_assess(data, _h_side, entry=current_display_price), _h_side, entry=current_display_price, show_levels=False)
+        st.caption("Exit Score rising across bars (e.g. 24 → 31 → 42 → 61) means the trend is fading. This card is advice; it does not place or close anything.")
+except Exception as _hc_err:
+    log_app_error("trend_health_signal_card", _hc_err)
+
 pl1, pl2, pl3, pl4, pl5, pl6 = st.columns(6)
 with pl1:
     st.metric("Suggested Entry", round(paper_plan["entry"], 2))
@@ -9509,7 +9596,7 @@ if buy_clicked or sell_clicked:
             st.error("Insufficient virtual cash or paper-state write failed.")
 
 st.markdown("**Open paper positions**")
-st.caption("Auto Exit mode: the currently selected symbol is checked on each Streamlit rerun/auto-refresh for stop loss, trailing stop and T1/T2/T3. Keep Auto Refresh ON and keep that symbol selected. Manual Exit mode disables automatic exits; the CLOSE control remains available for every open position. This is a paper simulator, not a background execution service.")
+st.caption("Auto Exit mode: stop loss, trailing stop and T1/T2/T3 are checked on every page refresh AND, if the Background exit worker is ON (Settings), every ~15 seconds on the server during NSE hours even when no page is open. The worker needs the app server to be awake and uses Yahoo prices, so it is not a broker execution service. Manual Exit mode disables automatic exits; the CLOSE control remains available for every open position. Paper simulator only.")
 if open_paper.empty:
     st.info("No open paper positions. Use BUY / LONG or SELL / SHORT to open a virtual position.")
 else:
@@ -9554,6 +9641,19 @@ else:
                         st.rerun()
                     else:
                         st.error(close_message)
+            try:
+                if pos_symbol == str(selected):
+                    _pos_tf = str(pos.get("Timeframe", ""))
+                    _ph = _ec_assess(data, pos_side, entry=pos_entry)
+                    _ec_render_health(_ph, pos_side, entry=pos_entry, stop=float(pos.get("TrailingStop", pos.get("StopLoss", 0)) or 0))
+                    _ride = bool(st.session_state.get("tr_ride_on", False))
+                    st.caption(("Trend-ride mode is ON: the trail and an EXIT reading act on this trade (Auto Exit trades only)." if _ride else
+                                "Advice only - Trend-ride mode is OFF (Settings → Trend-ride exit), so nothing here closes or moves your stop.")
+                               + (f" Candles shown are {timeframe}; this trade was opened on {_pos_tf}." if _pos_tf and _pos_tf != str(timeframe) else ""))
+                else:
+                    st.caption("Select this symbol to see its Trend Health and Exit Score.")
+            except Exception as _ph_err:
+                log_app_error("trend_health_position_card", _ph_err)
 
 st.markdown("**Paper trade history**")
 if paper_journal.empty:
