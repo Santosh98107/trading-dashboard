@@ -337,14 +337,50 @@ def _paper_bool(value, default=False):
 
 
 
+_EXIT_MODES = ("Manual Exit", "Auto Exit (Enabled)")
+
+
+def _mode_from_open_positions():
+    """The mode the open paper trades are already in (their AutoExitEnabled flag is saved in the journal), or None if nothing is open."""
+    try:
+        j = load_journal()
+        if j is None or j.empty or "AutoExitEnabled" not in j.columns:
+            return None
+        open_rows = j[j["Status"].astype(str).str.upper().eq("OPEN")]
+        if open_rows.empty:
+            return None
+        flags = open_rows["AutoExitEnabled"].map(lambda v: _paper_bool(v, False))
+        return "Auto Exit (Enabled)" if bool(flags.all()) else "Manual Exit"
+    except Exception:
+        return None
+
+
+def paper_auto_exit_active():
+    """True when Auto Exit is the chosen mode AND there is at least one open paper trade for it to manage.
+    Same remembered choice as the selector, so it can be asked before the selector is drawn."""
+    try:
+        mode = st.session_state.get("paper_exit_mode_saved") or st.session_state.get("paper_exit_mode") or _mode_from_open_positions()
+        if mode != "Auto Exit (Enabled)":
+            return False
+        j = load_journal()
+        return bool(j is not None and not j.empty and j["Status"].astype(str).str.upper().eq("OPEN").any())
+    except Exception:
+        return False
+
+
 def render_paper_exit_mode_selector():
-    """Offer an explicit Manual or Auto Exit mode; Manual is the safe default."""
-    valid_modes = {"Manual Exit", "Auto Exit (Enabled)"}
-    if st.session_state.get("paper_exit_mode") not in valid_modes:
-        st.session_state["paper_exit_mode"] = "Manual Exit"
+    """Offer an explicit Manual or Auto Exit mode; Manual is the default for a brand-new session.
+    The choice is remembered outside the widget: Streamlit forgets a widget's value on any run where the widget is not drawn
+    (page switch, interrupted or failed run), which used to flip Auto Exit back to Manual by itself. If the remembered
+    value is gone too (new browser session), the mode is taken from the open trades' own saved flag."""
+    if st.session_state.get("paper_exit_mode") not in _EXIT_MODES:
+        remembered = st.session_state.get("paper_exit_mode_saved")
+        if remembered not in _EXIT_MODES:
+            remembered = _mode_from_open_positions() or "Manual Exit"
+        st.session_state["paper_exit_mode"] = remembered
     mode = st.radio(
         "Exit Management Mode",
-        options=["Manual Exit", "Auto Exit (Enabled)"],
+        options=list(_EXIT_MODES),
         horizontal=True,
         key="paper_exit_mode",
         help=(
@@ -353,6 +389,7 @@ def render_paper_exit_mode_selector():
             "and may scale out at targets or close at stop/trailing stop."
         ),
     )
+    st.session_state["paper_exit_mode_saved"] = mode
     enabled = mode == "Auto Exit (Enabled)"
     if enabled:
         st.success("AUTO EXIT ENABLED — keep Auto Refresh ON and keep the position's symbol selected.")
