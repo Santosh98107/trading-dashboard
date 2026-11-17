@@ -77,7 +77,44 @@ def _open_auto_symbols():
     return sorted(set(j.loc[m, "Symbol"].astype(str)))
 
 
-def tick(price_fn=None, now=None, force=False):
+def _open_auto_keys():
+    """{symbol: {(side, timeframe), ...}} for open Auto Exit rows."""
+    j = load_journal()
+    out = {}
+    if j is None or j.empty or "AutoExitEnabled" not in j.columns:
+        return out
+    m = j["Status"].astype(str).str.upper().eq("OPEN") & j["AutoExitEnabled"].map(lambda v: rm._paper_bool(v, False))
+    for _, r in j[m].iterrows():
+        side = str(r.get("Side", r.get("Signal", "BUY"))).upper()
+        out.setdefault(str(r.get("Symbol", "")), set()).add((side, str(r.get("Timeframe", ""))))
+    return out
+
+
+def build_health(ticker, keys, settings, candle_fn=None):
+    """Trend-health readings for the open (side, timeframe) pairs of one symbol. Only used when Trend-ride mode is ON."""
+    out = {}
+    try:
+        import trade_health as th
+        if candle_fn is None:
+            from price_feed import fetch_candles as candle_fn
+        cfg = {"hold_max": float(settings.get("th_hold_max", 40.0)), "exit_min": float(settings.get("th_exit_min", 70.0))}
+        for side, tf in keys:
+            mins = rm.TF_MINUTES.get(tf)
+            if not mins:
+                continue
+            df = candle_fn(ticker, mins)
+            if df is None:
+                continue
+            h = th.assess(df, side, cfg=cfg, history=5)
+            if h.get("ok"):
+                h["ts"] = time.time()
+                out[f"{side}|{tf}"] = h
+    except Exception as exc:
+        log_app_error("exit_worker_health", exc)
+    return out
+
+
+def tick(price_fn=None, now=None, force=False, candle_fn=None):
     """One pass. price_fn(ticker) -> {"price", "age"} or None. Returns a small summary dict (also used by tests)."""
     cfg = _cfg()
     out = {"checked": 0, "closed": 0, "partial": 0, "skipped": "", "symbols": []}
@@ -99,6 +136,7 @@ def tick(price_fn=None, now=None, force=False):
     if price_fn is None:
         from price_feed import fetch_last_price as price_fn
     rm.set_thread_cfg(cfg["settings"])
+    _keys = _open_auto_keys() if cfg["settings"].get("tr_ride_on") else {}
     try:
         for sym in symbols:
             ticker = cfg["symbol_map"].get(sym)
@@ -114,7 +152,10 @@ def tick(price_fn=None, now=None, force=False):
                 _event(f"{sym}: price is {int(age)}s old - not used")
                 continue
             out["checked"] += 1
-            res = rm.auto_paper_trade_exit(q["price"], symbol=sym, atr=None)
+            _health = None
+            if cfg["settings"].get("tr_ride_on"):
+                _health = build_health(ticker, _keys.get(sym, set()), cfg["settings"], candle_fn)
+            res = rm.auto_paper_trade_exit(q["price"], symbol=sym, atr=None, health=_health)
             c, p = int(res.get("closed", 0)), int(res.get("partial", 0))
             out["closed"] += c
             out["partial"] += p
