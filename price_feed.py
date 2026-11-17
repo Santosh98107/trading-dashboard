@@ -52,3 +52,46 @@ def fetch_last_price(ticker, timeout=(3, 6)):
         except Exception:
             continue
     return None
+
+
+def parse_candles(payload):
+    """Pure parser (unit-tested): Yahoo chart payload -> DataFrame[Open, High, Low, Close, Volume] or None."""
+    try:
+        import pandas as pd
+        res = (payload.get("chart", {}).get("result") or [None])[0]
+        q = res["indicators"]["quote"][0]
+        df = pd.DataFrame({"Open": q["open"], "High": q["high"], "Low": q["low"], "Close": q["close"],
+                           "Volume": q.get("volume") or [0] * len(q["close"])},
+                          index=pd.to_datetime(res["timestamp"], unit="s"))
+        df = df.dropna(subset=["High", "Low", "Close"])
+        return df if len(df) else None
+    except Exception:
+        return None
+
+
+_CANDLE_CACHE = {}
+
+
+def fetch_candles(ticker, tf_minutes, max_age=45, timeout=(3, 8)):
+    """1-minute candles (last 5 days) resampled to tf_minutes. Cached for `max_age` seconds. None on failure."""
+    key = (str(ticker), int(tf_minutes))
+    hit = _CANDLE_CACHE.get(key)
+    if hit and time.time() - hit[0] < max_age:
+        return hit[1]
+    for host in ("query1.finance.yahoo.com", "query2.finance.yahoo.com"):
+        try:
+            r = requests.get(f"https://{host}/v8/finance/chart/{quote(str(ticker), safe='^.-')}",
+                             params={"range": "5d", "interval": "1m", "includePrePost": "false"}, headers=_HEADERS, timeout=timeout)
+            if r.status_code != 200:
+                continue
+            df = parse_candles(r.json())
+            if df is None:
+                continue
+            if int(tf_minutes) > 1:
+                df = df.resample(f"{int(tf_minutes)}min").agg({"Open": "first", "High": "max", "Low": "min", "Close": "last",
+                                                             "Volume": "sum"}).dropna(subset=["Close"])
+            _CANDLE_CACHE[key] = (time.time(), df)
+            return df
+        except Exception:
+            continue
+    return None
