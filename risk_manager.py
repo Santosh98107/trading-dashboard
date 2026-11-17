@@ -11,6 +11,11 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+try:
+    import trade_health        # optional: Exit Score / trend-ride mode
+except Exception:
+    trade_health = None
+
 from database import *   # noqa: F401,F403  (paths, load_/save_ helpers, ist_now, now_str, log_app_error ...)
 
 
@@ -549,7 +554,12 @@ LADDER_DEFAULTS = {
     "pl_opp_exit_on": False,  # strong opposite signal: exit half of what is left
     "pl_time_stop_on": False,
     "pl_weak_r": 0.5,         # time stop only when open profit is below this many R
+    "tr_ride_on": False,          # Trend-ride mode: trail by EMA20 / swing, exit on Exit Score > limit, structure break or SuperTrend flip
+    "tr_ride_no_targets": False,  # ... and do not scale out at fixed T1/T2/T3 (only while a fresh health reading exists)
+    "th_hold_max": 40.0,          # Exit Score below this = hold
+    "th_exit_min": 70.0,          # Exit Score at/above this = exit recommended
 }
+HEALTH_MAX_AGE_SEC = 600
 TIME_STOP_CANDLES = {"1m": 20, "3m": 15, "5m": 12, "10m": 10, "15m": 8}
 TF_MINUTES = {"1m": 1, "3m": 3, "5m": 5, "10m": 10, "15m": 15, "30m": 30}
 
@@ -615,9 +625,34 @@ def _time_stop_due(row, price, risk, cfg):
         return False
 
 
-def auto_paper_trade_exit(current_price, symbol=None, atr=None, opposite_strong=None):
+def _ride_health_for(health, row):
+    """Pick the fresh trend-health reading that matches this journal row (key 'BUY|3m'), or None."""
+    try:
+        if not health:
+            return None
+        h = health.get(f"{str(row.get('Side', row.get('Signal', 'BUY'))).upper()}|{row.get('Timeframe', '')}")
+        if not h or not h.get("ok") or "levels" not in h:
+            return None
+        import time as _t
+        if _t.time() - float(h.get("ts", 0)) > HEALTH_MAX_AGE_SEC:
+            return None
+        return h
+    except Exception:
+        return None
+
+
+def _trade_age_minutes(row):
+    try:
+        t0 = datetime.strptime(str(row.get("DateTime")), "%d-%m-%Y %H:%M:%S")
+        return (ist_now().replace(tzinfo=None) - t0).total_seconds() / 60.0
+    except Exception:
+        return 0.0
+
+
+def auto_paper_trade_exit(current_price, symbol=None, atr=None, opposite_strong=None, health=None):
     """Auto-manage only the currently selected symbol; scale out at T1/T2 and close at T3/SL.
-    opposite_strong: "buy" / "sell" when the live signal is a STRONG one of that side (used only by the optional profit ladder)."""
+    opposite_strong: "buy" / "sell" when the live signal is a STRONG one of that side (used only by the optional profit ladder).
+    health: {"BUY|3m": trade_health.assess(...) + {"ts"}} - used only when the optional Trend-ride mode is ON."""
     try:
         price = float(current_price)
         if not np.isfinite(price) or price <= 0:
@@ -678,6 +713,20 @@ def auto_paper_trade_exit(current_price, symbol=None, atr=None, opposite_strong=
                         journal.at[idx, "LockStage"] = _stage
                 except Exception as _le:
                     log_app_error("profit_ladder", _le)
+            # Optional Trend-ride mode: EMA20 / swing trail from the Exit Score reading. Tighten-only, only with a fresh reading.
+            _h = None
+            _tstage = ""
+            if _cfg.get("tr_ride_on") and trade_health is not None:
+                _h = _ride_health_for(health, row)
+                if _h is not None:
+                    try:
+                        _sg = trade_health.suggest_stop(side, entry, new_trail, price, _h["levels"], _h["state"],
+                                                        2.0 * entry * _paper_cost_bps() / 1e4)
+                        if _sg is not None:
+                            new_trail = max(new_trail, _sg) if is_long else min(new_trail, _sg)
+                            _tstage = _h["state"]
+                    except Exception as _te:
+                        log_app_error("trend_ride_trail", _te)
             journal.at[idx, "TrailingStop"] = new_trail
             journal.at[idx, "LastPrice"] = price
             journal.at[idx, "LastUpdateTime"] = now_str()
@@ -687,8 +736,15 @@ def auto_paper_trade_exit(current_price, symbol=None, atr=None, opposite_strong=
             effective_stop = max(stop_loss, new_trail) if is_long else min(stop_loss, new_trail)
             stop_hit = price <= effective_stop if is_long else price >= effective_stop
             if stop_hit:
-                _why = f"Auto Exit — Profit Lock ({_stage})" if _stage else "Auto Exit — Stop Loss / Trailing Stop"
+                _why = (f"Auto Exit — Profit Lock ({_stage})" if _stage
+                        else f"Auto Exit — Trend Trail ({_tstage})" if _tstage else "Auto Exit — Stop Loss / Trailing Stop")
                 ok, _ = close_paper_position(idx, price, _why)
+                if ok:
+                    closed_count += 1
+                continue
+
+            if _h is not None and _h.get("state") == "EXIT" and _trade_age_minutes(row) >= TF_MINUTES.get(str(row.get("Timeframe", "5m")), 5):
+                ok, _ = close_paper_position(idx, price, f"Auto Exit — Trend exit ({_h.get('exit_reason') or 'Exit Score'})")
                 if ok:
                     closed_count += 1
                 continue
@@ -724,6 +780,8 @@ def auto_paper_trade_exit(current_price, symbol=None, atr=None, opposite_strong=
                 ("T2_Hit", "Target2", 0.33),
                 ("T3_Hit", "Target3", 1.00),
             ]
+            if _h is not None and _cfg.get("tr_ride_no_targets"):
+                target_specs = []                     # trend-ride: no fixed T1/T2/T3 scale-outs while a fresh reading manages the trade
             for flag, target_col, fraction in target_specs:
                 journal = load_journal()
                 if idx not in journal.index or str(journal.at[idx, "Status"]).upper() != "OPEN":
