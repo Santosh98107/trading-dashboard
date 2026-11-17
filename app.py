@@ -124,7 +124,7 @@ def _ec_export(mod):
 
 _install_streamlit_compat()
 # Visible deployment marker: confirms which source file Streamlit Cloud is running.
-APP_BUILD_ID = "2026-11-16-LADDER2"
+APP_BUILD_ID = "2026-11-17-AUTOEXIT"
 # Optional integrations: Yahoo mode must still start if Angel SDK/TOTP or
 # the auto-refresh helper is not installed.
 try:
@@ -7632,9 +7632,23 @@ _ec_pause_on_action = st.checkbox(
     help="Auto refresh keeps running on Dashboard, Market, Signals, Scanner and the other view pages. "
          "On Portfolio, Trade Replay, AI, Research, Reports and Settings it waits, so a click is never cancelled by the timer."
 )
-_ec_timer_paused = bool(_ec_pause_on_action and _ec_active in _EC_ACTION_PAGES)
+_ec_keep_for_exits = st.checkbox(
+    "Keep auto refresh running while Auto Exit has open paper trades (stops and targets need it)", value=True, key="ec_keep_refresh_for_auto_exit",
+    help="Auto Exit only checks prices when the page refreshes. If the timer is paused on Portfolio, an open trade is not watched there. "
+         "ON (default): the timer keeps running on action pages while Auto Exit has open trades. OFF: the pause above always applies."
+)
+_ec_auto_needs_timer = False
+try:
+    _pa = globals().get("paper_auto_exit_active")
+    _ec_auto_needs_timer = bool(_ec_keep_for_exits and _pa is not None and _pa())
+except Exception:
+    _ec_auto_needs_timer = False
+_ec_timer_paused = bool(_ec_pause_on_action and _ec_active in _EC_ACTION_PAGES and not _ec_auto_needs_timer)
 if _ec_timer_paused and auto_refresh:
     st.caption("⏸ Auto refresh is paused on this page so your clicks are not interrupted. Stops and targets are re-checked on every click and on the view pages.")
+elif _ec_auto_needs_timer and _ec_active in _EC_ACTION_PAGES and auto_refresh:
+    st.caption("🔁 Auto refresh keeps running here because Auto Exit has open paper trades. If a button click does not register, press it again, "
+               "or switch to Manual Exit.")
 if auto_refresh and AUTO_REFRESH_AVAILABLE and not _ec_timer_paused:
     st_autorefresh(interval=refresh_seconds * 1000, key="elite_live_market_board_refresh")
 
