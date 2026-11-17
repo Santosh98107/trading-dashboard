@@ -80,6 +80,10 @@ try:
     import background_jobs as bgj   # slow scanner / ranking work runs here, off the page
 except Exception:
     bgj = None
+try:
+    import exit_worker as exw       # background Auto-Exit executor (paper trades); optional file
+except Exception:
+    exw = None
 import inspect as _inspect
 
 
@@ -124,7 +128,7 @@ def _ec_export(mod):
 
 _install_streamlit_compat()
 # Visible deployment marker: confirms which source file Streamlit Cloud is running.
-APP_BUILD_ID = "2026-11-17-AUTOEXIT"
+APP_BUILD_ID = "2026-11-17-BGEXIT"
 # Optional integrations: Yahoo mode must still start if Angel SDK/TOTP or
 # the auto-refresh helper is not installed.
 try:
@@ -7436,6 +7440,21 @@ def _ec_render_system_health(analysis, data):
     except Exception as _dq_err:
         log_app_error("data_quality_panel", _dq_err)
     try:
+        if exw is not None:
+            with st.expander("Background exit worker (Auto Exit without refresh)", expanded=False):
+                _hb = exw.heartbeat_age()
+                _alive = exw.is_alive()
+                st.write(f"Thread alive: **{_alive}** · Market hours now: **{exw.market_open()}** · Last check: **{exw.STATUS['last_tick'] or '-'}**"
+                         f" ({'-' if _hb is None else str(int(_hb)) + 's ago'}) · Note: {exw.STATUS['last_note']}")
+                st.write(f"Checks: {exw.STATUS['ticks']} · Auto exits: {exw.STATUS['exits']} · Scale-outs: {exw.STATUS['partials']}"
+                         + (f" · Last error: {exw.STATUS['last_error']}" if exw.STATUS["last_error"] else ""))
+                if exw.EVENTS:
+                    st.dataframe(pd.DataFrame({"Recent worker events": list(exw.EVENTS)}), use_container_width=True, hide_index=True)
+                st.caption("Paper trades only. Runs while the server process is awake; Yahoo price may lag the exchange; exit happens at the price "
+                           "the worker saw, which can be beyond the exact stop level in a fast move.")
+    except Exception as _wk_panel_err:
+        log_app_error("exit_worker_panel", _wk_panel_err)
+    try:
         if bgj is not None:
             _bg = [(k, bgj.peek(k)) for k in ("nifty30", "opps", "opps_idx")]
             with st.expander("Background jobs (scanner / opportunities)"):
@@ -7637,6 +7656,23 @@ _ec_keep_for_exits = st.checkbox(
     help="Auto Exit only checks prices when the page refreshes. If the timer is paused on Portfolio, an open trade is not watched there. "
          "ON (default): the timer keeps running on action pages while Auto Exit has open trades. OFF: the pause above always applies."
 )
+_ec_bg_exit_on = st.checkbox(
+    "🤖 Background exit worker (checks Auto Exit trades every ~15 s, even if no page refreshes)", value=True, key="ec_bg_exit_worker",
+    help="A background thread on the server watches open paper trades that have Auto Exit ON and exits them at stop / trailing stop / "
+         "targets using the latest Yahoo price, during NSE hours (Mon-Fri 09:10-15:35 IST). It works only while the app server is awake."
+)
+try:
+    if exw is not None:
+        _ec_wk_settings = {"paper_cost_bps": float(st.session_state.get("paper_cost_bps", DEFAULT_PAPER_COST_BPS))}
+        for _k in LADDER_DEFAULTS:
+            if _k in st.session_state:
+                _ec_wk_settings[_k] = st.session_state[_k]
+        _ec_wk_map = dict(stocks)
+        _ec_wk_map.update(globals().get("INDEX_OPP_UNIVERSE", {}) or {})
+        exw.update_config(enabled=_ec_bg_exit_on, interval=15, symbol_map=_ec_wk_map, settings=_ec_wk_settings)
+        exw.ensure_started()
+except Exception as _wk_err:
+    log_app_error("exit_worker_config", _wk_err)
 _ec_auto_needs_timer = False
 try:
     _pa = globals().get("paper_auto_exit_active")
