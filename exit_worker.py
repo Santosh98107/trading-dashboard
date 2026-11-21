@@ -27,6 +27,10 @@ MAX_QUOTE_AGE_SEC = 600                 # refuse a quote older than 10 minutes (
 MARKET_OPEN = (9, 10)                   # IST, small buffer around 09:15
 MARKET_CLOSE = (15, 35)                 # IST, small buffer around 15:30
 
+_KEEP = object()
+EXTERNAL_PRICE_MAX_AGE = 30          # seconds: a broker price pushed by an open page is preferred over Yahoo while it is this fresh
+_EXT = {}
+_NOTIFY = {"token": "", "chat_id": ""}
 _LOCK = threading.Lock()
 _CFG = {"enabled": True, "interval": DEFAULT_INTERVAL, "symbol_map": {}, "settings": {}, "ignore_hours": False}
 STATUS = {"running": False, "started": None, "last_tick": None, "last_note": "not started",
@@ -44,8 +48,39 @@ def market_open(now=None):
     return MARKET_OPEN <= hm <= MARKET_CLOSE
 
 
-def update_config(enabled=True, interval=DEFAULT_INTERVAL, symbol_map=None, settings=None, ignore_hours=False):
+def set_external_price(symbol, price, source="broker"):
+    """The page calls this with the broker/WebSocket price it already has. The worker prefers it while it is fresh."""
+    try:
+        p = float(price)
+        if p > 0:
+            _EXT[str(symbol)] = (p, time.time(), str(source))
+    except Exception:
+        pass
+
+
+def _external_quote(symbol):
+    hit = _EXT.get(str(symbol))
+    if hit and time.time() - hit[1] <= EXTERNAL_PRICE_MAX_AGE:
+        return {"price": hit[0], "age": time.time() - hit[1], "source": hit[2]}
+    return None
+
+
+def _notify(text):
+    """Optional Telegram message (token stays in memory only). Never raises."""
+    try:
+        tok, chat = _NOTIFY.get("token"), _NOTIFY.get("chat_id")
+        if tok and chat:
+            import requests
+            requests.post(f"https://api.telegram.org/bot{tok}/sendMessage", data={"chat_id": chat, "text": text}, timeout=8)
+    except Exception:
+        pass
+
+
+def update_config(enabled=True, interval=DEFAULT_INTERVAL, symbol_map=None, settings=None, ignore_hours=False, notify=_KEEP):
     """Called by the page on every run so the worker always has the latest Settings (the thread cannot see session_state)."""
+    if notify is not _KEEP:
+        _NOTIFY["token"] = str((notify or {}).get("token", "") or "")
+        _NOTIFY["chat_id"] = str((notify or {}).get("chat_id", "") or "")
     with _LOCK:
         _CFG["enabled"] = bool(enabled)
         _CFG["interval"] = max(5, int(interval or DEFAULT_INTERVAL))
@@ -143,7 +178,7 @@ def tick(price_fn=None, now=None, force=False, candle_fn=None):
             if not ticker:
                 _event(f"{sym}: no price source mapped - skipped")
                 continue
-            q = price_fn(ticker)
+            q = _external_quote(sym) or price_fn(ticker)
             if not q or not q.get("price"):
                 _event(f"{sym}: price unavailable - will retry")
                 continue
@@ -159,12 +194,15 @@ def tick(price_fn=None, now=None, force=False, candle_fn=None):
             c, p = int(res.get("closed", 0)), int(res.get("partial", 0))
             out["closed"] += c
             out["partial"] += p
+            _src = q.get("source", "Yahoo")
             if c:
                 STATUS["exits"] += c
-                _event(f"{sym}: position CLOSED by Auto Exit at ~{q['price']:.2f}")
+                _event(f"{sym}: position CLOSED by Auto Exit at ~{q['price']:.2f} ({_src})")
+                _notify(f"[Paper] {sym}: position CLOSED by Auto Exit at ~{q['price']:.2f} ({_src}). Check Portfolio for the reason and P&L.")
             if p:
                 STATUS["partials"] += p
-                _event(f"{sym}: target scale-out executed (price ~{q['price']:.2f})")
+                _event(f"{sym}: target scale-out executed (price ~{q['price']:.2f}, {_src})")
+                _notify(f"[Paper] {sym}: target scale-out executed at ~{q['price']:.2f} ({_src}).")
     finally:
         rm.set_thread_cfg(None)
     STATUS["ticks"] += 1

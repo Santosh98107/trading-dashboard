@@ -95,3 +95,25 @@ def fetch_candles(ticker, tf_minutes, max_age=45, timeout=(3, 8)):
         except Exception:
             continue
     return None
+
+
+_RESOLVED = {}
+
+
+def resolve_ticker(name, candidates, ok_hours=6, retry_minutes=10):
+    """First candidate Yahoo code that returns a price. Cached; if none works the first one is returned and retried later."""
+    now = time.time()
+    hit = _RESOLVED.get(name)
+    if hit and now < hit[1]:
+        return hit[0]
+    seen = []
+    for c in candidates:
+        if c in seen:
+            continue
+        seen.append(c)
+        q = fetch_last_price(c)
+        if q and q.get("price"):
+            _RESOLVED[name] = (c, now + ok_hours * 3600)
+            return c
+    _RESOLVED[name] = (seen[0] if seen else name, now + retry_minutes * 60)
+    return _RESOLVED[name][0]

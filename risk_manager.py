@@ -835,6 +835,72 @@ def auto_paper_trade_exit(current_price, symbol=None, atr=None, opposite_strong=
         return {"closed": 0, "partial": 0, "updated": 0}
 
 
+# --- cooldown after an exit and the "close all & halt" kill switch ----------------------------------------------
+def cooldown_check(symbol, side, minutes=None, journal=None):
+    """(ok, message). Blocks a NEW entry in the same symbol and direction for `minutes` after that kind of trade was closed.
+    minutes <= 0 (the default, Settings -> Trade timing guard) means OFF."""
+    try:
+        if minutes is None:
+            minutes = float(st.session_state.get("cooldown_min", 0) or 0)
+        minutes = float(minutes)
+        if minutes <= 0:
+            return True, ""
+        j = load_journal() if journal is None else journal
+        if j is None or j.empty or not {"Status", "Symbol", "ExitTime"}.issubset(j.columns):
+            return True, ""
+        side_col = "Side" if "Side" in j.columns else "Signal"
+        m = (j["Status"].astype(str).str.upper() == "CLOSED") & (j["Symbol"].astype(str) == str(symbol)) \
+            & (j[side_col].astype(str).str.upper() == str(side).upper())
+        if not m.any():
+            return True, ""
+        t = pd.to_datetime(j.loc[m, "ExitTime"], format="%d-%m-%Y %H:%M:%S", errors="coerce").dropna()
+        if t.empty:
+            return True, ""
+        gap = (ist_now().replace(tzinfo=None) - t.max().to_pydatetime()).total_seconds() / 60.0
+        if gap < minutes:
+            return False, (f"Cooldown: your last {str(side).upper()} in {symbol} closed {gap:.0f} min ago; wait {minutes - gap:.0f} more min "
+                           f"(Settings -> Trade timing guard -> cooldown).")
+        return True, ""
+    except Exception as exc:
+        log_app_error("cooldown_check", exc)
+        return True, ""
+
+
+def flatten_all_open(price_for=None, reason="Kill switch: close all"):
+    """Close every OPEN paper position. price_for(symbol) -> price or None; falls back to LastPrice, then EntryPrice.
+    Returns (closed_count, messages)."""
+    closed, msgs = 0, []
+    with JOURNAL_LOCK:
+        j = load_journal()
+        if j is None or j.empty or "Status" not in j.columns:
+            return 0, []
+        for idx in list(j.index[j["Status"].astype(str).str.upper() == "OPEN"]):
+            row = j.loc[idx]
+            px = None
+            try:
+                px = price_for(str(row.get("Symbol", ""))) if callable(price_for) else None
+            except Exception:
+                px = None
+            for cand in (px, row.get("LastPrice"), row.get("EntryPrice")):
+                try:
+                    if cand is not None and np.isfinite(float(cand)) and float(cand) > 0:
+                        px = float(cand)
+                        break
+                except Exception:
+                    continue
+            ok, msg = close_paper_position(idx, px, reason)
+            closed += 1 if ok else 0
+            msgs.append(f"{row.get('Symbol')}: {msg}")
+    return closed, msgs
+
+
+def halt_trading(on=True):
+    """Switch new entries off (or back on) through the existing TradingEnabled risk flag."""
+    rs_ = load_risk_state()
+    rs_.loc[0, "TradingEnabled"] = (not on)
+    save_risk_state(rs_)
+
+
 # Serialise every journal writer (page thread and exit worker). Must stay at the end of the module.
 for _n in ("add_trade_to_journal", "close_paper_position", "_paper_partial_exit", "auto_paper_trade_exit",
            "sync_open_position_auto_exit", "paper_trade_entry"):
