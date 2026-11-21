@@ -4276,10 +4276,10 @@ def analyze_signal(
     # Advanced context (shadow mode): shown in the analysis, scoring only if Settings switch is ON (default OFF).
     _af_note = ""
     try:
-        if afe is not None and len(df) >= 30:
+        if afe is not None and st.session_state.get("af_score_on", False) and len(df) >= 30:   # nothing computed while the switch is OFF (keeps scanner/reruns fast)
             _af_df = afe.add_advanced(df)
             _af_note = "; ".join(afe.summarize(_af_df)[:4])
-            if st.session_state.get("af_score_on", False):
+            if True:
                 _afs = afe.score_adjust(_af_df, "BUY", True)
                 if _afs > 0: bullish += _afs; reasons.append(f"Advanced context (+{_afs:.1f} bullish)")
                 elif _afs < 0: bearish += -_afs; reasons.append(f"Advanced context (+{-_afs:.1f} bearish)")
