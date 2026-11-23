@@ -679,6 +679,11 @@ def auto_paper_trade_exit(current_price, symbol=None, atr=None, opposite_strong=
             rem_qty = int(float(row.get("RemainingQty", initial_qty)))
             if rem_qty <= 0:
                 continue
+            # Bad-price guard: an index/stock never moves >30% from entry in a paper session. A quote that far away is a
+            # wrong-symbol / bad-feed price, so it must never close a trade (that created a fake Rs 3.8 lakh loss once).
+            if entry > 0 and "[ikey=" not in str(row.get("Notes", "")) and abs(price / entry - 1.0) > 0.30:   # option premiums legitimately move >30%
+                log_app_error("auto_exit_bad_price", f"{row.get('Symbol')}: price {price} is >30% from entry {entry}; ignored")
+                continue
             row_atr = row.get("ATR", np.nan)
             try:
                 atr_value = float(row_atr) if pd.notna(row_atr) and float(row_atr) > 0 else float(atr or 0.0)
@@ -899,6 +904,54 @@ def halt_trading(on=True):
     rs_ = load_risk_state()
     rs_.loc[0, "TradingEnabled"] = (not on)
     save_risk_state(rs_)
+
+
+def void_trades(indices, reason="voided by user"):
+    """Take wrongly-priced CLOSED trades out of the P&L / risk-lock maths (they become Status=VOID, PnL 0).
+    A copy of the journal is written next to it first, so nothing is lost. Returns (count, message)."""
+    try:
+        import shutil
+        j = load_journal()
+        idx = [i for i in indices if i in j.index and str(j.loc[i, "Status"]).upper() == "CLOSED"]
+        if not idx:
+            return 0, "No CLOSED trades selected."
+        try:
+            shutil.copyfile(JOURNAL_FILE, JOURNAL_FILE.replace(".csv", f"_backup_{ist_now().strftime('%Y%m%d_%H%M%S')}.csv"))
+        except Exception:
+            pass
+        for i in idx:
+            old = f"orig PnL {j.loc[i, 'PnL']}"
+            j.loc[i, "Status"] = "VOID"
+            for c in ("PnL", "RealizedPnL"):
+                if c in j.columns:
+                    j.loc[i, c] = 0.0
+            if "Notes" in j.columns:
+                j.loc[i, "Notes"] = (str(j.loc[i, "Notes"]) + f" | {reason} ({old})").strip(" |")
+        save_journal(j)
+        update_risk_locks()
+        return len(idx), f"{len(idx)} trade(s) voided."
+    except Exception as exc:
+        log_app_error("void_trades", exc)
+        return 0, f"Failed: {exc}"
+
+
+def reset_paper_account(balance=None):
+    """Set cash back to the starting balance. Refused while any position is OPEN (it would orphan its margin)."""
+    try:
+        if get_open_position_count() > 0:
+            return False, "Close all open positions first (use the Kill switch)."
+        st_ = load_paper_state()
+        start = float(balance) if balance else float(st_.loc[0, "InitialBalance"])
+        st_.loc[0, "Balance"] = start
+        st_.loc[0, "UsedMargin"] = 0.0
+        st_.loc[0, "OpenPositions"] = 0
+        st_.loc[0, "InitialBalance"] = start
+        save_paper_state(st_)
+        update_risk_locks()
+        return True, f"Paper balance reset to {start:,.2f}."
+    except Exception as exc:
+        log_app_error("reset_paper_account", exc)
+        return False, f"Failed: {exc}"
 
 
 # Serialise every journal writer (page thread and exit worker). Must stay at the end of the module.

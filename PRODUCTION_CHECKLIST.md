@@ -8,9 +8,12 @@
 | 4 | Kill switch | DONE: "Kill switch" expander closes all open paper positions and halts trading (confirm tick needed). |
 | 5 | Always-on running + alerts | PARTIAL: Telegram alerts on every worker exit; Docker files + DEPLOY_ALWAYS_ON.md. You must host it. |
 | 6 | Better price source | PARTIAL: if a page is open and Angel/Upstox price is live, the worker prefers it (max 30 s old); otherwise Yahoo. Broker calls from background threads were NOT attempted. |
+| 6b | Option premium paper trading | BUILT, default OFF (Settings). Uses Upstox option list + live quote, buy CE/PE only, page must be open for exits. Contract picking/levels/exit flow tested with sample data; real Upstox calls NOT run here - check on 1 lot in paper first. |
 | 7 | Live broker orders | NOT built on purpose: untestable here, real-money risk. order_gateway.py has checks + DryRunBroker only. |
 | 8 | Indicator parity (no look-ahead) | DONE for new indicators (advanced_features.py, tested for parity). Scoring OFF by default. |
 | 9 | Staged rollout (paper -> tiny live -> scale) | YOUR decision. |
 | 10 | SEBI / broker compliance check | YOUR job (algo/API rules, registration). |
 
 Not verified here: live Streamlit run, Yahoo/NSE/broker connectivity, SMALLCAP Yahoo code (^CNXSC), real Telegram delivery.
+
+Also added: bad-price guards (order price must be within 3% of the chart close; auto-exit ignores quotes >30% from entry for index trades), and a 'Repair paper account' tool (void wrong trades, reset balance, edit weekly/monthly limits).

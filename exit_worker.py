@@ -175,10 +175,12 @@ def tick(price_fn=None, now=None, force=False, candle_fn=None):
     try:
         for sym in symbols:
             ticker = cfg["symbol_map"].get(sym)
-            if not ticker:
-                _event(f"{sym}: no price source mapped - skipped")
-                continue
-            q = _external_quote(sym) or price_fn(ticker)
+            q = _external_quote(sym)
+            if q is None:
+                if not ticker:
+                    _event(f"{sym}: no fresh price (option positions need the dashboard page open) - skipped")
+                    continue
+                q = price_fn(ticker)
             if not q or not q.get("price"):
                 _event(f"{sym}: price unavailable - will retry")
                 continue
