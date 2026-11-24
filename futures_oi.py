@@ -85,6 +85,42 @@ def align_oi(data, fut, max_price_gap_pct=3.0):
         return data, False, f"Futures OI alignment failed: {type(exc).__name__}: {exc}"
 
 
+def align_volume(data, fut, max_price_gap_pct=3.0):
+    """Return (data_copy, ok, message). data['FutVolume'] = the futures volume of the SAME candle (exact timestamp match, no fill, no look-ahead).
+    Used only for the optional futures Volume Profile when the chart instrument (an index) has no volume of its own."""
+    try:
+        if data is None or data.empty or fut is None or fut.empty or "Volume" not in fut.columns:
+            return data, False, "No futures volume to align"
+        vol = pd.to_numeric(fut["Volume"], errors="coerce")
+        vol = vol[~vol.index.duplicated(keep="last")].sort_index().clip(lower=0)
+        if (vol > 0).sum() < 5:
+            return data, False, "Futures volume is empty / zero"
+        if "Close" in fut.columns and "Close" in data.columns:
+            fc, dc = float(fut["Close"].dropna().iloc[-1]), float(data["Close"].dropna().iloc[-1])
+            if dc > 0 and abs(fc - dc) / dc * 100 > max_price_gap_pct:
+                return data, False, f"Futures price is {abs(fc - dc) / dc * 100:.1f}% away from the chart price: wrong contract, volume not used"
+        out = data.copy()
+        out["FutVolume"] = vol.reindex(out.index)
+        if not (out["FutVolume"] > 0).any():
+            return data, False, "Futures candles do not line up with the chart candles"
+        return out, True, "ok"
+    except Exception as exc:
+        return data, False, f"Futures volume alignment failed: {type(exc).__name__}: {exc}"
+
+
+def futures_volume_profile(df, calc_fn):
+    """Volume Profile built from price levels of the chart candles weighted by FUTURES volume. calc_fn = institutional calculate_volume_profile.
+    Returns the profile dict (available False when there is not enough real futures volume). Never raises."""
+    try:
+        if df is None or "FutVolume" not in df.columns:
+            return None
+        tmp = df[["Open", "High", "Low", "Close"]].copy()
+        tmp["Volume"] = pd.to_numeric(df["FutVolume"], errors="coerce").fillna(0)
+        return calc_fn(tmp)
+    except Exception:
+        return None
+
+
 def classify(price_pct, oi_pct, min_price_pct=0.03, min_oi_pct=0.2):
     if price_pct is None or oi_pct is None or abs(price_pct) < min_price_pct or abs(oi_pct) < min_oi_pct:
         return "Neutral"
