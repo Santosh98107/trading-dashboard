@@ -1,0 +1,370 @@
+{
+ "a": {
+  "audit": [
+   [
+    "Trend structure (EMA20/50/200, VWAP, SuperTrend)",
+    7.0,
+    1.0
+   ],
+   [
+    "Momentum (RSI, MACD, ADX/DI, Stochastic, EMA slope)",
+    3.0,
+    6.0
+   ],
+   [
+    "Price action (candlestick patterns, Heikin-Ashi, breakout/retest, volume)",
+    1.0,
+    1.0
+   ],
+   [
+    "Higher timeframe + multi-timeframe alignment",
+    0.0,
+    0.0
+   ],
+   [
+    "Options PCR",
+    0.0,
+    0.0
+   ],
+   [
+    "Institutional (structure, liquidity, OB, FVG, volume profile, premium/discount, RS)",
+    2.8,
+    2.0
+   ],
+   [
+    "Macro / geo-political",
+    0.0,
+    0.0
+   ],
+   [
+    "Smart Money (FII / DII cash flows)",
+    0.0,
+    0.0
+   ],
+   [
+    "Option flow (OI change + live Put/Call volume)",
+    0.0,
+    0.0
+   ]
+  ],
+  "n_reasons": 20,
+  "net_score": 3.8,
+  "signal_text": "NO TRADE"
+ },
+ "b": {
+  "audit": [
+   [
+    "Trend structure (EMA20/50/200, VWAP, SuperTrend)",
+    7.0,
+    1.0
+   ],
+   [
+    "Momentum (RSI, MACD, ADX/DI, Stochastic, EMA slope)",
+    0.0,
+    7.0
+   ],
+   [
+    "Price action (candlestick patterns, Heikin-Ashi, breakout/retest, volume)",
+    0.0,
+    1.0
+   ],
+   [
+    "Higher timeframe + multi-timeframe alignment",
+    0.0,
+    0.0
+   ],
+   [
+    "Options PCR",
+    0.0,
+    0.0
+   ],
+   [
+    "Institutional (structure, liquidity, OB, FVG, volume profile, premium/discount, RS)",
+    3.8,
+    2.4
+   ],
+   [
+    "Macro / geo-political",
+    0.0,
+    0.0
+   ],
+   [
+    "Smart Money (FII / DII cash flows)",
+    0.0,
+    0.0
+   ],
+   [
+    "Option flow (OI change + live Put/Call volume)",
+    0.0,
+    0.0
+   ]
+  ],
+  "n_reasons": 20,
+  "net_score": -0.6,
+  "signal_text": "NO TRADE"
+ },
+ "backtests": {
+  "down": {
+   "cols": [
+    "Date",
+    "Time",
+    "Symbol",
+    "Timeframe",
+    "Signal",
+    "Entry"
+   ],
+   "nums": [
+    18.0,
+    2.0,
+    20.0,
+    90.0
+   ],
+   "rows": 20,
+   "sum_num": 2932531.3961
+  },
+  "flat": {
+   "cols": [
+    "Date",
+    "Time",
+    "Symbol",
+    "Timeframe",
+    "Signal",
+    "Entry"
+   ],
+   "nums": [
+    5.0,
+    7.0,
+    12.0,
+    41.67
+   ],
+   "rows": 12,
+   "sum_num": 1791055.0053
+  },
+  "up": {
+   "cols": [
+    "Date",
+    "Time",
+    "Symbol",
+    "Timeframe",
+    "Signal",
+    "Entry"
+   ],
+   "nums": [
+    32.0,
+    8.0,
+    40.0,
+    80.0
+   ],
+   "rows": 40,
+   "sum_num": 6148739.7796
+  }
+ },
+ "c": {
+  "audit": [
+   [
+    "Trend structure (EMA20/50/200, VWAP, SuperTrend)",
+    5.0,
+    3.0
+   ],
+   [
+    "Momentum (RSI, MACD, ADX/DI, Stochastic, EMA slope)",
+    0.0,
+    7.0
+   ],
+   [
+    "Price action (candlestick patterns, Heikin-Ashi, breakout/retest, volume)",
+    0.0,
+    1.0
+   ],
+   [
+    "Higher timeframe + multi-timeframe alignment",
+    0.0,
+    0.0
+   ],
+   [
+    "Options PCR",
+    0.0,
+    0.0
+   ],
+   [
+    "Institutional (structure, liquidity, OB, FVG, volume profile, premium/discount, RS)",
+    4.4,
+    2.4
+   ],
+   [
+    "Macro / geo-political",
+    0.0,
+    0.0
+   ],
+   [
+    "Smart Money (FII / DII cash flows)",
+    0.0,
+    0.0
+   ],
+   [
+    "Option flow (OI change + live Put/Call volume)",
+    0.0,
+    0.0
+   ]
+  ],
+  "n_reasons": 23,
+  "net_score": -4.0,
+  "signal_text": "NO TRADE"
+ },
+ "down": {
+  "audit": [
+   [
+    "Trend structure (EMA20/50/200, VWAP, SuperTrend)",
+    0.0,
+    8.0
+   ],
+   [
+    "Momentum (RSI, MACD, ADX/DI, Stochastic, EMA slope)",
+    2.0,
+    7.0
+   ],
+   [
+    "Price action (candlestick patterns, Heikin-Ashi, breakout/retest, volume)",
+    0.0,
+    1.0
+   ],
+   [
+    "Higher timeframe + multi-timeframe alignment",
+    0.0,
+    0.0
+   ],
+   [
+    "Options PCR",
+    0.0,
+    0.0
+   ],
+   [
+    "Institutional (structure, liquidity, OB, FVG, volume profile, premium/discount, RS)",
+    5.0,
+    4.0
+   ],
+   [
+    "Macro / geo-political",
+    0.0,
+    0.0
+   ],
+   [
+    "Smart Money (FII / DII cash flows)",
+    0.0,
+    0.0
+   ],
+   [
+    "Option flow (OI change + live Put/Call volume)",
+    0.0,
+    0.0
+   ]
+  ],
+  "n_reasons": 21,
+  "net_score": -13.0,
+  "signal_text": "NO TRADE"
+ },
+ "up": {
+  "audit": [
+   [
+    "Trend structure (EMA20/50/200, VWAP, SuperTrend)",
+    8.0,
+    0.0
+   ],
+   [
+    "Momentum (RSI, MACD, ADX/DI, Stochastic, EMA slope)",
+    7.0,
+    3.0
+   ],
+   [
+    "Price action (candlestick patterns, Heikin-Ashi, breakout/retest, volume)",
+    0.0,
+    0.0
+   ],
+   [
+    "Higher timeframe + multi-timeframe alignment",
+    0.0,
+    0.0
+   ],
+   [
+    "Options PCR",
+    0.0,
+    0.0
+   ],
+   [
+    "Institutional (structure, liquidity, OB, FVG, volume profile, premium/discount, RS)",
+    4.0,
+    5.0
+   ],
+   [
+    "Macro / geo-political",
+    0.0,
+    0.0
+   ],
+   [
+    "Smart Money (FII / DII cash flows)",
+    0.0,
+    0.0
+   ],
+   [
+    "Option flow (OI change + live Put/Call volume)",
+    0.0,
+    0.0
+   ]
+  ],
+  "n_reasons": 21,
+  "net_score": 11.0,
+  "signal_text": "NO TRADE"
+ },
+ "up2": {
+  "audit": [
+   [
+    "Trend structure (EMA20/50/200, VWAP, SuperTrend)",
+    8.0,
+    0.0
+   ],
+   [
+    "Momentum (RSI, MACD, ADX/DI, Stochastic, EMA slope)",
+    7.0,
+    3.0
+   ],
+   [
+    "Price action (candlestick patterns, Heikin-Ashi, breakout/retest, volume)",
+    0.0,
+    0.0
+   ],
+   [
+    "Higher timeframe + multi-timeframe alignment",
+    0.0,
+    0.0
+   ],
+   [
+    "Options PCR",
+    0.0,
+    0.0
+   ],
+   [
+    "Institutional (structure, liquidity, OB, FVG, volume profile, premium/discount, RS)",
+    5.4,
+    2.0
+   ],
+   [
+    "Macro / geo-political",
+    0.0,
+    0.0
+   ],
+   [
+    "Smart Money (FII / DII cash flows)",
+    0.0,
+    0.0
+   ],
+   [
+    "Option flow (OI change + live Put/Call volume)",
+    0.0,
+    0.0
+   ]
+  ],
+  "n_reasons": 19,
+  "net_score": 15.4,
+  "signal_text": "BUY"
+ }
+}
