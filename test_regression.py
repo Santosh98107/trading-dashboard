@@ -312,3 +312,43 @@ def test_risk_manager_stop_target_partial_math(tmp_path):
     r = subprocess.run([sys.executable, "-I", "-c", script], capture_output=True, text=True, timeout=180)
     assert r.returncode == 0, r.stderr[-800:]
     assert "RES (1, True, True, True) CLOSED 0" in r.stdout, r.stdout
+
+
+# ---------------------------------------------------------------- 5. script-order guard (catches 'NameError: name X is not defined')
+def test_no_top_level_function_is_used_before_it_is_defined():
+    """Streamlit runs app.py top to bottom. A helper defined BELOW the line that calls it crashes the whole app with a NameError
+    (this happened once with _foi_attach). Function bodies are exempt: they look names up when they run."""
+    import ast
+    tree = ast.parse(open(os.path.join(ROOT, "app.py"), encoding="utf-8").read())
+    def_line, first_assign = {}, {}
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+            def_line.setdefault(node.name, node.lineno)
+        for sub in ast.walk(node) if not isinstance(node, (ast.FunctionDef, ast.ClassDef)) else []:
+            if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Store):
+                first_assign.setdefault(sub.id, sub.lineno)
+            elif isinstance(sub, (ast.Import, ast.ImportFrom)):
+                for al in sub.names:
+                    first_assign.setdefault((al.asname or al.name).split(".")[0], sub.lineno)
+
+    problems = []
+
+    class V(ast.NodeVisitor):
+        def visit_FunctionDef(self, n):          # exempt: executed later
+            for d in n.decorator_list:
+                self.visit(d)
+            for d in list(n.args.defaults) + [x for x in n.args.kw_defaults if x is not None]:
+                self.visit(d)
+        visit_AsyncFunctionDef = visit_FunctionDef
+
+        def visit_ClassDef(self, n):
+            for d in n.decorator_list + n.bases:
+                self.visit(d)
+
+        def visit_Name(self, n):
+            if isinstance(n.ctx, ast.Load) and n.id in def_line and n.lineno < def_line[n.id] and first_assign.get(n.id, 10 ** 9) > n.lineno:
+                problems.append(f"{n.id}: used at line {n.lineno}, defined at line {def_line[n.id]}")
+
+    for node in tree.body:
+        V().visit(node)
+    assert not problems, "\n".join(problems[:20])
